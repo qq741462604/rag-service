@@ -42,7 +42,7 @@ public class MatchService {
         return bestF;
     }
 
-    // 最简单粗暴的字符交集相似度（无需库）
+    // 最简单粗暴的字符交集相似度（无需库）优化
     private int similarity(String a, String b) {
         a = a.toLowerCase();
         b = b.toLowerCase();
