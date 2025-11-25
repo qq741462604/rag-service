@@ -1,0 +1,5 @@
+﻿canonical_field,column_name,data_type,length,description,aliases,remark,priority_level
+bsrMtbNbr,BSR_NTB_NBR,String,8,企业银行编号,"Bsr_Ntb_Nbr,bsrNtbNbr,agcNtbNbr",,1
+bsrReqNbr,BSR_REQ_NBR,String,20,流程实例号,"Bsr_Req_Nbr,bsrReqNbr,agcReqNbr,xReqNbr",,1
+bsrOprDat,Bsr_Opr_Dat,String,8,经办日,"Bsr_Opr_Dat,agcOprDat",yyyyMMdd,0
+trxAmt,TRX_AMT,"decimal(18,2)",,交易金额,"TRX_AMT,totalFee,payAmount,txnAmt,trsTrsAmt,xTrxAmt,transAmt,transAmount",,0
