@@ -11,64 +11,39 @@ import java.util.*;
 @Service
 public class KbService {
 
-    private final Map<String, String> aliasToCanonical = new HashMap<>();
-    private final Map<String, FieldInfo> canonicalToInfo = new HashMap<>();
+    private final Map<String, FieldInfo> fields = new LinkedHashMap<>();
 
-    private final String kbPath = System.getProperty("kb.path",
-            "src/main/resources/data/kb.csv");
+    private final String KB_PATH = "src/main/resources/kb_with_embedding.csv";
 
     @PostConstruct
-    public void init() throws Exception {
-        loadKb(kbPath);
-    }
+    public void load() throws Exception {
+        CSVReader reader = new CSVReader(new FileReader(KB_PATH));
+        String[] header = reader.readNext();
+        String[] row;
 
-    private void loadKb(String path) throws Exception {
-        try (CSVReader r = new CSVReader(new FileReader(path))) {
-            String[] header = r.readNext(); // skip header
-            String[] line;
+        while ((row = reader.readNext()) != null) {
 
-            while ((line = r.readNext()) != null) {
+            FieldInfo f = new FieldInfo();
+            f.canonical = row[0];
+            f.column = row[1];
+            f.aliases = row[2];
+            f.description = row[3];
+            f.embedding = parseEmbedding(row[4]);
 
-                FieldInfo f = new FieldInfo();
-                f.canonicalField = line[0].trim();
-                f.columnName = line[1].trim();
-                f.dataType = line[2].trim();
-                f.length = line[3].trim();
-                f.description = line[4].trim();
-                f.aliases = line[5].trim();
-                f.remark = line.length > 6 ? line[6].trim() : "";
-                f.priorityLevel = line.length > 7 && !line[7].isEmpty()
-                        ? Integer.parseInt(line[7]) : 0;
-
-                canonicalToInfo.put(f.canonicalField, f);
-
-                // 别名建立映射
-                for (String a : f.aliases.split(",")) {
-                    aliasToCanonical.putIfAbsent(normalize(a), f.canonicalField);
-                }
-
-                // canonical 字段本身
-                aliasToCanonical.putIfAbsent(normalize(f.canonicalField), f.canonicalField);
-                aliasToCanonical.putIfAbsent(normalize(f.columnName), f.canonicalField);
-            }
+            fields.put(f.canonical, f);
         }
     }
 
-    private String normalize(String s) {
-        if (s == null) return "";
-        return s.trim().toLowerCase()
-                .replaceAll("[_\\s]", "");
-    }
-
-    public Optional<String> lookup(String q) {
-        return Optional.ofNullable(aliasToCanonical.get(normalize(q)));
-    }
-
-    public FieldInfo getInfo(String canonical) {
-        return canonicalToInfo.get(canonical);
-    }
-
     public Collection<FieldInfo> all() {
-        return canonicalToInfo.values();
+        return fields.values();
+    }
+
+    private float[] parseEmbedding(String s) {
+        String[] parts = s.split(",");
+        float[] arr = new float[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            arr[i] = Float.parseFloat(parts[i]);
+        }
+        return arr;
     }
 }

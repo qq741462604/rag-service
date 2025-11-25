@@ -40,6 +40,18 @@
             <artifactId>simmetrics-core</artifactId>
             <version>4.1.1</version>
         </dependency>
+<!--        引入 Embedding SDK（Qwen）-->
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>dashscope-sdk-java</artifactId>
+            <version>2.22.2</version>
+        </dependency>
+
+        <dependency>
+            <groupId>com.aliyun</groupId>
+            <artifactId>aliyun-java-sdk-nlp</artifactId>
+            <version>2.0.0</version>
+        </dependency>
 
         <!-- OkHttp (for optional OpenAI embedding calls) -->
         <dependency>

@@ -1,11 +1,9 @@
 package com.example.rag.service;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import okhttp3.*;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
+
+import com.alibaba.dashscope.aigc.generation.TextEmbeddingClient;
+import com.alibaba.dashscope.aigc.generation.TextEmbeddingRequest;
+import com.alibaba.dashscope.aigc.generation.TextEmbeddingResponse;
 
 @Component
 public class EmbeddingClient {
@@ -23,6 +21,31 @@ public class EmbeddingClient {
     private final ObjectMapper mapper = new ObjectMapper();
 
     public float[] embed(String text) {
+        try {
+            // 创建请求对象
+            TextEmbeddingRequest request = new TextEmbeddingRequest();
+            request.setApiKey(API_KEY);  // 你的 API Key
+            request.setInput(text);      // 要 embedding 的文本
+            request.setModel("text-embedding-v2");  // 模型名称
+
+            // 调用 DashScope API 获取 embedding
+            TextEmbeddingResponse response = TextEmbeddingClient.textEmbedding(request);
+
+            // 确保返回数据存在
+            if (response != null && response.getData() != null && !response.getData().isEmpty()) {
+                // 返回第一条记录的 embedding
+                return response.getData().get(0).getEmbedding();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        // 如果 API 调用失败，返回一个默认的零向量
+        return new float[768];  // 假设 embedding 维度为 768
+    }
+}
+
+    public float[] embed1(String text) {
         if (openaiKey == null || openaiKey.isEmpty()) return null; // disabled
 
         try {

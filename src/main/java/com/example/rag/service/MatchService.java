@@ -7,49 +7,39 @@ import org.springframework.stereotype.Service;
 public class MatchService {
 
     private final KbService kb;
+    private final EmbeddingClient embedding;
 
-    public MatchService(KbService kb) {
+    public MatchService(KbService kb, EmbeddingClient embedding) {
         this.kb = kb;
+        this.embedding = embedding;
     }
 
-    public FieldInfo match(String queryField) {
+    public FieldInfo match(String query) {
 
-        // ① alias 精确命中
-        return kb.lookup(queryField)
-                .map(kb::getInfo)
-                .orElseGet(() -> fuzzyMatch(queryField));
-    }
+        float[] queryVec = embedding.embed(query);
 
-    private FieldInfo fuzzyMatch(String q) {
-        int best = -1;
+        double best = -1;
         FieldInfo bestF = null;
 
         for (FieldInfo f : kb.all()) {
-            int score = similarity(q, f.aliases + "," + f.canonicalField + "," + f.columnName);
-
-            // 允许使用 priority 加权
-            score += f.priorityLevel * 3;
-
+            double score = cosine(queryVec, f.embedding);
             if (score > best) {
                 best = score;
                 bestF = f;
             }
         }
 
-        // 阈值小于 20 认为不可靠
-        if (best < 20) return null;
-
-        return bestF;
+        // 阈值可调整
+        return best < 0.60 ? null : bestF;
     }
 
-    // 最简单粗暴的字符交集相似度（无需库）优化
-    private int similarity(String a, String b) {
-        a = a.toLowerCase();
-        b = b.toLowerCase();
-        int count = 0;
-        for (char c : a.toCharArray()) {
-            if (b.indexOf(c) >= 0) count++;
+    private double cosine(float[] a, float[] b) {
+        double dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            na += a[i] * a[i];
+            nb += b[i] * b[i];
         }
-        return count * 10;
+        return dot / (Math.sqrt(na) * Math.sqrt(nb));
     }
 }
