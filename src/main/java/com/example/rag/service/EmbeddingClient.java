@@ -1,6 +1,5 @@
 package com.example.rag.service;
 
-import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import okhttp3.*;
@@ -20,15 +19,13 @@ public class EmbeddingClient {
     private final OkHttpClient client = new OkHttpClient();
 
     /**
-     * 调用 embedding API，返回 float[] 向量。
-     * 如果 API 不可用，返回 null（调用方可决定是否降级）
+     * 调用 embedding API，返回 float[]（若失败返回 null）
      */
     public float[] embed(String text) {
         if (apiKey == null || apiKey.isEmpty()) return null;
-
         try {
             JSONObject body = new JSONObject();
-            body.put("model", "text-embedding-v2");
+            body.put("model", "text-embedding-v2"); // 或按你实际使用的模型名
             body.put("input", text);
 
             Request request = new Request.Builder()
@@ -46,15 +43,12 @@ public class EmbeddingClient {
             String respBody = resp.body().string();
             resp.close();
 
-            JSONObject root = JSON.parseObject(respBody);
-            // dashscope 返回结构通常是 { "data": [ { "embedding": [ ... ] } ] }
+            JSONObject root = JSONObject.parseObject(respBody);
             if (root == null) return null;
             JSONArray data = root.getJSONArray("data");
             if (data == null || data.size() == 0) return null;
-            JSONObject first = data.getJSONObject(0);
-            JSONArray emb = first.getJSONArray("embedding");
+            JSONArray emb = data.getJSONObject(0).getJSONArray("embedding");
             if (emb == null) return null;
-
             float[] vec = new float[emb.size()];
             for (int i = 0; i < emb.size(); i++) {
                 Number n = (Number) emb.get(i);

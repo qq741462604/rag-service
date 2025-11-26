@@ -47,6 +47,14 @@
             <version>2.22.2</version>
         </dependency>
 
+        <dependency>
+            <groupId>com.theokanning.openai-gpt3-java</groupId>
+            <artifactId>service</artifactId>
+            <version>0.18.2</version>
+        </dependency>
+
+
+
         <!-- 核心库 -->
 <!--        <dependency>-->
 <!--            <groupId>com.aliyun</groupId>-->
@@ -84,6 +92,12 @@
             <groupId>com.alibaba</groupId>
             <artifactId>fastjson</artifactId>
             <version>1.2.83</version>
+        </dependency>
+        <!-- logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.30</version>
         </dependency>
     </dependencies>
 

@@ -1,5 +1,8 @@
 package com.example.rag.model;
 
+import lombok.Data;
+
+@Data
 public class FieldInfo {
     public String canonicalField;
     public String columnName;
@@ -10,6 +13,4 @@ public class FieldInfo {
     public String remark;
     public int priorityLevel;
     public float[] embedding; // may be null
-
-    public FieldInfo() {}
 }

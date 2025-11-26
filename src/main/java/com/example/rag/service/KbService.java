@@ -1,14 +1,17 @@
 package com.example.rag.service;
 
 import com.example.rag.model.FieldInfo;
-import com.opencsv.CSVReader;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import com.opencsv.CSVReader;
 
 import javax.annotation.PostConstruct;
 import java.io.FileReader;
 import java.util.*;
 
+/**
+ * 加载带 embedding 的 CSV 到内存
+ */
 @Service
 public class KbService {
 
@@ -23,15 +26,17 @@ public class KbService {
         load(kbLoadPath);
     }
 
-    public void load(String path) throws Exception {
+    public synchronized void load(String path) throws Exception {
         canonicalToInfo.clear();
         aliasIndex.clear();
-        try (CSVReader r = new CSVReader(new FileReader(path))) {
+
+        CSVReader r = null;
+        try {
+            r = new CSVReader(new FileReader(path));
             String[] header = r.readNext();
             if (header == null) return;
             String[] line;
             while ((line = r.readNext()) != null) {
-                // expect columns: canonicalField,columnName,dataType,length,description,aliases,remark,priorityLevel,embedding
                 FieldInfo f = new FieldInfo();
                 f.canonicalField = safe(line, 0);
                 f.columnName = safe(line, 1);
@@ -41,9 +46,9 @@ public class KbService {
                 f.aliases = safe(line, 5);
                 f.remark = safe(line, 6);
                 f.priorityLevel = parseIntSafe(safe(line, 7));
-                String embStr = safe(line, 8);
-                if (embStr != null && !embStr.isEmpty()) {
-                    String[] parts = embStr.split(",");
+                String emb = safe(line, 8);
+                if (emb != null && !emb.isEmpty()) {
+                    String[] parts = emb.split(",");
                     float[] vec = new float[parts.length];
                     for (int i = 0; i < parts.length; i++) {
                         vec[i] = Float.parseFloat(parts[i]);
@@ -52,7 +57,7 @@ public class KbService {
                 }
                 canonicalToInfo.put(f.canonicalField, f);
 
-                // alias index
+                // build alias index
                 if (f.aliases != null && !f.aliases.isEmpty()) {
                     String[] arr = f.aliases.split(",");
                     for (String a : arr) {
@@ -62,10 +67,11 @@ public class KbService {
                         }
                     }
                 }
-                // also index canonical and columnName
                 aliasIndex.putIfAbsent(normalize(f.canonicalField), f.canonicalField);
                 aliasIndex.putIfAbsent(normalize(f.columnName), f.canonicalField);
             }
+        } finally {
+            if (r != null) try { r.close(); } catch (Exception ex) {}
         }
     }
 
