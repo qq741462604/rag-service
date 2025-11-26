@@ -1,45 +1,61 @@
 package com.example.rag.service;
 
 import com.example.rag.model.FieldInfo;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 @Service
 public class MatchService {
 
-    private final KbService kb;
-    private final EmbeddingClient embedding;
+    @Autowired
+    private KbService kb;
 
-    public MatchService(KbService kb, EmbeddingClient embedding) {
-        this.kb = kb;
-        this.embedding = embedding;
-    }
+    @Autowired
+    private EmbeddingClient embeddingClient;
+
+    // thresholds
+    private static final double COSINE_THRESHOLD = 0.60;
 
     public FieldInfo match(String query) {
+        if (query == null || query.trim().isEmpty()) return null;
 
-        float[] queryVec = embedding.embed(query);
+        // 1) exact alias
+        java.util.Optional<String> alias = kb.lookupAlias(query);
+        if (alias.isPresent()) {
+            return kb.get(alias.get());
+        }
 
-        double best = -1;
+        // 2) compute query vector
+        float[] qv = embeddingClient.embed(query);
+        if (qv == null) return null;
+
+        // 3) brute-force cosine over in-memory embeddings
+        double best = -2;
         FieldInfo bestF = null;
-
         for (FieldInfo f : kb.all()) {
-            double score = cosine(queryVec, f.embedding);
+            if (f.embedding == null) continue;
+            double cos = cosine(qv, f.embedding);
+            // optionally weight by priorityLevel
+            double score = cos + (f.priorityLevel * 0.01);
             if (score > best) {
                 best = score;
                 bestF = f;
             }
         }
 
-        // 阈值可调整
-        return best < 0.60 ? null : bestF;
+        if (best >= COSINE_THRESHOLD) return bestF;
+        return null;
     }
 
     private double cosine(float[] a, float[] b) {
-        double dot = 0, na = 0, nb = 0;
+        if (a == null || b == null || a.length != b.length) return -2;
+        double dot = 0, na=0, nb=0;
         for (int i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            na += a[i] * a[i];
-            nb += b[i] * b[i];
+            dot += ((double)a[i]) * ((double)b[i]);
+            na += ((double)a[i]) * ((double)a[i]);
+            nb += ((double)b[i]) * ((double)b[i]);
         }
+        if (na == 0 || nb == 0) return -2;
         return dot / (Math.sqrt(na) * Math.sqrt(nb));
     }
 }

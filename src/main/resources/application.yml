@@ -4,21 +4,13 @@ server:
 spring:
   profiles:
     active: local
-  datasource:
-    driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://192.168.211.133:3306/mytest?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai
-    username: root
-    password: root
-    hikari:
-      connection-timeout: 30000 # 连接超时时间，单位毫秒
-      minimum-idle: 5           # 最小空闲连接数
-      maximum-pool-size: 20     # 最大连接池大小
-      idle-timeout: 600000      # 空闲连接超时时间，单位毫秒
-      max-lifetime: 1800000     # 连接最大生命周期，单位毫秒
-      pool-name: HikariPool     # 连接池名称
-      connection-test-query: select 1
   jackson:
     time-zone: GMT+8
+
+embedding:
+  api:
+    url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+    key: ${LLM_API_KEY}
 
 llm:
   api:
@@ -37,13 +29,18 @@ okhttp:
 
 # Knowledge file location (external override possible)
 kb:
-  path: src/main/resources/data/kb.csv
+  input:
+    path: src/main/resources/data/kb.csv
+  output:
+    path: src/main/resources/data/kb_with_embedding.csv
+  load:
+    path: src/main/resources/data/kb_with_embedding.csv
   correction: src/main/resources/data/correction.csv
 
 # MyBatis配置
 mybatis:
   mapper-locations: classpath:mapper/*.xml
-  type-aliases-package: com.aiassistant
+  type-aliases-package: com.example
   configuration:
     map-underscore-to-camel-case: true
     cache-enabled: false

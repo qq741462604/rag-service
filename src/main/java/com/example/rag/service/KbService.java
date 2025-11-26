@@ -2,6 +2,7 @@ package com.example.rag.service;
 
 import com.example.rag.model.FieldInfo;
 import com.opencsv.CSVReader;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
@@ -11,39 +12,82 @@ import java.util.*;
 @Service
 public class KbService {
 
-    private final Map<String, FieldInfo> fields = new LinkedHashMap<>();
+    private final Map<String, FieldInfo> canonicalToInfo = new LinkedHashMap<>();
+    private final Map<String, String> aliasIndex = new HashMap<>();
 
-    private final String KB_PATH = "src/main/resources/kb_with_embedding.csv";
+    @Value("${kb.load.path}")
+    private String kbLoadPath;
 
     @PostConstruct
-    public void load() throws Exception {
-        CSVReader reader = new CSVReader(new FileReader(KB_PATH));
-        String[] header = reader.readNext();
-        String[] row;
+    public void init() throws Exception {
+        load(kbLoadPath);
+    }
 
-        while ((row = reader.readNext()) != null) {
+    public void load(String path) throws Exception {
+        canonicalToInfo.clear();
+        aliasIndex.clear();
+        try (CSVReader r = new CSVReader(new FileReader(path))) {
+            String[] header = r.readNext();
+            if (header == null) return;
+            String[] line;
+            while ((line = r.readNext()) != null) {
+                // expect columns: canonicalField,columnName,dataType,length,description,aliases,remark,priorityLevel,embedding
+                FieldInfo f = new FieldInfo();
+                f.canonicalField = safe(line, 0);
+                f.columnName = safe(line, 1);
+                f.dataType = safe(line, 2);
+                f.length = safe(line, 3);
+                f.description = safe(line, 4);
+                f.aliases = safe(line, 5);
+                f.remark = safe(line, 6);
+                f.priorityLevel = parseIntSafe(safe(line, 7));
+                String embStr = safe(line, 8);
+                if (embStr != null && !embStr.isEmpty()) {
+                    String[] parts = embStr.split(",");
+                    float[] vec = new float[parts.length];
+                    for (int i = 0; i < parts.length; i++) {
+                        vec[i] = Float.parseFloat(parts[i]);
+                    }
+                    f.embedding = vec;
+                }
+                canonicalToInfo.put(f.canonicalField, f);
 
-            FieldInfo f = new FieldInfo();
-            f.canonical = row[0];
-            f.column = row[1];
-            f.aliases = row[2];
-            f.description = row[3];
-            f.embedding = parseEmbedding(row[4]);
-
-            fields.put(f.canonical, f);
+                // alias index
+                if (f.aliases != null && !f.aliases.isEmpty()) {
+                    String[] arr = f.aliases.split(",");
+                    for (String a : arr) {
+                        String norm = normalize(a);
+                        if (!norm.isEmpty() && !aliasIndex.containsKey(norm)) {
+                            aliasIndex.put(norm, f.canonicalField);
+                        }
+                    }
+                }
+                // also index canonical and columnName
+                aliasIndex.putIfAbsent(normalize(f.canonicalField), f.canonicalField);
+                aliasIndex.putIfAbsent(normalize(f.columnName), f.canonicalField);
+            }
         }
     }
 
-    public Collection<FieldInfo> all() {
-        return fields.values();
+    private String safe(String[] arr, int idx) {
+        if (arr == null || idx >= arr.length) return "";
+        return arr[idx] == null ? "" : arr[idx].trim();
     }
 
-    private float[] parseEmbedding(String s) {
-        String[] parts = s.split(",");
-        float[] arr = new float[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            arr[i] = Float.parseFloat(parts[i]);
-        }
-        return arr;
+    private int parseIntSafe(String s) {
+        try { return Integer.parseInt(s); } catch (Exception e) { return 0; }
     }
+
+    private String normalize(String s) {
+        if (s == null) return "";
+        return s.trim().toLowerCase().replaceAll("[_\\s]", "");
+    }
+
+    public Optional<String> lookupAlias(String q) {
+        return Optional.ofNullable(aliasIndex.get(normalize(q)));
+    }
+
+    public Collection<FieldInfo> all() { return canonicalToInfo.values(); }
+
+    public FieldInfo get(String canonical) { return canonicalToInfo.get(canonical); }
 }
