@@ -4,6 +4,7 @@ import com.example.rag.service.EnhancedVectorSearchService;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/search")
@@ -35,4 +36,10 @@ public class SearchController {
 //        return search.hybridSearch(q, 5);
         return search.match(q, 3);
     }
+
+    @PostMapping("/match-json")
+    public Object matchJson(@RequestBody List<Map<String, String>> items) {
+        return jsonFieldMatcher.matchFields(items);
+    }
+
 }

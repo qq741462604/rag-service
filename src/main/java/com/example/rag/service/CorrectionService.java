@@ -1,5 +1,7 @@
 package com.example.rag.service;
 
+import com.example.rag.model.FieldInfo;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
@@ -24,6 +26,9 @@ public class CorrectionService {
     private static final String FILE = "src/main/resources/data/correction.csv";
 
     private final Map<String, CorrectionItem> map = new HashMap<>();
+
+    @Autowired
+    private KbService kbService;
 
     @PostConstruct
     public void init() {
@@ -100,5 +105,20 @@ public class CorrectionService {
         CorrectionItem c = map.get(query);
         if (c == null) return null;
         return c.correctCanonical;
+    }
+
+    /**
+     * 纠错覆盖逻辑
+     * query → canonical → FieldInfo
+     */
+    public FieldInfo checkCorrection(String query) {
+        CorrectionItem c = map.get(query.trim().toLowerCase());
+        if (c == null) return null;
+        String canonical = c.correctCanonical;
+
+        if (canonical == null) return null;
+
+        // 关键点：从 KB 中取完整 FieldInfo
+        return kbService.getByCanonical(canonical);
     }
 }

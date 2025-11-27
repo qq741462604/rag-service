@@ -26,6 +26,63 @@ public class BM25Service {
     private static final double k1 = 1.5;
     private static final double b = 0.75;
 
+
+    private List<FieldInfo> kb;
+    private List<List<String>> documents;
+    private double avgDocLength;
+    public void build(List<FieldInfo> all) {
+        this.kb = all;
+
+        documents = new ArrayList<>();
+        df.clear();
+
+        int totalLength = 0;
+
+        for (FieldInfo f : all) {
+            List<String> tokens = tokenize(f.aliases + " " + f.canonicalField + " " + f.description);
+            documents.add(tokens);
+
+            totalLength += tokens.size();
+
+            tokens.stream().distinct().forEach(term ->
+                    df.put(term, df.getOrDefault(term, 0) + 1)
+            );
+        }
+        avgDocLength = totalLength * 1.0 / documents.size();
+    }
+
+    public Map<FieldInfo, Double> search(String query) {
+
+        List<String> qTokens = tokenize(query);
+        Map<FieldInfo, Double> scores = new HashMap<>();
+
+        for (int i = 0; i < kb.size(); i++) {
+            scores.put(kb.get(i), scoreBM25(qTokens, documents.get(i)));
+        }
+        return scores;
+    }
+    private double scoreBM25(List<String> qTokens, List<String> docTokens) {
+        double score = 0.0;
+
+        for (String t : qTokens) {
+            score += bm25Term(t, docTokens);
+        }
+        return score;
+    }
+    private double bm25Term(String term, List<String> doc) {
+        int N = documents.size();
+        int dfTerm = df.getOrDefault(term, 0);
+        if (dfTerm == 0) return 0;
+
+        long tf = doc.stream().filter(t -> t.equals(term)).count();
+
+        double idf = Math.log(1 + (N - dfTerm + 0.5) / (dfTerm + 0.5));
+        double k1 = 1.5;
+        double b = 0.75;
+
+        return idf * (tf * (k1 + 1)) /
+                (tf + k1 * (1 - b + b * doc.size() / avgDocLength));
+    }
     /**
      * 构建索引，覆盖旧索引
      */
