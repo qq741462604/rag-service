@@ -126,6 +126,10 @@ public class KbService {
 
         /** ---- BM25 重建索引 ---- **/
         bm25Service.buildIndex(kb.values());
+
+//        List<FieldInfo> fieldList = kb.values().stream().collect(Collectors.toList());
+//        bm25Service.build(fieldList);
+
         log.info("BM25 index rebuilt");
 
     }
