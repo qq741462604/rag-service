@@ -9,7 +9,7 @@ import java.time.LocalDateTime;
 @Service
 public class SearchLogService {
 
-    private static final String LOG_FILE = "search_log.txt";
+    private static final String LOG_FILE = "logs/search_log.txt";
     private final String LOG_PATH = "logs/search_log.csv";
 
     public SearchLogService() {
