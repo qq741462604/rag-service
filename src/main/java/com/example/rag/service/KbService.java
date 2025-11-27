@@ -209,6 +209,7 @@ public class KbService {
         executor.submit(() -> {
             try {
                 Path path = Paths.get("src/main/resources/data");
+
                 WatchService ws = FileSystems.getDefault().newWatchService();
                 path.register(ws, StandardWatchEventKinds.ENTRY_MODIFY);
 
@@ -217,6 +218,7 @@ public class KbService {
 
                     for (WatchEvent<?> event : key.pollEvents()) {
                         Path changed = (Path) event.context();
+                        log.info("监听开始: Loading KB from {}", changed);
                         if (changed.toString().equals("kb_with_embedding.csv")) {
                             log.info("KB file changed, reloading...");
                             loadKbAsync();

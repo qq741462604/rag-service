@@ -15,8 +15,24 @@ public class SearchController {
         this.search = search;
     }
 
+    /**
+     * 不含纠错
+     * @param q
+     * @return
+     */
     @GetMapping
     public List<EnhancedVectorSearchService.SearchResult> search(@RequestParam String q) {
         return search.hybridSearch(q, 5);
+    }
+
+    /**
+     * 含纠错
+     * @param q
+     * @return
+     */
+    @GetMapping("/match")
+    public List<EnhancedVectorSearchService.Result> match(@RequestParam String q) {
+//        return search.hybridSearch(q, 5);
+        return search.match(q, 3);
     }
 }

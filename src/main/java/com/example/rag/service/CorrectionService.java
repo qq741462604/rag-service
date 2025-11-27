@@ -5,6 +5,10 @@ import org.springframework.stereotype.Service;
 import javax.annotation.PostConstruct;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -17,12 +21,13 @@ import java.util.concurrent.ConcurrentHashMap;
 @Service
 public class CorrectionService {
 
-    private static final String CORRECTION_FILE = "src/main/resources/data/correction.csv";
-    private final Map<String, String> corrections = new ConcurrentHashMap<>();
+    private static final String FILE = "src/main/resources/data/correction.csv";
+
+    private final Map<String, CorrectionItem> map = new HashMap<>();
 
     @PostConstruct
     public void init() {
-        File f = new File(CORRECTION_FILE);
+        File f = new File(FILE);
         if (!f.exists()) {
             // ensure dir
             f.getParentFile().mkdirs();
@@ -32,39 +37,59 @@ public class CorrectionService {
         }
         load();
     }
-
+    public static class CorrectionItem {
+        public String query;
+        public String wrongCanonical;
+        public String correctCanonical;
+    }
     private void load() {
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(
-                new FileInputStream(CORRECTION_FILE), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                if (line.trim().isEmpty()) continue;
-                String[] arr = parseCsvLine(line);
-                if (arr.length >= 2) {
-                    corrections.put(normalize(arr[0]), arr[1]);
-                }
+        try {
+            if (!Files.exists(Paths.get(FILE))) return;
+            List<String> lines = Files.readAllLines(Paths.get(FILE));
+            for (String line : lines) {
+                if (line.trim().isEmpty() || line.startsWith("#")) continue;
+                String[] arr = line.split(",");
+                if (arr.length < 3) continue;
+                CorrectionItem c = new CorrectionItem();
+                c.query = arr[0];
+                c.wrongCanonical = arr[1];
+                c.correctCanonical = arr[2];
+                map.put(c.query, c);
             }
-        } catch (Exception e) {
-            // ignore, log if needed
-            e.printStackTrace();
+        } catch (Exception ignored) {}
+    }
+
+    public boolean record(String query, String wrong, String correct) {
+        CorrectionItem c = new CorrectionItem();
+        c.query = query;
+        c.wrongCanonical = wrong;
+        c.correctCanonical = correct;
+        map.put(query, c);
+        return persist();
+    }
+
+
+    /**
+     * 写入
+     * @return
+     */
+    private boolean persist() {
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(FILE))) {
+            for (CorrectionItem c : map.values()) {
+                w.write(c.query + "," + c.wrongCanonical + "," + c.correctCanonical + "\n");
+            }
+            return true;
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
-    /**
-     * 将纠错保存到文件并更新内存
-     */
-    public synchronized boolean recordCorrection(String query, String canonical) {
-        try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
-                new FileOutputStream(CORRECTION_FILE, true), StandardCharsets.UTF_8))) {
-            String line = csvEscape(query) + "," + csvEscape(canonical) + "\n";
-            bw.write(line);
-            bw.flush();
-            corrections.put(normalize(query), canonical);
-            return true;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
+    private String normalize(String s) {
+        return s == null ? null : s.trim().toLowerCase();
+    }
+
+    public CorrectionItem findByQuery(String query) {
+        return map.get(query);
     }
 
     /**
@@ -72,45 +97,8 @@ public class CorrectionService {
      */
     public String applyCorrection(String query) {
         if (query == null) return null;
-        return corrections.get(normalize(query));
-    }
-
-    private String normalize(String s) {
-        return s == null ? null : s.trim().toLowerCase();
-    }
-
-    private String csvEscape(String s) {
-        if (s == null) return "";
-        if (s.contains(",") || s.contains("\"") || s.contains("\n")) {
-            return "\"" + s.replace("\"", "\"\"") + "\"";
-        }
-        return s;
-    }
-
-    // 简单的 CSV 解析（支持双引号）
-    private String[] parseCsvLine(String line) {
-        java.util.List<String> out = new java.util.ArrayList<>();
-        boolean inQuotes = false;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < line.length(); i++) {
-            char c = line.charAt(i);
-            if (c == '"') {
-                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
-                    sb.append('"'); // escaped quote
-                    i++;
-                } else {
-                    inQuotes = !inQuotes;
-                }
-                continue;
-            }
-            if (c == ',' && !inQuotes) {
-                out.add(sb.toString());
-                sb.setLength(0);
-            } else {
-                sb.append(c);
-            }
-        }
-        out.add(sb.toString());
-        return out.toArray(new String[0]);
+        CorrectionItem c = map.get(query);
+        if (c == null) return null;
+        return c.correctCanonical;
     }
 }
