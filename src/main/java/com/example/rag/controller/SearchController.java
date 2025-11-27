@@ -1,6 +1,12 @@
 package com.example.rag.controller;
 
+import com.alibaba.fastjson.JSONObject;
+import com.example.rag.model.SearchResult;
 import com.example.rag.service.EnhancedVectorSearchService;
+import com.example.rag.service.HybridSearchService;
+import com.example.rag.tools.JsonFieldMatcher;
+
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -10,6 +16,10 @@ import java.util.Map;
 @RequestMapping("/search")
 public class SearchController {
 
+    @Autowired
+    private JsonFieldMatcher jsonFieldMatcher;
+//    @Autowired
+    private HybridSearchService hybridSearchService;
     private final EnhancedVectorSearchService search;
 
     public SearchController(EnhancedVectorSearchService search) {
@@ -41,5 +51,10 @@ public class SearchController {
     public Object matchJson(@RequestBody List<Map<String, String>> items) {
         return jsonFieldMatcher.matchFields(items);
     }
+
+//    @PostMapping("/match-searchJson")
+//    public SearchResult searchJson(@RequestBody JSONObject json) throws Exception {
+//        return hybridSearchService.searchJson(JSONObject.toJSONString(json));
+//    }
 
 }

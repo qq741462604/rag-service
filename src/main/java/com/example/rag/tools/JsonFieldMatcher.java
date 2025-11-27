@@ -43,7 +43,7 @@ public class JsonFieldMatcher {
         float bestScore = -1;
 
         // ① description → correction
-        FieldInfo byDescCorr = correctionService.correct(desc);
+        FieldInfo byDescCorr = correctionService.checkCorrection(desc);
         if (byDescCorr != null) return byDescCorr;
 
         // ② description → alias
@@ -54,7 +54,7 @@ public class JsonFieldMatcher {
         }
 
         // ③ name → correction
-        FieldInfo byNameCorr = correctionService.correct(name);
+        FieldInfo byNameCorr = correctionService.checkCorrection(name);
         if (byNameCorr != null) {
             return byNameCorr;
         }

@@ -41,6 +41,11 @@ public class EnhancedVectorSearchService {
         this.embeddingService = embeddingService;
     }
 
+    public FieldInfo searchByAlias(String query) {
+        String canonical = kb.resolveAlias(query);
+        if (canonical != null) return kb.getByCanonical(canonical);
+        return null;
+    }
 
 
     // ---------- 对外暴露的统一搜索接口 ----------

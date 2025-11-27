@@ -29,6 +29,7 @@ public class KbService {
     // alias 倒排索引 (alias -> list<FieldInfo>)
     private final Map<String, List<FieldInfo>> aliasIndex = new ConcurrentHashMap<>();
 
+    private final Map<String, String> aliasToCanonical = new HashMap<>();
     @Getter
     private long lastLoadTime = 0;
 
@@ -133,6 +134,9 @@ public class KbService {
         log.info("BM25 index rebuilt");
 
     }
+    private String norm(String s) {
+        return s.trim().toLowerCase().replaceAll("[_\\s]", "");
+    }
 
     /** ----------- CSV 解析 ----------- **/
     private FieldInfo parseLine(String line) {
@@ -169,6 +173,12 @@ public class KbService {
 //                }
 //                f.embedding = vec;
 //            }
+
+            for (String a : f.aliases.split(",")) {
+                aliasToCanonical.put(norm(a), f.canonicalField);
+            }
+            aliasToCanonical.put(norm(f.canonicalField), f.canonicalField);
+            aliasToCanonical.put(norm(f.columnName), f.canonicalField);
 
             return f;
 
@@ -253,6 +263,9 @@ public class KbService {
     public List<FieldInfo> searchByAlias(String alias) {
         if (alias == null) return Collections.emptyList();
         return aliasIndex.getOrDefault(alias.trim().toLowerCase(), Collections.emptyList());
+    }
+    public String resolveAlias(String q) {
+        return aliasToCanonical.get(norm(q));
     }
 
 
