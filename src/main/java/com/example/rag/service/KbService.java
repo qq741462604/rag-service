@@ -1,170 +1,254 @@
 package com.example.rag.service;
 
 import com.example.rag.model.FieldInfo;
-import com.opencsv.CSVReader;
-import org.springframework.scheduling.annotation.Async;
-import org.springframework.scheduling.annotation.Scheduled;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
 import java.util.*;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 public class KbService {
 
-    // 存放 canonicalField -> FieldInfo
-    private final Map<String, FieldInfo> kb = new HashMap<>();
-
-    // alias 反查表 （alias -> canonicalField）
-    private final Map<String, String> aliasIndex = new HashMap<>();
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-    // token -> list of canonicalFields
-    private final Map<String, Set<String>> invertedIndex = new HashMap<>();
-    // CSV 文件路径 —— 根据你自己的资源位置修改
     private static final String KB_FILE = "src/main/resources/data/kb_with_embedding.csv";
 
-    //------------------------------------------
-    // 初始化时异步加载 KB
-    //------------------------------------------
+    // 主存储
+    private final Map<String, FieldInfo> kb = new ConcurrentHashMap<>();
+
+    // canonicalField 快速索引
+    private final Map<String, FieldInfo> canonicalIndex = new ConcurrentHashMap<>();
+
+    // alias 倒排索引 (alias -> list<FieldInfo>)
+    private final Map<String, List<FieldInfo>> aliasIndex = new ConcurrentHashMap<>();
+
+    @Getter
+    private long lastLoadTime = 0;
+
+    private final ThreadPoolTaskExecutor executor;
+    private final BM25Service bm25Service;
+
+    public KbService(BM25Service bm25Service) {
+        this.bm25Service = bm25Service;
+
+        // 异步线程池
+        executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(5);
+        executor.setThreadNamePrefix("kb-loader-");
+        executor.initialize();
+    }
+
+    /** ----------- 初始化加载 KB ----------- **/
     @PostConstruct
-    @Async
-    public void initAsync() {
-        System.out.println("KB loading async…");
-        loadKb();
-        System.out.println("KB initial load done");
+    public void init() {
+        loadKbAsync();   // 启动时异步加载
+        watchKbFile();   // 文件监控，热更新
     }
 
-    //------------------------------------------
-    // 手动触发刷新
-    //------------------------------------------
+    /** 外部调用 reload */
     public void reload() {
-        loadKb();
+        loadKbAsync();
     }
 
-    //------------------------------------------
-    // 每 10 分钟自动刷新（可调）
-    //------------------------------------------
-    @Scheduled(fixedDelay = 10 * 60 * 1000)
-    public void autoReload() {
-        System.out.println("Auto reload KB…");
-        loadKb();
+    /** 异步加载 KB */
+    private void loadKbAsync() {
+        executor.submit(this::loadKb);
     }
 
-    //------------------------------------------
-    // 核心加载逻辑（带写锁）
-    //------------------------------------------
-    public void loadKb() {
-        System.out.println("Loading KB from " + KB_FILE);
-        lock.writeLock().lock();
-        try {
-            CSVReader reader = new CSVReader(new FileReader(KB_FILE));
-            Map<String, FieldInfo> newKb = new HashMap<>();
-            Map<String, String> newAlias = new HashMap<>();
+    /** ----------- 实际加载逻辑 ----------- **/
+    private synchronized void loadKb() {
+        log.info("Loading KB from {}", KB_FILE);
 
-            String[] arr;
-            boolean header = true;
+        File file = new File(KB_FILE);
+        if (!file.exists()) {
+            log.error("KB not found: {}", KB_FILE);
+            return;
+        }
 
-            while ((arr = reader.readNext()) != null) {
+        Map<String, FieldInfo> newKb = new ConcurrentHashMap<>();
+        Map<String, FieldInfo> newCanonicalIndex = new ConcurrentHashMap<>();
+        Map<String, List<FieldInfo>> newAliasIndex = new ConcurrentHashMap<>();
 
-                // 跳过 header
-                if (header) {
-                    header = false;
-                    continue;
-                }
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
 
-                if (arr.length < 9) continue;
+            String header = br.readLine();
+            if (header == null) {
+                log.error("KB file empty");
+                return;
+            }
 
-                FieldInfo f = new FieldInfo();
-                f.canonicalField = arr[0];
-                f.columnName = arr[1];
-                f.dataType = arr[2];
-                f.length = arr[3];
-                f.description = arr[4];
-                f.aliases = arr[5];
-                f.remark = arr[6];
-                f.priorityLevel = parseInt(arr[7]);
-                f.embedding = parseEmbedding(arr[8]);
+            String line;
+            while ((line = br.readLine()) != null) {
+                FieldInfo f = parseLine(line);
+                if (f == null) continue;
 
                 newKb.put(f.canonicalField, f);
+                newCanonicalIndex.put(f.canonicalField, f);
 
-                for (String alias : f.aliases.split("\\|")) {
-                    newAlias.put(alias.trim(), f.canonicalField);
+                // alias 倒排索引
+                if (f.aliases != null) {
+                    for (String a : f.aliases.split("[,;|]")) {
+                        String key = a.trim().toLowerCase();
+                        if (key.length() == 0) continue;
+
+                        newAliasIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(f);
+                    }
                 }
-                String text = f.canonicalField + " " + f.columnName + " " + f.description + " " + f.aliases;
-                for (String token : tokenize(text)) {
-                    invertedIndex.computeIfAbsent(token, k -> new HashSet<>()).add(f.canonicalField);
-                }
-
-
             }
-            kb.clear();
-            kb.putAll(newKb);
-
-            aliasIndex.clear();
-            aliasIndex.putAll(newAlias);
-
-            System.out.println("KB reloaded: " + kb.size() + " rows");
 
         } catch (Exception e) {
-            throw new RuntimeException("Failed to load KB", e);
-        } finally {
-            lock.writeLock().unlock();
+            log.error("Error loading KB", e);
+            return;
         }
-    }
-    private List<String> tokenize(String text) {
-        if (text == null) return new ArrayList<>();
-        return Arrays.stream(text.toLowerCase().split("[^a-zA-Z0-9\u4e00-\u9fa5]+"))
-                .filter(s -> s.length() > 1)
-                .collect(Collectors.toList());
+
+        // 替换旧索引
+        kb.clear();
+        kb.putAll(newKb);
+
+        canonicalIndex.clear();
+        canonicalIndex.putAll(newCanonicalIndex);
+
+        aliasIndex.clear();
+        aliasIndex.putAll(newAliasIndex);
+
+        lastLoadTime = System.currentTimeMillis();
+        log.info("KB loaded: {} fields", kb.size());
+
+        /** ---- BM25 重建索引 ---- **/
+        bm25Service.buildIndex(kb.values());
+        log.info("BM25 index rebuilt");
+
     }
 
-    public Set<FieldInfo> fuzzyCandidates(String query) {
-        Set<FieldInfo> result = new HashSet<>();
-        for (String t : tokenize(query)) {
-            Set<String> keys = invertedIndex.get(t);
-            if (keys != null) {
-                for (String k : keys) {
-                    result.add(kb.get(k));
+    /** ----------- CSV 解析 ----------- **/
+    private FieldInfo parseLine(String line) {
+        try {
+            List<String> parts = parseCsv(line);
+            if (parts.size() < 7) return null;
+
+            FieldInfo f = new FieldInfo();
+//            f.canonicalField = parts.get(0);
+//            f.columnName = parts.get(1);
+//            f.aliases = parts.get(2);
+//            f.description = parts.get(3);
+//            f.remark = parts.get(4);
+//            f.priorityLevel = Integer.parseInt(parts.get(5));
+
+            String[] array = parts.stream().toArray(String[]::new);
+            f.canonicalField = array[0];
+            f.columnName = array[1];
+            f.dataType = array[2];
+            f.length = array[3];
+            f.description = array[4];
+            f.aliases = array[5];
+            f.remark = array[6];
+            f.priorityLevel = parseInt(array[7]);
+            f.embedding = parseEmbedding(array[8]);
+
+//            // embedding
+//            String embStr = parts.get(6);
+//            if (embStr != null && !embStr.isEmpty()) {
+//                String[] arr = embStr.split(" ");
+//                float[] vec = new float[arr.length];
+//                for (int i = 0; i < arr.length; i++) {
+//                    vec[i] = Float.parseFloat(arr[i]);
+//                }
+//                f.embedding = vec;
+//            }
+
+            return f;
+
+        } catch (Exception e) {
+            log.error("Error parsing KB line: {}", line);
+            return null;
+        }
+    }
+
+    /** 简单 CSV split 支持双引号 */
+    private List<String> parseCsv(String line) {
+        List<String> list = new ArrayList<>();
+        boolean inQuotes = false;
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+
+            if (c == '"') {
+                if (inQuotes && i + 1 < line.length() && line.charAt(i + 1) == '"') {
+                    sb.append('"');
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
                 }
+                continue;
+            }
+
+            if (c == ',' && !inQuotes) {
+                list.add(sb.toString());
+                sb.setLength(0);
+            } else {
+                sb.append(c);
             }
         }
-        return result;
+        list.add(sb.toString());
+        return list;
     }
 
+    /** ----------- 监听 CSV 热更新 ----------- **/
+    private void watchKbFile() {
+        executor.submit(() -> {
+            try {
+                Path path = Paths.get("src/main/resources/data");
+                WatchService ws = FileSystems.getDefault().newWatchService();
+                path.register(ws, StandardWatchEventKinds.ENTRY_MODIFY);
 
-    //------------------------------------------
-    // 提供安全读取接口（读锁）
-    //------------------------------------------
-    public Optional<String> lookup(String alias) {
-        lock.readLock().lock();
-        try {
-            return Optional.ofNullable(aliasIndex.get(alias));
-        } finally {
-            lock.readLock().unlock();
-        }
+                while (true) {
+                    WatchKey key = ws.take(); // block until modify
+
+                    for (WatchEvent<?> event : key.pollEvents()) {
+                        Path changed = (Path) event.context();
+                        if (changed.toString().equals("kb_with_embedding.csv")) {
+                            log.info("KB file changed, reloading...");
+                            loadKbAsync();
+                        }
+                    }
+                    key.reset();
+                }
+            } catch (Exception e) {
+                log.error("watchKbFile error", e);
+            }
+        });
     }
 
-    public FieldInfo getInfo(String canonical) {
-        lock.readLock().lock();
-        try {
-            return kb.get(canonical);
-        } finally {
-            lock.readLock().unlock();
-        }
+    /** ----------- Public API ----------- **/
+
+    /** 你缺的：通过 canonical 获取 FieldInfo */
+    public FieldInfo getByCanonical(String canonical) {
+        if (canonical == null) return null;
+        return canonicalIndex.get(canonical);
     }
 
+    /** 获取所有字段 */
     public Collection<FieldInfo> all() {
-        lock.readLock().lock();
-        try {
-            return new ArrayList<>(kb.values());
-        } finally {
-            lock.readLock().unlock();
-        }
+        return kb.values();
     }
+
+    /** alias 倒排检索 */
+    public List<FieldInfo> searchByAlias(String alias) {
+        if (alias == null) return Collections.emptyList();
+        return aliasIndex.getOrDefault(alias.trim().toLowerCase(), Collections.emptyList());
+    }
+
 
     //------------------------------------------
     // CSV 工具方法
@@ -186,22 +270,5 @@ public class KbService {
     private int parseInt(String s) {
         try { return Integer.parseInt(s); }
         catch (Exception e) { return 0; }
-    }
-
-    private String[] parseCsvLine(String line) {
-        List<String> out = new ArrayList<>();
-        boolean inQuotes = false;
-        StringBuilder sb = new StringBuilder();
-        for (char c : line.toCharArray()) {
-            if (c == '"') { inQuotes = !inQuotes; continue; }
-            if (c == ',' && !inQuotes) {
-                out.add(sb.toString());
-                sb.setLength(0);
-            } else {
-                sb.append(c);
-            }
-        }
-        out.add(sb.toString());
-        return out.toArray(new String[0]);
     }
 }
