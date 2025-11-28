@@ -15,37 +15,16 @@ vector:
   topk: 5
   threshold: 0.60
 
-
-qwen:
+dashscope:
   api:
-    url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
-    key: ${LLM_API_KEY}
-  model: qwen-plus
-  top_n: 5
-
-okhttp:
-  connect-timeout: 10000
-  read-timeout: 20000
-  write-timeout: 20000
-  retry-on-connection-failure: true
-  max-idle-connections: 5
-  keep-alive-duration: 300000
-
-# Knowledge file location (external override possible)
+    url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings # <- 替换为真实 dashscope embedding URL
+    key: ${LLM_API_KEY}  # 推荐用环境变量 DASHSCOPE_API_KEY
+model:
+  name: "text-embedding-v2"
 kb:
-  input:
-    path: src/main/resources/data/kb.csv
-  output:
-    path: src/main/resources/data/kb_with_embedding.csv
-  load:
-    path: src/main/resources/data/kb_with_embedding.csv
-  correction: src/main/resources/data/correction.csv
-
-# MyBatis配置
-mybatis:
-  mapper-locations: classpath:mapper/*.xml
-  type-aliases-package: com.example
-  configuration:
-    map-underscore-to-camel-case: true
-    cache-enabled: false
-
+  raw-path: "src/main/resources/data/kb.csv"
+  emb-path: "src/main/resources/data/kb_with_embedding.csv"
+  correction-path: "src/main/resources/data/correction.csv"
+search:
+  desc-weight: 3
+  name-weight: 1

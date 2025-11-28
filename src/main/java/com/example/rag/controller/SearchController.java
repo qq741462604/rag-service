@@ -1,60 +1,64 @@
 package com.example.rag.controller;
 
-import com.alibaba.fastjson.JSONObject;
-import com.example.rag.model.SearchResult;
-import com.example.rag.service.EnhancedVectorSearchService;
-import com.example.rag.service.HybridSearchService;
-import com.example.rag.tools.JsonFieldMatcher;
-
+import com.example.rag.service.CorrectionService;
+import com.example.rag.service.GenerateEmbeddingsController;
+import com.example.rag.service.JsonFieldMatcher;
+import com.example.rag.service.EnhancedVectorSearchService.Hit;
+import com.example.rag.service.KbService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * SearchController - 提供三个接口：
+ *  - POST /search-json  (body: JSON array of {name, description})
+ *  - POST /admin/generate-embeddings  (trigger generation)
+ *  - POST /admin/correct?query=...&canonical=...
+ */
 @RestController
-@RequestMapping("/search")
 public class SearchController {
 
+    private final JsonFieldMatcher matcher;
+    private final CorrectionService correction;
+
+    public SearchController(JsonFieldMatcher matcher,
+                            CorrectionService correction) {
+        this.matcher = matcher;
+        this.correction = correction;
+    }
+
     @Autowired
-    private JsonFieldMatcher jsonFieldMatcher;
-//    @Autowired
-    private HybridSearchService hybridSearchService;
-    private final EnhancedVectorSearchService search;
+    private KbService kbService;
 
-    public SearchController(EnhancedVectorSearchService search) {
-        this.search = search;
+    @PostMapping("/search-json")
+    public List<Hit> searchJson(@RequestBody List<Map<String,String>> items) {
+        return matcher.match(items);
     }
 
-    /**
-     * 不含纠错
-     * @param q
-     * @return
-     */
-    @GetMapping
-    public List<EnhancedVectorSearchService.SearchResult> search(@RequestParam String q) {
-        return search.hybridSearch(q, 5);
+
+
+    @PostMapping("/admin/correct")
+    public Map<String,Object> correct(@RequestParam String query, @RequestParam String canonical) {
+        boolean ok = correction.recordCorrection(query, canonical);
+        Map map = new HashMap();
+        map.put("ok", ok);
+        return map;
     }
 
-    /**
-     * 含纠错
-     * @param q
-     * @return
-     */
-    @GetMapping("/match")
-    public List<EnhancedVectorSearchService.Result> match(@RequestParam String q) {
-//        return search.hybridSearch(q, 5);
-        return search.match(q, 3);
+    @PostMapping("/admin/reload-kb")
+    public Map<String,Object> reloadKb() {
+        Map<String,Object> map = new HashMap<>();
+        try {
+            kbService.reload();
+            map.put("ok", true);
+        } catch (Exception e) {
+            map.put("ok", false);
+            map.put("error", e.getMessage());
+        }
+
+        return map;
     }
-
-    @PostMapping("/match-json")
-    public Object matchJson(@RequestBody List<Map<String, String>> items) {
-        return jsonFieldMatcher.matchFields(items);
-    }
-
-//    @PostMapping("/match-searchJson")
-//    public SearchResult searchJson(@RequestBody JSONObject json) throws Exception {
-//        return hybridSearchService.searchJson(JSONObject.toJSONString(json));
-//    }
-
 }

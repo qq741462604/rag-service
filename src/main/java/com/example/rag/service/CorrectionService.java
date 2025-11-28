@@ -1,124 +1,104 @@
 package com.example.rag.service;
 
-import com.example.rag.model.FieldInfo;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * CorrectionService - 纠错学习模块
- *
- * correction.csv 格式：query,canonicalField
- * 一行一条（CSV，query 可能带逗号时请用引号）
+ * CorrectionService: stores query->canonical mapping (two columns CSV)
  */
 @Service
 public class CorrectionService {
 
-    private static final String FILE = "src/main/resources/data/correction.csv";
+    @Value("${kb.correction-path}")
+    private String correctionPath;
 
-    private final Map<String, CorrectionItem> map = new HashMap<>();
-
-    @Autowired
-    private KbService kbService;
+    private final Map<String, String> map = new ConcurrentHashMap<>();
 
     @PostConstruct
     public void init() {
-        File f = new File(FILE);
-        if (!f.exists()) {
-            // ensure dir
-            f.getParentFile().mkdirs();
-            try {
+        File f = new File(correctionPath);
+        try {
+            if (!f.exists()) {
+                f.getParentFile().mkdirs();
                 f.createNewFile();
-            } catch (IOException ignored) {}
-        }
+            }
+        } catch (Exception ignored) {}
         load();
     }
-    public static class CorrectionItem {
-        public String query;
-        public String wrongCanonical;
-        public String correctCanonical;
-    }
+
     private void load() {
-        try {
-            if (!Files.exists(Paths.get(FILE))) return;
-            List<String> lines = Files.readAllLines(Paths.get(FILE));
-            for (String line : lines) {
-                if (line.trim().isEmpty() || line.startsWith("#")) continue;
-                String[] arr = line.split(",");
-                if (arr.length < 3) continue;
-                CorrectionItem c = new CorrectionItem();
-                c.query = arr[0];
-                c.wrongCanonical = arr[1];
-                c.correctCanonical = arr[2];
-                map.put(c.query, c);
+        File f = new File(correctionPath);
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.trim().isEmpty()) continue;
+                String[] arr = parseCsvLine(line);
+                if (arr.length >= 2) {
+                    map.put(normalize(arr[0]), arr[1].trim());
+                }
             }
         } catch (Exception ignored) {}
     }
 
-    public boolean record(String query, String wrong, String correct) {
-        CorrectionItem c = new CorrectionItem();
-        c.query = query;
-        c.wrongCanonical = wrong;
-        c.correctCanonical = correct;
-        map.put(query, c);
-        return persist();
+    public String getCorrection(String query) {
+        if (query == null) return null;
+        return map.get(normalize(query));
     }
 
-
-    /**
-     * 写入
-     * @return
-     */
-    private boolean persist() {
-        try (BufferedWriter w = new BufferedWriter(new FileWriter(FILE))) {
-            for (CorrectionItem c : map.values()) {
-                w.write(c.query + "," + c.wrongCanonical + "," + c.correctCanonical + "\n");
-            }
+    public synchronized boolean recordCorrection(String query, String canonical) {
+        if (query == null || canonical == null) return false;
+        String line = csvEscape(query) + "," + csvEscape(canonical) + "\n";
+        try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(correctionPath, true), StandardCharsets.UTF_8))) {
+            bw.write(line);
+            bw.flush();
+            map.put(normalize(query), canonical);
             return true;
-        } catch (Exception ignored) {
+        } catch (Exception e) {
             return false;
         }
     }
 
+    // helpers: simple CSV parse/escape
+    private String csvEscape(String s) {
+        if (s == null) return "";
+        if (s.contains(",") || s.contains("\"") || s.contains("\n")) {
+            return "\"" + s.replace("\"", "\"\"") + "\"";
+        }
+        return s;
+    }
+
+    private String[] parseCsvLine(String line) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        boolean inQuotes = false;
+        StringBuilder sb = new StringBuilder();
+        for (int i=0;i<line.length();i++){
+            char c = line.charAt(i);
+            if (c == '"') {
+                if (inQuotes && i+1 < line.length() && line.charAt(i+1) == '"') { sb.append('"'); i++; }
+                else { inQuotes = !inQuotes; }
+                continue;
+            }
+            if (c == ',' && !inQuotes) {
+                out.add(sb.toString());
+                sb.setLength(0);
+            } else sb.append(c);
+        }
+        out.add(sb.toString());
+        return out.toArray(new String[0]);
+    }
+
     private String normalize(String s) {
-        return s == null ? null : s.trim().toLowerCase();
+        return s == null ? "" : s.trim().toLowerCase();
     }
 
-    public CorrectionItem findByQuery(String query) {
-        return map.get(query);
-    }
-
-    /**
-     * 返回修正后的 canonical（如果存在）
-     */
-    public String applyCorrection(String query) {
-        if (query == null) return null;
-        CorrectionItem c = map.get(query);
-        if (c == null) return null;
-        return c.correctCanonical;
-    }
-
-    /**
-     * 纠错覆盖逻辑
-     * query → canonical → FieldInfo
-     */
-    public FieldInfo checkCorrection(String query) {
-        CorrectionItem c = map.get(query.trim().toLowerCase());
-        if (c == null) return null;
-        String canonical = c.correctCanonical;
-
-        if (canonical == null) return null;
-
-        // 关键点：从 KB 中取完整 FieldInfo
-        return kbService.getByCanonical(canonical);
+    // convenience for EnhancedVectorSearchService in previous messages
+    public String lookupCorrect(String q) {
+        return getCorrection(q);
     }
 }

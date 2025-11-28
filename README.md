@@ -1,21 +1,31 @@
-确保 KbService 在加载结束时调用 bm25Service.buildIndex(kb.values())。
+“三方融合搜索算法”，专门为结构化字段匹配进行优化：
 
-如果你使用我之前的异步 KbService 实现，直接把 @Autowired BM25Service bm25Service 和 bm25Service.buildIndex(kb.values()) 加到加载逻辑结束处。
+Alias（别名精确）+ 加权语义向量匹配（Embedding）+ Fuzzy/Correction（兜底）三网合一
 
-启动应用（第一次会读取 kb_with_embedding.csv；若不存在，先运行你已有的生成脚本生成它）。
+整个设计同时确保：
 
-测试搜索：GET /search?q=身份证号（或你原来的 search 接口）→ EnhancedVectorSearchService.match(query,k) 会同时利用 Correction、BM25、vector、text，并把过程写入 search_log.txt。
+    精确优先（alias、拼写纠正）
+    
+    语义为主（desc 和 name 加权）
+    
+    fuzzy 不“抢答”（仅当前两者失败才进入）
+    
+    可控 topK，多候选融合打分
 
-如果搜索结果有误，调用管理接口提交纠错：
+✔ alias 精确秒杀
 
-POST /admin/correct?query=错误输入&canonical=正确的canonicalField
+✔ correction 精确秒杀
 
+✔ vector 占主导
 
-纠错会追加到 src/main/resources/data/correction.csv，并立即在内存生效（applyCorrection 返回会包含该映射）。
+✔ fuzzy 兜底不抢答
 
-若你更新了 KB（替换 kb_with_embedding.csv），可以调用：
+✔ topK 的所有候选都在 candidates 里
 
-POST /admin/reload
+✔ best 是融合后的最终答案
 
+✔ 每个候选都带
 
-触发 KB 重新加载、BM25 重建。
+    评分
+    
+    来源（vector / alias / fuzzy）

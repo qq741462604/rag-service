@@ -1,258 +1,218 @@
 package com.example.rag.service;
 
-import com.example.rag.embedding.EmbeddingService;
 import com.example.rag.model.FieldInfo;
-import org.springframework.beans.factory.annotation.Autowired;
+import com.example.rag.service.CorrectionService;
+import com.example.rag.service.EmbeddingService;
+import com.example.rag.service.KbService;
+import com.example.rag.util.VectorUtils;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Service
 public class EnhancedVectorSearchService {
 
     private final KbService kb;
-    private final BM25Service bm25;
-    private final CorrectionService correction;
-    private final SearchLogService logService;
     private final EmbeddingService embeddingService;
+    private final CorrectionService correctionService;
 
-    // 控制混合搜索的权重
-    private static final float WEIGHT_ALIAS = 100f;
-    private static final float WEIGHT_TEXT = 1.5f;
-    private static final float WEIGHT_VECTOR = 60f;
-    // 权重（可调）
-    private static final double W_BM25 = 1.0;
-    private static final double W_VECTOR = 0.8;
-    private static final double W_TEXT = 0.3;
-    private static final double W_PRIORITY = 0.05;
-    private static final double ALIAS_BONUS = 2.0;
+    @Value("${search.desc-weight}")
+    private int descWeight;
 
+    @Value("${search.name-weight}")
+    private int nameWeight;
 
-    public EnhancedVectorSearchService(KbService kb,
-                                       BM25Service bm25,
-                                       CorrectionService correction,
-                                       SearchLogService logService,
-                                       EmbeddingService embeddingService) {
+    public EnhancedVectorSearchService(
+            KbService kb,
+            EmbeddingService embeddingService,
+            CorrectionService correctionService) {
         this.kb = kb;
-        this.bm25 = bm25;
-        this.correction = correction;
-        this.logService = logService;
         this.embeddingService = embeddingService;
-    }
-
-    public FieldInfo searchByAlias(String query) {
-        String canonical = kb.resolveAlias(query);
-        if (canonical != null) return kb.getByCanonical(canonical);
-        return null;
+        this.correctionService = correctionService;
     }
 
 
-    // ---------- 对外暴露的统一搜索接口 ----------
-    public List<SearchResult> hybridSearch(String query, int topK) {
+    /** 三方融合搜索 */
+    public List<Hit> matchJsonFields(List<Map<String, String>> input, int topK) {
 
-        // 1. alias 命中立即放在最前面（100%置信度）
-        List<SearchResult> aliasHits = aliasMatch(query);
+        List<Hit> result = new ArrayList<>();
 
-        // 2. 文本 + 向量 混合评分
-        List<SearchResult> hybridHits = new ArrayList<>();
-        for (FieldInfo f : kb.all()) {
-            float scoreText = textSimilarity(query, f);
-            float scoreVector = vectorSimilarity(query, f);
+        for (Map<String, String> item : input) {
 
-            float finalScore = scoreText * WEIGHT_TEXT + scoreVector * WEIGHT_VECTOR;
+            String name = item.getOrDefault("name", "");
+            String desc = item.getOrDefault("description", "");
+            String weighted = buildWeightedText(name, desc);
 
-            hybridHits.add(new SearchResult(f, finalScore));
-        }
+            List<Candidate> candidates = new ArrayList<>();
 
-        // 排序
-        hybridHits.sort((a, b) -> Float.compare(b.score, a.score));
-
-        // 去重：把 alias 命中过滤掉
-        Set<String> aliasFields = new HashSet<>();
-        aliasHits.forEach(h -> aliasFields.add(h.info.canonicalField));
-
-        List<SearchResult> merged = new ArrayList<>(aliasHits);
-        for (SearchResult r : hybridHits) {
-            if (!aliasFields.contains(r.info.canonicalField)) {
-                merged.add(r);
+            // -----------------------------------------
+            // 1. correction（最高优先级）
+            // -----------------------------------------
+            String corr = correctionService.getCorrection(desc);
+            if (corr != null) {
+                FieldInfo f = kb.getByCanonical(corr);
+                if (f != null) {
+                    candidates.add(new Candidate(f, 1.0, "correction"));
+                    result.add(Hit.fromCandidates(name, desc, candidates));
+                    continue;
+                }
             }
-        }
 
-        // 返回 topK
-        return merged.subList(0, Math.min(topK, merged.size()));
-    }
-
-    // ---------------------------------------------------
-    // alias 精确匹配
-    // ---------------------------------------------------
-    private List<SearchResult> aliasMatch(String query) {
-        List<SearchResult> results = new ArrayList<>();
-        for (FieldInfo f : kb.all()) {
-            if (f.aliases != null && f.aliases.contains(query)) {
-                results.add(new SearchResult(f, WEIGHT_ALIAS)); // 最高置信度
+            // -----------------------------------------
+            // 2. alias（第二优先级）
+            // -----------------------------------------
+            FieldInfo alias = resolveAliasMatch(desc, name);
+            if (alias != null) {
+                candidates.add(new Candidate(alias, 0.95, "alias"));
+                result.add(Hit.fromCandidates(name, desc, candidates));
+                continue;
             }
-        }
-        return results;
-    }
 
-    // ---------------------------------------------------
-    // 文本 fuzzy 匹配（对所有 FieldInfo 字段做字符交集）
-    // ---------------------------------------------------
-    private float textSimilarity(String q, FieldInfo f) {
-        String text = (f.aliases + "," + f.canonicalField + "," + f.columnName + "," +
-                f.description + "," + f.remark + "," + f.dataType).toLowerCase();
-
-        q = q.toLowerCase();
-        int count = 0;
-        for (char c : q.toCharArray()) {
-            if (text.indexOf(c) >= 0) count++;
-        }
-        return count;
-    }
-
-    // ---------------------------------------------------
-    // 向量相似度（如果无 embedding 返回 0）
-    // ---------------------------------------------------
-    private float vectorSimilarity(String query, FieldInfo f) {
-        if (f.embedding == null || f.embedding.length == 0) return 0;
-
-        float[] qvec = EmbeddingCache.get(query);
-        if (qvec == null) return 0;
-
-        return cosine(qvec, f.embedding);
-    }
-
-    // ---------------------------------------------------
-    // 余弦相似度
-    // ---------------------------------------------------
-    private float cosine(float[] a, float[] b) {
-        float dot = 0, na = 0, nb = 0;
-
-        for (int i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            na += a[i] * a[i];
-            nb += b[i] * b[i];
-        }
-
-        return (float) (dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-5));
-    }
-
-    // 对外统一返回结构
-    public static class SearchResult {
-        public final FieldInfo info;
-        public final float score;
-
-        public SearchResult(FieldInfo info, float score) {
-            this.info = info;
-            this.score = score;
-        }
-    }
-
-    public List<Result> match(String query, int topK) {
-        long start = System.currentTimeMillis();
-
-        // 1) check correction
-        String corr = correction.applyCorrection(query);
-        if (corr != null) {
-            FieldInfo f = kb.getByCanonical(corr);
-            if (f != null) {
-                // log and return single high-confidence result
-                logService.log(query, "CORRECTION_APPLIED -> " + corr);
-                return Collections.singletonList(new Result(f, 999.0, 0,0,0));
+            // -----------------------------------------
+            // 3. vector（核心）
+            // -----------------------------------------
+            float[] qVec = embeddingService.embed(weighted);
+            if (qVec != null) {
+                qVec = VectorUtils.normalize(qVec);
+                List<Scored> vecTop = vectorTopK(qVec, Math.max(topK, 10));
+                for (Scored s : vecTop) {
+                    candidates.add(new Candidate(s.field, s.score * 0.9, "vector"));
+                }
             }
-        }
 
-        // 2) alias exact hit (immediate strong candidate)
-        List<Result> aliasResults = new ArrayList<>();
-        for (FieldInfo f : kb.all()) {
-            if (f.aliases != null && containsTokenExact(f.aliases, query)) {
-                aliasResults.add(new Result(f, ALIAS_BONUS, 0,0,0));
+            // -----------------------------------------
+            // 4. fuzzy（兜底）
+            // -----------------------------------------
+            FieldInfo fuzzy = fuzzyBest(name, desc);
+            if (fuzzy != null) {
+                double fuzzyScore = simpleFuzzy(desc.isEmpty() ? name : desc, fuzzy);
+                candidates.add(new Candidate(fuzzy, fuzzyScore * 0.5, "fuzzy"));
             }
+
+            // -----------------------------------------
+            // 5. 最终融合决策
+            // -----------------------------------------
+            if (candidates.isEmpty()) {
+                candidates.add(new Candidate(null, 0, "none"));
+            }
+
+            result.add(Hit.fromCandidates(name, desc, candidates));
         }
 
-        // 3) build candidate set using BM25 candidateDocs (fast)
-        Set<String> candidates = bm25.candidateDocs(query);
-        // also ensure alias hits included
-        for (Result r : aliasResults) candidates.add(r.field.canonicalField);
+        return result;
+    }
 
-        // if candidates empty, fallback to all (small KB ok)
-        Collection<FieldInfo> pool;
-        if (candidates.isEmpty()) {
-            pool = kb.all();
-        } else {
-            pool = candidates.stream()
-                    .map(kb::getByCanonical)
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.toList());
-        }
 
-        // 4) compute scores for pool
-        float[] qVec = embeddingService.embed(query); // may be null
-        List<Result> scored = new ArrayList<>();
-        for (FieldInfo f : pool) {
-            double bm25Score = bm25.score(query, f.canonicalField);
-            double vecScore = (qVec != null && f.embedding != null && qVec.length == f.embedding.length)
-                    ? cosine(qVec, f.embedding)
-                    : 0.0;
-            double textScore = simpleTextSim(query, f);
-            double total = bm25Score * W_BM25 + vecScore * W_VECTOR + textScore * W_TEXT + f.priorityLevel * W_PRIORITY;
+    // ---------------- helpers ---------------------
 
-            // if alias exact, add bonus
-            if (f.aliases != null && containsTokenExact(f.aliases, query)) total += ALIAS_BONUS;
+    private FieldInfo resolveAliasMatch(String desc, String name) {
+        FieldInfo f = resolveAlias(desc);
+        return (f != null) ? f : resolveAlias(name);
+    }
 
-            scored.add(new Result(f, total, bm25Score, vecScore, textScore));
-        }
+    private FieldInfo resolveAlias(String q) {
+        String key = normalize(q);
+        String canonical = kb.resolveAlias(key);
+        return canonical != null ? kb.getByCanonical(canonical) : null;
+    }
 
-        // 5) sort
-        scored.sort((a,b) -> Double.compare(b.score, a.score));
-
-        // 6) result topK
-        List<Result> out = scored.subList(0, Math.min(topK, scored.size()));
-
-        // 7) logging details
+    private String buildWeightedText(String name, String desc) {
         StringBuilder sb = new StringBuilder();
-        sb.append("match_time_ms=").append(System.currentTimeMillis() - start).append(";");
-        sb.append("candidates=").append(out.size()).append(";");
-        for (Result r : out) {
-            sb.append("[field=").append(r.field.canonicalField)
-                    .append(",score=").append(String.format("%.4f", r.score))
-                    .append(",bm25=").append(String.format("%.4f", r.bm25))
-                    .append(",vec=").append(String.format("%.4f", r.vec))
-                    .append(",text=").append(String.format("%.4f", r.text)).append("]");
+        if (!desc.isEmpty())
+//            sb.append(desc.repeat(descWeight)).append(" ");
+            sb.append(repeat(desc,descWeight)).append(" ");
+        if (!name.isEmpty())
+//            sb.append(name.repeat(nameWeight)).append(" ");
+            sb.append(repeat(name,nameWeight)).append(" ");
+        return sb.toString().trim();
+    }
+
+    private List<Scored> vectorTopK(float[] qVec, int k) {
+        List<Scored> list = new ArrayList<>();
+        for (FieldInfo f : kb.all()) {
+            if (f.getEmbedding() == null) continue;
+            double score = VectorUtils.cosine(qVec, f.getEmbedding());
+            list.add(new Scored(f, score));
         }
-        logService.log(query, sb.toString());
-
-        return out;
+        list.sort((a, b) -> Double.compare(b.score, a.score));
+        return list.subList(0, Math.min(k, list.size()));
     }
-    // ---------------- utils ----------------
-    private boolean containsTokenExact(String aliases, String q) {
-        if (aliases == null || q == null) return false;
-        for (String a : aliases.split("[,|;]")) {
-            if (a.trim().equalsIgnoreCase(q.trim())) return true;
+
+    // 自定义 repeat 方法
+    public static String repeat(String str, int count) {
+        if (count < 0) {
+            throw new IllegalArgumentException("count 不能为负数: " + count);
         }
-        return false;
-    }
-    private double simpleTextSim(String q, FieldInfo f) {
-        // character overlap normalized
-        String text = (f.aliases + " " + f.canonicalField + " " + f.columnName + " " + f.description + " " + f.remark).toLowerCase();
-        q = q.toLowerCase();
-        int hit = 0;
-        for (char c : q.toCharArray()) if (text.indexOf(c) >= 0) hit++;
-        return (double) hit / Math.max(1, q.length());
+        return new String(new char[count]).replace("\0", str);
     }
 
-    // result container
-    public static class Result {
-        public final FieldInfo field;
-        public final double score;
-        public final double bm25;
-        public final double vec;
-        public final double text;
-        public Result(FieldInfo f, double score, double bm25, double vec, double text) {
-            this.field = f; this.score = score; this.bm25 = bm25; this.vec = vec; this.text = text;
+    private FieldInfo fuzzyBest(String name, String desc) {
+        double best = -1;
+        FieldInfo bestF = null;
+        String q = (desc.isEmpty() ? name : desc).toLowerCase();
+        for (FieldInfo f : kb.all()) {
+            double s = simpleFuzzy(q, f);
+            if (s > best) {
+                best = s;
+                bestF = f;
+            }
+        }
+        return bestF;
+    }
+
+    private double simpleFuzzy(String q, FieldInfo f) {
+        String t = (f.getAliases() == null ? "" : f.getAliases())
+                + " " + f.getDescription()
+                + " " + f.getCanonicalField();
+        t = t.toLowerCase();
+        int hits = 0;
+        for (char c : q.toCharArray())
+            if (t.indexOf(c) >= 0) hits++;
+        return hits / (double) Math.max(1, q.length());
+    }
+
+    private String normalize(String s) {
+        if (s == null) return "";
+        return s.trim().toLowerCase().replaceAll("[_\\s]", "");
+    }
+
+
+    // ---------------- DTO ---------------------
+
+    public static class Hit {
+        public String inputName;
+        public String inputDescription;
+        public FieldInfo best;
+        public List<Candidate> candidates;
+
+        public static Hit fromCandidates(String name, String desc, List<Candidate> cs) {
+            Candidate best = cs.stream()
+                    .max(Comparator.comparingDouble(c -> c.score))
+                    .orElse(new Candidate(null, 0, "none"));
+            Hit h = new Hit();
+            h.inputName = name;
+            h.inputDescription = desc;
+            h.best = best.field;
+            h.candidates = cs;
+            return h;
         }
     }
 
+    public static class Candidate {
+        public FieldInfo field;
+        public double score;
+        public String from;
+        public Candidate(FieldInfo f, double s, String from) {
+            this.field = f;
+            this.score = s;
+            this.from = from;
+        }
+    }
 
+    private static class Scored {
+        FieldInfo field;
+        double score;
+        Scored(FieldInfo f, double s) { this.field = f; this.score = s; }
+    }
 }
