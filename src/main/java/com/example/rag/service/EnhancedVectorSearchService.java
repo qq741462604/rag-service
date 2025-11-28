@@ -5,6 +5,7 @@ import com.example.rag.service.CorrectionService;
 import com.example.rag.service.EmbeddingService;
 import com.example.rag.service.KbService;
 import com.example.rag.util.VectorUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -16,6 +17,9 @@ public class EnhancedVectorSearchService {
     private final KbService kb;
     private final EmbeddingService embeddingService;
     private final CorrectionService correctionService;
+
+    @Autowired
+    private SmartCorrectionService smartCorrectionService;
 
     @Value("${search.desc-weight}")
     private int descWeight;
@@ -49,7 +53,9 @@ public class EnhancedVectorSearchService {
             // -----------------------------------------
             // 1. correction（最高优先级）
             // -----------------------------------------
-            String corr = correctionService.getCorrection(desc);
+//            String corr = correctionService.getCorrection(desc);
+            // 改成智能纠错
+            String corr = smartCorrectionService.resolve(desc);
             if (corr != null) {
                 FieldInfo f = kb.getByCanonical(corr);
                 if (f != null) {
