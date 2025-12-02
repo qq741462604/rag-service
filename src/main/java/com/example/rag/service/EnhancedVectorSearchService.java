@@ -54,14 +54,34 @@ public class EnhancedVectorSearchService {
             // 1. correction（最高优先级）
             // -----------------------------------------
 //            String corr = correctionService.getCorrection(desc);
-            // 改成智能纠错
-            String corr = smartCorrectionService.resolve(desc);
-            if (corr != null) {
-                FieldInfo f = kb.getByCanonical(corr);
+            // 0. manual correction (highest priority) - NO embedding here
+            String manual = smartCorrectionService.getManualCorrection(desc);
+            if (manual == null) manual = smartCorrectionService.getManualCorrection(name);
+            if (manual != null) {
+                FieldInfo f = kb.getByCanonical(manual);
                 if (f != null) {
                     candidates.add(new Candidate(f, 1.0, "correction"));
                     result.add(Hit.fromCandidates(name, desc, candidates));
                     continue;
+                }
+            }
+            // 1. semantic suggestion (only a candidate, not authoritative)
+            SmartCorrectionService.Suggestion suggestion = smartCorrectionService.suggestBySemantic(desc);
+            if (suggestion == null) suggestion = smartCorrectionService.suggestBySemantic(name);
+            if (suggestion != null) {
+                FieldInfo sfi = kb.getByCanonical(suggestion.canonical);
+                if (sfi != null) {
+                    // add it as a candidate with lowered score (do not short-circuit)
+                    List<Scored> temp = new ArrayList<>();
+                    temp.add(new Scored(sfi, suggestion.score));
+                    // you can merge with vectorTopK later; here simply add to candidates list
+                    for (Scored sc : temp) {
+                        // store candidates somewhere (if your code expects Hit right away, change to building candidates list)
+                        // For compatibility with your previous code, we can early add candidate and continue vector search
+                        // but do NOT return it as correction
+                        // example: add to temporary list or log it:
+                        candidates.add(new Candidate(sfi, suggestion.score, "semantic-suggestion"));
+                    }
                 }
             }
 

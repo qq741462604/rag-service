@@ -1,7 +1,6 @@
 package com.example.rag.controller;
 
 import com.example.rag.service.CorrectionService;
-import com.example.rag.service.GenerateEmbeddingsController;
 import com.example.rag.service.JsonFieldMatcher;
 import com.example.rag.service.EnhancedVectorSearchService.Hit;
 import com.example.rag.service.KbService;
