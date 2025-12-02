@@ -1,14 +1,17 @@
-package com.example.rag.service;
+package com.example.rag.controller;
 
+import com.example.rag.service.EmbeddingService;
 import com.example.rag.util.CSVUtils;
-import com.example.rag.util.VectorUtils;
+
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
-
+import org.apache.poi.ss.usermodel.*;
 import java.io.*;
 import java.util.*;
 
@@ -18,17 +21,14 @@ import java.util.*;
 @RestController
 public class GenerateEmbeddingsController {
 
-    private final EmbeddingService embeddingService;
+    @Autowired
+    private EmbeddingService embeddingService;
 
     @Value("${kb.raw-path}")
     private String rawPath;
 
     @Value("${kb.emb-path}")
     private String embPath;
-
-    public GenerateEmbeddingsController(EmbeddingService embeddingService) {
-        this.embeddingService = embeddingService;
-    }
 
     @PostMapping("/admin/generate-embeddings")
     public Map<String,Object> generate() throws Exception {
@@ -74,6 +74,73 @@ public class GenerateEmbeddingsController {
         return result;
     }
 
+    @PostMapping("/admin/generate-xlsx-embeddings")
+    public Map<String,Object> generateByExcel() throws Exception {
+        File in = new File(rawPath);
+        if (!in.exists()) return Collections.singletonMap("error", "raw kb.xlsx not found: " + rawPath);
+
+        File out = new File(embPath);
+
+        // overwrite header
+        try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(out), "UTF-8"))) {
+            bw.write("canonical_field,column_name,data_type,length,description,aliases,remark,priority_level,embedding\n");
+        }
+
+        int count = 0;
+
+        // ---------------------
+        // XLSX PARSE
+        // ---------------------
+        try (InputStream is = new FileInputStream(in);
+             Workbook workbook = new XSSFWorkbook(is)) {
+
+            Sheet sheet = workbook.getSheetAt(0);
+            Iterator<Row> it = sheet.iterator();
+            if (it.hasNext()) it.next(); // skip header row
+
+            while (it.hasNext()) {
+                Row row = it.next();
+
+                String canonical = cell(row, 0);
+                String column    = cell(row, 1);
+                String dataType  = cell(row, 2);
+                String length    = cell(row, 3);
+                String description = cell(row, 4);
+                String aliases   = cell(row, 5);
+                String remark    = cell(row, 6);
+                String priority  = cell(row, 7);
+
+                String inputText = buildEmbeddingInput(canonical, column, description, aliases, remark);
+                float[] vec = embeddingService.embed(inputText);
+                if (vec == null) {
+                    return Collections.singletonMap("error", "embedding failed for " + canonical);
+                }
+
+                List<String> cols = Arrays.asList(canonical, column, dataType, length, description, aliases, remark, priority);
+                CSVUtils.appendRowWithEmbedding(out, cols, vec);
+                count++;
+
+                Thread.sleep(50);
+            }
+        }
+
+        Map<String,Object> result = new HashMap<>();
+        result.put("ok", true);
+        result.put("generated", count);
+
+        return result;
+    }
+
+    private String cell(Row row, int index) {
+        try {
+            Cell cell = row.getCell(index, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+            if (cell == null) return "";
+            cell.setCellType(CellType.STRING);
+            return cell.getStringCellValue().trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
     private String safe(CSVRecord r, int idx) {
         try { return r.get(idx); } catch (Exception e) { return ""; }
     }
