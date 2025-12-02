@@ -146,9 +146,41 @@ public class SmartCorrectionService {
         return cleanPattern.matcher(s).replaceAll("");
     }
 
+//    private String normalize(String s) {
+//        if (s == null) return "";
+//        return s.trim().toLowerCase().replaceAll("[_\\s]", "");
+//    }
     private String normalize(String s) {
         if (s == null) return "";
-        return s.trim().toLowerCase().replaceAll("[_\\s]", "");
+
+        // 去除 BOM
+        s = s.replace("\uFEFF", "");
+        // 全部转小写
+        s = s.toLowerCase();
+
+        // 去除所有空白符（包含 \u200b 等不可见）
+        s = s.replaceAll("[\\s\\u00A0\\u200B\\u200C\\u200D\\uFEFF]", "");
+
+        // 把全角转半角
+        s = toHalfWidth(s);
+
+        // 去除中英文符号
+        s = s.replaceAll("[`~!@#\\$%\\^&\\*\\(\\)\\-_=\\+\\[\\]{};:'\",.<>/?·！￥…（）—【】“”；：，。？·]", "");
+
+        return s.trim();
+    }
+
+    private String toHalfWidth(String s) {
+        StringBuilder out = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            if (c >= 65281 && c <= 65374)
+                out.append((char)(c - 65248));
+            else if (c == 12288)
+                out.append(' ');
+            else
+                out.append(c);
+        }
+        return out.toString();
     }
 
     // minimal CSV parse for two columns (supports quoted)
