@@ -22,7 +22,7 @@ dashscope:
 model:
   name: "text-embedding-v2"
 kb:
-  raw-path: "src/main/resources/data/kb.csv"
+  raw-path: "src/main/resources/data/kb.xlsx"
   emb-path: "src/main/resources/data/kb_with_embedding.csv"
   correction-path: "src/main/resources/data/correction.csv"
 search:

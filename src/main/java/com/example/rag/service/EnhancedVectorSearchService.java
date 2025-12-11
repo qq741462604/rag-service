@@ -66,24 +66,24 @@ public class EnhancedVectorSearchService {
                 }
             }
             // 1. semantic suggestion (only a candidate, not authoritative)
-            SmartCorrectionService.Suggestion suggestion = smartCorrectionService.suggestBySemantic(desc);
-            if (suggestion == null) suggestion = smartCorrectionService.suggestBySemantic(name);
-            if (suggestion != null) {
-                FieldInfo sfi = kb.getByCanonical(suggestion.canonical);
-                if (sfi != null) {
-                    // add it as a candidate with lowered score (do not short-circuit)
-                    List<Scored> temp = new ArrayList<>();
-                    temp.add(new Scored(sfi, suggestion.score));
-                    // you can merge with vectorTopK later; here simply add to candidates list
-                    for (Scored sc : temp) {
-                        // store candidates somewhere (if your code expects Hit right away, change to building candidates list)
-                        // For compatibility with your previous code, we can early add candidate and continue vector search
-                        // but do NOT return it as correction
-                        // example: add to temporary list or log it:
-                        candidates.add(new Candidate(sfi, suggestion.score, "semantic-suggestion"));
-                    }
-                }
-            }
+//            SmartCorrectionService.Suggestion suggestion = smartCorrectionService.suggestBySemantic(desc);
+//            if (suggestion == null) suggestion = smartCorrectionService.suggestBySemantic(name);
+//            if (suggestion != null) {
+//                FieldInfo sfi = kb.getByCanonical(suggestion.canonical);
+//                if (sfi != null) {
+//                    // add it as a candidate with lowered score (do not short-circuit)
+//                    List<Scored> temp = new ArrayList<>();
+//                    temp.add(new Scored(sfi, suggestion.score));
+//                    // you can merge with vectorTopK later; here simply add to candidates list
+//                    for (Scored sc : temp) {
+//                        // store candidates somewhere (if your code expects Hit right away, change to building candidates list)
+//                        // For compatibility with your previous code, we can early add candidate and continue vector search
+//                        // but do NOT return it as correction
+//                        // example: add to temporary list or log it:
+//                        candidates.add(new Candidate(sfi, suggestion.score, "semantic-suggestion"));
+//                    }
+//                }
+//            }
 
             // -----------------------------------------
             // 2. alias（第二优先级）

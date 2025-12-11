@@ -49,11 +49,17 @@
             <version>2.13.4</version>
         </dependency>
 
-        <!-- Apache Commons CSV -->
+<!--        &lt;!&ndash; Apache Commons CSV &ndash;&gt;-->
+<!--        <dependency>-->
+<!--            <groupId>org.apache.commons</groupId>-->
+<!--            <artifactId>commons-csv</artifactId>-->
+<!--            <version>1.10.0</version>-->
+<!--        </dependency>-->
+
         <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-csv</artifactId>
-            <version>1.10.0</version>
+            <groupId>com.opencsv</groupId>
+            <artifactId>opencsv</artifactId>
+            <version>5.5.2</version>
         </dependency>
 
 
