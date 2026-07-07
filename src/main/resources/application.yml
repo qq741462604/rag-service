@@ -28,3 +28,21 @@ kb:
 search:
   desc-weight: 3
   name-weight: 1
+
+
+#加鉴权
+auth:
+  enabled: true          # 是否开启鉴权（支持灰度）
+  time-window-seconds: 300
+
+  # appId -> appSecret
+  app-secrets:
+    demo-app: demo-secret-123
+
+  # 不参与鉴权的路径前缀（框架 / 探针 / 运维）
+  excluded-path-prefixes:
+    - /actuator
+    - /health
+    - /metrics
+    - /probe
+    - /prometheus
