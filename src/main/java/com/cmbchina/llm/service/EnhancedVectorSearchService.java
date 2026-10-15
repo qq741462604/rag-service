@@ -1,0 +1,267 @@
+package com.cmbchina.llm.service;
+
+import com.cmbchina.llm.entity.model.FieldInfo;
+import com.cmbchina.llm.util.VectorUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+
+@Service
+@Slf4j
+public class EnhancedVectorSearchService {
+
+    private final KbService kb;
+    private final EmbeddingService embeddingService;
+
+    @Autowired
+    private SmartCorrectionService smartCorrectionService;
+
+    @Value("${search.desc-weight}")
+    private int descWeight;
+
+    @Value("${search.name-weight}")
+    private int nameWeight;
+
+    public EnhancedVectorSearchService(
+            KbService kb,
+            EmbeddingService embeddingService) {
+        this.kb = kb;
+        this.embeddingService = embeddingService;
+    }
+
+
+    /**
+     * 三方融合搜索
+     */
+    public List<Hit> matchJsonFields(List<Map<String, String>> input, int topK) {
+
+        List<Hit> result = new ArrayList<>();
+
+        for (Map<String, String> item : input) {
+
+            String name = item.getOrDefault("name", "");
+            String desc = item.getOrDefault("description", "");
+            String weighted = buildWeightedText(name, desc);
+
+            List<Candidate> candidates = new ArrayList<>();
+
+            // -----------------------------------------
+            // 1. correction（最高优先级）
+            // -----------------------------------------
+
+            // 0. manual correction (highest priority) - NO embedding here
+            String manual = smartCorrectionService.getManualCorrection(desc);
+            if (manual == null) {
+                manual = smartCorrectionService.getManualCorrection(name);
+            }
+            if (manual != null) {
+                FieldInfo f = kb.getByCanonical(manual);
+                if (f != null) {
+                    candidates.add(new Candidate(f, 1.0, "correction"));
+                    result.add(Hit.fromCandidates(name, desc, candidates));
+                    continue;
+                }
+            }
+            // 1. semantic suggestion (only a candidate, not authoritative)
+            /** 此处代码暂时不用
+             * SmartCorrectionService.Suggestion suggestion = smartCorrectionService.suggestBySemantic(desc);
+             *             if (suggestion == null) {
+             *                 suggestion = smartCorrectionService.suggestBySemantic(name);
+             *             }
+             *             if (suggestion != null) {
+             *                 FieldInfo sfi = kb.getByCanonical(suggestion.canonical);
+             *                 if (sfi != null) {
+             *                     // add it as a candidate with lowered score (do not short-circuit)
+             *                     List<Scored> temp = new ArrayList<>();
+             *                     temp.add(new Scored(sfi, suggestion.score));
+             *                     // you can merge with vectorTopK later; here simply add to candidates list
+             *                     for (Scored sc : temp) {
+             *                         // store candidates somewhere (if your code expects Hit right away, change to building candidates list)
+             *                         // For compatibility with your previous code, we can early add candidate and continue vector search
+             *                         // but do NOT return it as correction
+             *                         // example: add to temporary list or log it:
+             *                         log.info("sc: {} -> {}", sc);
+             *                         candidates.add(new Candidate(sfi, suggestion.score, suggestion.reason));
+             *                     }
+             *                 }
+             *             }
+             *
+             */
+
+            // -----------------------------------------
+            // 2. alias（第二优先级）
+            // -----------------------------------------
+            FieldInfo alias = resolveAliasMatch(desc, name);
+            if (alias != null) {
+                candidates.add(new Candidate(alias, 0.95, "alias"));
+                result.add(Hit.fromCandidates(name, desc, candidates));
+                continue;
+            }
+
+            // -----------------------------------------
+            // 3. vector（核心）
+            // -----------------------------------------
+            float[] qVec = embeddingService.embed(weighted);
+            if (qVec != null) {
+                qVec = VectorUtils.normalize(qVec);
+                List<Scored> vecTop = vectorTopK(qVec, Math.max(topK, 10));
+                for (Scored s : vecTop) {
+                    candidates.add(new Candidate(s.field, s.score * 0.9, "vector"));
+                }
+            }
+
+            // -----------------------------------------
+            // 4. fuzzy（兜底）
+            // -----------------------------------------
+            FieldInfo fuzzy = fuzzyBest(name, desc);
+            if (fuzzy != null) {
+                double fuzzyScore = simpleFuzzy(desc.isEmpty() ? name : desc, fuzzy);
+                candidates.add(new Candidate(fuzzy, fuzzyScore * 0.5, "fuzzy"));
+            }
+
+            // -----------------------------------------
+            // 5. 最终融合决策
+            // -----------------------------------------
+            if (candidates.isEmpty()) {
+                candidates.add(new Candidate(null, 0, "none"));
+            }
+
+            result.add(Hit.fromCandidates(name, desc, candidates));
+        }
+        return result;
+    }
+
+
+    // ---------------- helpers ---------------------
+
+    private FieldInfo resolveAliasMatch(String desc, String name) {
+        FieldInfo f = resolveAlias(desc);
+        return (f != null) ? f : resolveAlias(name);
+    }
+
+    private FieldInfo resolveAlias(String q) {
+        String key = normalize(q);
+        String canonical = kb.resolveAlias(key);
+        return canonical != null ? kb.getByCanonical(canonical) : null;
+    }
+
+    private String buildWeightedText(String name, String desc) {
+        StringBuilder sb = new StringBuilder();
+        if (!desc.isEmpty()) {
+            sb.append(repeat(desc, descWeight)).append(" ");
+        }
+        if (!name.isEmpty()) {
+            sb.append(repeat(name, nameWeight)).append(" ");
+        }
+        return sb.toString().trim();
+    }
+
+    private List<Scored> vectorTopK(float[] qVec, int k) {
+        List<Scored> list = new ArrayList<>();
+        for (FieldInfo f : kb.all()) {
+            if (f.getEmbedding() == null) {
+                continue;
+            }
+            double score = VectorUtils.cosine(qVec, f.getEmbedding());
+            list.add(new Scored(f, score));
+        }
+        list.sort((a, b) -> Double.compare(b.score, a.score));
+        return list.subList(0, Math.min(k, list.size()));
+    }
+
+    // 自定义 repeat 方法
+    public static String repeat(String str, int count) {
+        if (count < 0) {
+            throw new IllegalArgumentException("count 不能为负数: " + count);
+        }
+        return new String(new char[count]).replace("\0", str);
+    }
+
+    private FieldInfo fuzzyBest(String name, String desc) {
+        double best = -1;
+        FieldInfo bestF = null;
+        String q = (desc.isEmpty() ? name : desc).toLowerCase();
+        for (FieldInfo f : kb.all()) {
+            double s = simpleFuzzy(q, f);
+            if (s > best) {
+                best = s;
+                bestF = f;
+            }
+        }
+        return bestF;
+    }
+    private double simpleFuzzy(String q, FieldInfo f) {
+        String t = (f.getAliases() == null ? "" : f.getAliases())
+                + " " + f.getDescription()
+                + " " + f.getCanonicalField();
+        t = t.toLowerCase();
+        int hits = 0;
+        for (char c : q.toCharArray()) {
+            if (t.indexOf(c) >= 0) {
+                hits++;
+            }
+        }
+        return hits / (double)Math.max(1, q.length());
+    }
+
+    private String normalize(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.trim().toLowerCase().replaceAll("[_\\s]", "");
+    }
+
+
+    // ---------------- DTO ---------------------
+
+    public static class Hit {
+        public String inputName;
+        public String inputDescription;
+        public FieldInfo best;
+        public List<Candidate> candidates;
+
+        public static Hit fromCandidates(String name, String desc, List<Candidate> cs) {
+            Candidate best = cs.stream()
+                    .max(Comparator.comparingDouble(c -> c.score))
+                    .orElse(new Candidate(null, 0, "none"));
+            Hit h = new Hit();
+            h.inputName = name;
+            h.inputDescription = desc;
+            h.best = best.field;
+            h.candidates = cs;
+            return h;
+        }
+    }
+
+    public static class Candidate {
+        public FieldInfo field;
+        public double score;
+        public String from;
+
+        public Candidate(FieldInfo f, double s, String from) {
+            // 去除向量信息
+            if (f != null) {
+                f.setEmbedding(new float[0]);
+            }
+            this.field = f;
+            this.score = s;
+            this.from = from;
+        }
+    }
+
+    private static class Scored {
+        FieldInfo field;
+        double score;
+
+        Scored(FieldInfo f, double s) {
+            this.field = f;
+            this.score = s;
+        }
+    }
+}

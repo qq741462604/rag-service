@@ -42,3 +42,7 @@ application-local.yml
 *.log
 *.txt
 *.csv
+/logs/
+/.idea/
+/.mvn/
+/src/main/resources/application-bak.yml

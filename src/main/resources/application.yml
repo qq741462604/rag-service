@@ -3,49 +3,137 @@ server:
 
 spring:
   profiles:
-    active: local
-  jackson:
-    time-zone: GMT+8
+    active: ${SPRING_ACTIVE_PROFILE:local}
 
-embedding:
+
+logging:
+  file:
+    name: logs/mini-codex.log
+  level:
+    com.cmbchina.llm: INFO
+
+
+
+LLM_API_KEY: BExxxx88oGurMqzhV9zgudJC0Aw==
+
+#=============================================================================
+# 日志模块设置日志访问级别
+#=============================================================================
+#logging:
+#  level:
+#    root: debug
+
+#embedding模型
+dashscope:
   api:
-    url: https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings
+    url: http://xxx/bge-m3-flash/v1/embeddings # <- 替换为真实 dashscope embedding URL
     key: ${LLM_API_KEY}
-vector:
-  topk: 5
-  threshold: 0.60
+    model: bge-m3-flash
 
-
-qwen:
+#日志分析模型
+docllm:
   api:
-    url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+    url: http://xxx/${docllm.api.model}/v1/chat/completions # <- 替换为真实 dashscope embedding URL
     key: ${LLM_API_KEY}
-  model: qwen-plus
-  top_n: 5
-
-okhttp:
-  connect-timeout: 10000
-  read-timeout: 20000
-  write-timeout: 20000
-  retry-on-connection-failure: true
-  max-idle-connections: 5
-  keep-alive-duration: 300000
-
-# Knowledge file location (external override possible)
+    model: qwen3p6-35b-a3b
 kb:
-  input:
-    path: src/main/resources/data/kb.csv
-  output:
-    path: src/main/resources/data/kb_with_embedding.csv
-  load:
-    path: src/main/resources/data/kb_with_embedding.csv
-  correction: src/main/resources/data/correction.csv
+  raw-path: "data/canonical_field_dirt.xlsx"
+  emb-path: "data/kb_with_embedding.csv"
+  correction-path: "data/correction.csv"
+search:
+  desc-weight: 3
+  name-weight: 1
+  top-k: 5
 
-# MyBatis配置
-mybatis:
-  mapper-locations: classpath:mapper/*.xml
-  type-aliases-package: com.example
-  configuration:
-    map-underscore-to-camel-case: true
-    cache-enabled: false
+#文档开发助手配置
+#位置  D:\ideaPro\AI\LW45.02_rag_service\
+minicodex:
+  home: D:/ideaPro/AI/LW45.02_rag_service
 
+#目标  D:\FlinkTest\demo\LW45.07_RT_PfPlugin
+codex:
+  workspace:
+    root: D:/FlinkTest/demo/LW45.07_RT_PfPlugin
+
+llm:
+  appKey: ？？？
+  actionKey: xxxx=   #测试自定义知识库
+  API-Key: xxx+2YPSwalF5KNahJQSNyzUIf4pmA==
+  url: http://xxx/${llm.appKey}/tag/dev/workflow/run/${llm.actionKey}
+  async-url: https://xxx/${llm.appKey}/tag/dev/run/single/action
+  async-query-url: https://xxx/${llm.appKey}/tag/dev/result/query/{}
+  #  代码生成模型
+  api:
+    url: ${docllm.api.url}  #统一调用地址，仅更换模型即可
+    key: ${LLM_API_KEY}
+  model: ${docllm.api.model}
+
+a: http://xxx8
+bee:
+  #=============================================================================
+  # tracer模块配置设置BusinessId，xxx表示对应的BusinessId（这里需要修改xxx为自行设定businessId），值为对应的API或者作业条。支持通配符、带参数的方式。例如：/**/wulei
+  # bee.tracing.samplingRate，如要测试，请一定要配置。采样率。默认值为0.001，即10000次请求大约有10次请求会被监控，如果设置为1，就是每一次请求都会被监控并输出日志
+  #=============================================================================
+  tracing:
+    businessIds:
+      LW4502RagService: /**
+  #    samplingRate: 1
+  #=============================================================================
+  # 数据访问模块persistence
+  #=============================================================================
+  # 数据库配置信息，多数据源配置，bee.persistence是前缀，ds1数据源名称，后接数据库连接配置属性
+
+thread:
+  pool:
+    core-pool-size: ${CORE-POOL-SIZE:2}
+    max-pool-size: ${MAX-POOL-SIZE:2}
+    keep-alive-time: ${KEEP-ALIVE-TIME:60}
+    queue-capacity: ${QUEUE-CAPACITY:20}
+
+
+dimension:
+  config:
+    - id: "CUST_ID"
+      name: "客户号"
+    - id: "LoginID"
+      name: "登录ID"
+    - id: "userId"
+      name: "用户编号维度"
+    - id: "pid"
+      name: "pid维度"
+    - id: "walletId"
+      name: "钱包id维度"
+    - id: "ipAddress"
+      name: "ip地址维度"
+    - id: "deviceNumber"
+      name: "设备号维度"
+    - id: "macAddress"
+      name: "mac维度"
+    - id: "TRX_EAC_ID"
+      name: "转出账号"
+    - id: "AGC_ACC_NBR"
+      name: "发起方账号"
+    - id: "CARD_NUMBER"
+      name: "交易卡号维度"
+    - id: "merId"
+      name: "merId维度"
+    - id: "Caller"
+      name: "来电号码"
+    - id: "ACCOUNT"
+      name: "账户维度"
+    - id: "OPP_TRX_EAC_NBR"
+      name: "收方账户"
+    - id: "linkageAccount2"
+      name: "联动方B户口号"
+    - id: "linkageAccount1"
+      name: "发起方A账户号"
+    - id: "creditorWalletId"
+      name: "收款钱包id维度"
+    - id: "ctpAcctNbr"
+      name: "银联对手账户号维度"
+    - id: "remarkTextClt"
+      name: "银联子账户维度"
+    - id: "ctpAcctName"
+      name: "银联对手账户名"
+    - id: "EAC_NM"
+      name: "账户名维度"
