@@ -16,9 +16,7 @@ import java.io.File;
  * <p>校验计划中每个文件操作步骤的合法性，包括路径非空、patch 目标存在性
  * 以及 CODING 双子行程路径约束（S1 只能写 src/main，S2 只能写 src/test）。</p >
  *
- * <p>注意：write_file / create_file 已放开"不得覆盖已存在文件"的限制。
- * 分轮读取模板生成代码时，下一轮常会遇到已存在文件，这是正常场景，
- * 不应校验失败阻断流程。</p >
+ * <p>已有文件必须先读后 patch，禁止通过新建工具覆盖原有代码。</p >
  *
  * @author IT006901
  * @date 2026-10-10 15:40:00
@@ -60,7 +58,9 @@ public class PlanValidator {
                 && isFileMutationTool(tool)) {
             validateCodingTrackPath(path, tool, context);
         }
-        // write_file / create_file 已放开已存在文件限制，不再校验存在性
+        if (isCreateTool(tool) && isExistingFile(path)) {
+            throw new IllegalArgumentException("existing file requires read_file then patch_file path=" + path);
+        }
         if ("patch_file".equals(tool)) {
             validatePatchTool(input);
         }

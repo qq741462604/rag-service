@@ -1,12 +1,10 @@
 package com.cmbchina.llm.tool;
 
-
 import com.cmbchina.llm.agent.AgentContext;
 import com.cmbchina.llm.config.AgentHomeService;
 import com.cmbchina.llm.workspace.WorkspaceService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
-
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -15,145 +13,56 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 
-
-
 @Component
 @RequiredArgsConstructor
 public class ReadFileTool extends BaseTool {
 
-
-    private final WorkspaceService workspaceService;
-
-    private final AgentHomeService agentHomeService;
-
-
-
     private static final int DEFAULT_LIMIT = 200;
 
-
+    private final WorkspaceService workspaceService;
+    private final AgentHomeService agentHomeService;
 
     @Override
     public String name() {
-
         return "read_file";
-
     }
-
-
 
     @Override
     public String description() {
-
         return "读取项目文件内容";
-
     }
 
-
-
-
     @Override
-    public void validate(
-            Object input
-    ){
-
-
-        ToolInput toolInput =
-                (ToolInput) input;
-
-
-
-        if(toolInput.getPath()==null
-                ||
-                toolInput.getPath().trim().isEmpty()){
-
-
-            throw new IllegalArgumentException(
-                    "read_file path empty"
-            );
-
+    public void validate(Object input) {
+        ToolInput toolInput = (ToolInput) input;
+        if (toolInput.getPath() == null || toolInput.getPath().trim().isEmpty()) {
+            throw new IllegalArgumentException("read_file path empty");
         }
-
-
     }
 
-
-
-
-
     @Override
-    public Object execute(
-            Object input,
-            AgentContext context
-    ) throws Exception {
-
-
+    public Object execute(Object input, AgentContext context) throws Exception {
         logExecute(input);
-
-
-
-        ToolInput toolInput =
-                (ToolInput) input;
-
-
-
-        File file =
-                resolveFile(
-                        toolInput.getPath()
-                );
-
-
-
-        if(!file.exists()
-                ||
-                !file.isFile()){
-
-
-            throw new RuntimeException(
-                    "file not found:"
-                            +
-                            file.getAbsolutePath()
-            );
-
+        ToolInput toolInput = (ToolInput) input;
+        File file = resolveFile(toolInput.getPath());
+        if (!file.exists() || !file.isFile()) {
+            throw new RuntimeException("file not found:" + file.getAbsolutePath());
         }
 
-
-
-        int startLine =
-                toolInput.getStartLine()==null
-                        ?
-                        1
-                        :
-                        toolInput.getStartLine();
-
-
-
-        int endLine =
-                toolInput.getEndLine()==null
-                        ?
-                        startLine + DEFAULT_LIMIT
-                        :
-                        toolInput.getEndLine();
-
-
-
-        return read(
-                file,
-                startLine,
-                endLine
-        );
-
-
+        int startLine = toolInput.getStartLine() == null ? 1 : toolInput.getStartLine();
+        int endLine = toolInput.getEndLine() == null
+                ? startLine + DEFAULT_LIMIT
+                : toolInput.getEndLine();
+        return read(file, startLine, endLine);
     }
 
-
-
-
-
-
-    private File resolveFile(
-            String path
-    ){
-
+    private File resolveFile(String path) {
+        // Skill 的 docs/*.md 是生成器工程的只读模板，不属于 codex.workspace.root
+        // 指向的目标工程。必须优先从 minicodex.home 解析，避免目标工程恰好有同名
+        // docs 文件，或模型将相对路径展开为目标工程绝对路径时读取到错误模板。
+        if (isAgentHomeReference(path)) {
+            return resolveFromAgentHomeDocs(path);
+        }
 
         /*
          * 优先解析到 workspace（目标项目）目录。
@@ -175,17 +84,9 @@ public class ReadFileTool extends BaseTool {
             // 路径不在 workspace 内：跳过 workspace 解析，直接走 docs 回退
         }
 
-        if(file != null
-                &&
-                (file.exists()
-                        ||
-                        file.isFile())){
-
-
+        if (file != null && (file.exists() || file.isFile())) {
             return file;
-
         }
-
 
         /*
          * workspace（目标项目）下不存在时，
@@ -199,25 +100,22 @@ public class ReadFileTool extends BaseTool {
          * - 绝对路径：D:\FlinkTest\demo\...\docs\predict-call-template.md
          *   此时从原路径中提取文件名，到 agent home 的 docs 目录下查找。
          */
-        File reference =
-                resolveFromAgentHomeDocs(
-                        path
-                );
-
-
-        if(reference.exists()
-                ||
-                reference.isFile()){
-
-
+        File reference = resolveFromAgentHomeDocs(path);
+        if (reference.exists() || reference.isFile()) {
             return reference;
-
         }
-
-
         return file != null ? file : reference;
-
     }
+
+    private boolean isAgentHomeReference(String path) {
+        if (path == null || path.trim().isEmpty()) {
+            return false;
+        }
+        String normalized = path.trim().replace('\\', '/').toLowerCase();
+        return normalized.startsWith("docs/")
+                || (normalized.contains("/docs/") && normalized.endsWith(".md"));
+    }
+
     /**
      * 尝试从 agent home 项目的 docs 参考文档目录解析文件。
      *
@@ -227,35 +125,19 @@ public class ReadFileTool extends BaseTool {
      * @param path 原始路径（相对或绝对）
      * @return 解析后的文件（可能不存在）
      */
-    private File resolveFromAgentHomeDocs(
-            String path
-    ){
-
-
-        if(path==null
-                ||
-                path.trim().isEmpty()){
-
-
+    private File resolveFromAgentHomeDocs(String path) {
+        if (path == null || path.trim().isEmpty()) {
             return agentHomeService.resolve(path);
-
         }
 
-
         String trimmed = path.trim();
-
-
         /*
          * 相对路径（docs/ 或 docs\ 开头）：直接用原路径拼接 home 目录。
          */
-        String normalized = trimmed.replace('\\','/');
-        if(normalized.startsWith("docs/")){
-
-
+        String normalized = trimmed.replace('\\', '/');
+        if (normalized.startsWith("docs/")) {
             return agentHomeService.resolve(trimmed);
-
         }
-
 
         /*
          * 绝对路径或其它形式：提取 docs/ 之后的完整子路径（含子目录），到 home 的 docs 目录下查找。
@@ -263,7 +145,6 @@ public class ReadFileTool extends BaseTool {
          * 例如 D:\...\docs\predict-call-template-parts\00-overview.md -> home/docs/predict-call-template-parts/00-overview.md
          */
         String normalizedPath = trimmed.replace('\\', '/');
-
         // 尝试提取 docs/ 之后的完整相对路径（保留子目录结构）
         int docsIdx = normalizedPath.indexOf("/docs/");
         if (docsIdx >= 0) {
@@ -272,150 +153,45 @@ public class ReadFileTool extends BaseTool {
         }
 
         // 路径中没有 docs/ 段，退化为只提取文件名
-        String fileName =
-                new File(trimmed)
-                        .getName();
-
-
-        if(fileName.isEmpty()){
-
-
+        String fileName = new File(trimmed).getName();
+        if (fileName.isEmpty()) {
             return agentHomeService.resolve(trimmed);
-
         }
-
-
-        return agentHomeService.resolve(
-                "docs"
-                        +
-                        File.separator
-                        +
-                        fileName
-        );
-
+        return agentHomeService.resolve("docs" + File.separator + fileName);
     }
 
-
-
-
-
-    private FileContent read(
-            File file,
-            int startLine,
-            int endLine
-    ){
-
-
-        BufferedReader reader=null;
-
-
-        List<String> result =
-                new ArrayList<>();
-
-
-
-        try{
-
-
-            reader =
-                    Files.newBufferedReader(
-                            file.toPath(),
-                            StandardCharsets.UTF_8
-                    );
-
-
-
+    private FileContent read(File file, int startLine, int endLine) {
+        BufferedReader reader = null;
+        List<String> result = new ArrayList<>();
+        try {
+            reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8);
             String line;
-
-
-            int current=1;
-
-
-
-            while(
-                    (line=reader.readLine())
-                            !=null
-            ){
-
-
-
-                if(current>=startLine
-                        &&
-                        current<=endLine){
-
-
-                    result.add(
-                            current
-                                    +
-                                    ": "
-                                    +
-                                    line
-                    );
-
-
+            int current = 1;
+            while ((line = reader.readLine()) != null) {
+                if (current >= startLine && current <= endLine) {
+                    result.add(current + ": " + line);
                 }
-
-
-
-                if(current>endLine){
-
+                if (current > endLine) {
                     break;
-
                 }
-
-
                 current++;
-
-
             }
-
-
-
 
             return FileContent.builder()
-                    .path(
-                            file.getCanonicalPath()
-                    )
-                    .startLine(
-                            startLine
-                    )
-                    .endLine(
-                            endLine
-                    )
-                    .lines(
-                            result
-                    )
+                    .path(file.getCanonicalPath())
+                    .startLine(startLine)
+                    .endLine(endLine)
+                    .lines(result)
                     .build();
-
-
-
-        }catch(Exception e){
-
-
-            throw new RuntimeException(
-                    e
-            );
-
-
-        }finally{
-
-
-            try{
-
-                if(reader!=null){
-
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            try {
+                if (reader != null) {
                     reader.close();
-
                 }
-
-            }catch(Exception ignored){
-
+            } catch (Exception ignored) {
             }
-
         }
-
-
     }
-
-
 }

@@ -11,7 +11,7 @@
 http:
   invoke:
     enable: true #模型接口开关
-    url: http://rcprtzf.paasuat.cmbchina.cn/services/rest/api/predict # uat环境模型地址
+    url: http://xxxx/services/rest/api/predict # uat环境模型地址
     connection-timeout: 20 # 连接超时时间，
     socket-timeout: 300 # 响应超时时间
 #    socket-timeout: 100 # 响应超时时间

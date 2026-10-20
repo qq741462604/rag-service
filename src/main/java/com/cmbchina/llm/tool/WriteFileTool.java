@@ -50,7 +50,6 @@ public class WriteFileTool extends BaseTool {
         // 分轮读取模板生成代码时，下一轮常会遇到已存在文件，这是正常场景，
         // 不应抛错阻断（原有代码要求改用 patch_file，但 LLM 的 oldText 常不匹配，
         // 会导致反复降级 read_file 直至耗尽迭代）。
-
         if (file.getParentFile() != null && !file.getParentFile().exists()) {
             file.getParentFile().mkdirs();
         }

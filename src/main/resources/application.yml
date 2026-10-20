@@ -33,9 +33,9 @@ dashscope:
 #日志分析模型
 docllm:
   api:
-    url: http://xxx/${docllm.api.model}/v1/chat/completions # <- 替换为真实 dashscope embedding URL
+    url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions # <- 替换为真实 dashscope embedding URL
     key: ${LLM_API_KEY}
-    model: qwen3p6-35b-a3b
+    model: qwen3.5-plus-2026-02-15
 kb:
   raw-path: "data/canonical_field_dirt.xlsx"
   emb-path: "data/kb_with_embedding.csv"
@@ -46,14 +46,17 @@ search:
   top-k: 5
 
 #文档开发助手配置
-#位置  D:\ideaPro\AI\LW45.02_rag_service\
+#位置  D:\ideaProject\target\LW45.07_RT_PfPlugin
 minicodex:
-  home: D:/ideaPro/AI/LW45.02_rag_service
+  home: D:/ideaProject/AI/LW45.02_rag_service
 
-#目标  D:\FlinkTest\demo\LW45.07_RT_PfPlugin
+#目标  D:\ideaProject\target\LW45.07_RT_PfPlugin
 codex:
+  agent:
+    test-generation-enabled: false # 暂停 S2 测试生成及自动执行
+    max-model-calls: 40 # 单任务规划调用上限，确定性模板读取不消耗该预算
   workspace:
-    root: D:/FlinkTest/demo/LW45.07_RT_PfPlugin
+    root: D:/ideaProject/target/LW45.07_RT_PfPlugin
 
 llm:
   appKey: ？？？

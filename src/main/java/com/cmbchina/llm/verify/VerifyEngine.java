@@ -7,6 +7,7 @@ import com.cmbchina.llm.tool.ToolInput;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Value;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -22,6 +23,9 @@ public class VerifyEngine {
     private final CodeValidator validator;
     private final VerifyFileLoader loader;
     private final RunTestTool runTestTool;
+
+    @Value("${codex.agent.test-generation-enabled:false}")
+    private boolean testGenerationEnabled;
 
     /**
      * 执行验证。
@@ -40,6 +44,10 @@ public class VerifyEngine {
         if (!staticErrors.isEmpty()) {
             log.warn("static verify failed errors={}", staticErrors);
             return VerifyResult.failed(staticErrors);
+        }
+        if (!testGenerationEnabled) {
+            log.info("static verify passed; S2 paused, skip test generation and mvn test");
+            return VerifyResult.success();
         }
         log.info("static verify passed, start running tests");
 

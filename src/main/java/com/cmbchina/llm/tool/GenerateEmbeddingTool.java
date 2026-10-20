@@ -54,7 +54,8 @@ public class GenerateEmbeddingTool {
         File out = ResourceFileUtils.getResourceAsFile(embPath);
 
         // overwrite header
-        try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(out), StandardCharsets.UTF_8))) {
+        try (BufferedWriter bw = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(out), StandardCharsets.UTF_8))) {
             bw.write("canonical_field,column_name,data_type,length,description,aliases,remark,priority_level,embedding\n");
         } catch (Exception e) {
             log.error("Failed to overwrite header", e);
@@ -92,7 +93,8 @@ public class GenerateEmbeddingTool {
                     return Collections.singletonMap("error", "embedding failed for " + canonical);
                 }
 
-                List<String> cols = Arrays.asList(canonical, column, dataType, length, description, aliases, remark, priority);
+                List<String> cols = Arrays.asList(
+                        canonical, column, dataType, length, description, aliases, remark, priority);
                 CSVUtils.appendRowWithEmbedding(out, cols, vec);
                 count++;
 

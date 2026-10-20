@@ -8,13 +8,25 @@
         </encoder>
     </appender>
 
+    <!-- 每次应用启动覆盖旧日志，便于按单次 Agent 执行链路排查问题。 -->
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>logs/mini-codex.log</file>
+        <append>false</append>
+        <encoder>
+            <charset>UTF-8</charset>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
     <!-- SQL 日志配置 -->
     <logger name="org.hibernate.SQL" level="DEBUG" additivity="false">
         <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
     </logger>
 
     <logger name="org.hibernate.type.descriptor.sql.BasicBinder" level="TRACE" additivity="false">
         <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
     </logger>
 
     <!-- Spring JDBC 日志 -->
@@ -34,5 +46,6 @@
 
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
     </root>
 </configuration>

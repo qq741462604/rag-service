@@ -15,6 +15,7 @@
 3. **补齐类声明**：方法片段需放入对应类中（如 `AhiHttpInvokerHandler`），补充 `class`、`@Component` 等声明，保持与目标类一致。
 4. **只保留相关代码**：代码块是"该接口的固定写法示范"，生成时按实际业务字段裁剪，**不要整段照搬无关字段/方法**。
 5. **常量与依赖**：代码块中出现的常量（如 `REQUEST_URL`、`RESPONSE_HEADER`、`AHI_INVOKE_SUCCESS_RET_CODE`、`IPV4_TYPE`、`FORMATTER`、`MAPPER`）必须在类中定义或 import，禁止生成未定义引用。
+6. **S1 同步补齐 Maven 依赖**：AI 结合当前模板的实际 import、目标模块 POM 和已有版本管理判断缺项，通过局部补丁补充，不照搬整份 POM、不等到 S2 才补。已知公共包映射维护在生成器项目的 `.ai/dependency-mappings.properties`，仅提供可靠坐标及已知传递提供方，不固定版本。私有公共包确认坐标后可补充该映射；未知坐标、版本不能编造。父 POM 只读，dependencyManagement/BOM 不等于已引入依赖。
 
 ---
 

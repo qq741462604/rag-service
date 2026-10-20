@@ -13,7 +13,6 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PostConstruct;
@@ -97,30 +96,13 @@ public class QwenClient implements LlmClient {
             String body = "";
             HttpEntity<String> requestEntity = new HttpEntity<>(json, headers);
 
-            // 网关超时重试机制：总共最多调用3次模型（1次原始 + 2次重试）
-            // 注意：网关 504 超时并不代表请求未被处理，重试会再次调用模型生成完整输出，
-            // 因此重试次数必须严格控制，避免产生重复输出、浪费 token。
-            // 模型生成完整代码（如 277 行 Handler）耗时较长（50s+），接近网关超时上限，
-            // 偶发 504 需要多次重试才能成功。
-            int maxRetry = 2;
-            for (int attempt = 0; attempt <= maxRetry; attempt++) {
-                try {
-                    ResponseEntity<JSONObject> response = restTemplate.exchange(url, HttpMethod.POST, requestEntity, JSONObject.class);
-                    if (response.getBody() != null) {
-                        body = response.getBody().toJSONString();
-                    }
-                    break;
-                } catch (HttpServerErrorException e) {
-                    if (attempt < maxRetry && e.getStatusCode().value() == 504) {
-                        log.warn("qwen request gateway timeout, retry {}/{} url={} model={}",
-                                attempt + 1, maxRetry, url, model);
-                        Thread.sleep(3000L * (attempt + 1)); // 递增等待：3s, 6s
-                        continue;
-                    }
-                    throw e;
-                }
+            // 超时不能证明服务端未计费，不自动重放整份代码生成请求。
+            // 额度、鉴权和网络异常向任务层透传并停止，不进行内外两层重试。
+            ResponseEntity<JSONObject> response = restTemplate.exchange(
+                    url, HttpMethod.POST, requestEntity, JSONObject.class);
+            if (response.getBody() != null) {
+                body = response.getBody().toJSONString();
             }
-
 
             log.info(
                     "qwen response cost={}ms bodyLength={}",
@@ -130,6 +112,20 @@ public class QwenClient implements LlmClient {
 
 
             JsonNode node = objectMapper.readTree(body);
+            JsonNode usage = node.path("usage");
+            if (usage.isMissingNode() && node.path("output").has("usage")) {
+                usage = node.path("output").path("usage");
+            }
+            if (!usage.isMissingNode()) {
+                long inputTokens = usage.path("prompt_tokens").asLong(usage.path("input_tokens").asLong(-1));
+                long outputTokens = usage.path("completion_tokens").asLong(usage.path("output_tokens").asLong(-1));
+                long totalTokens = usage.path("total_tokens").asLong(
+                        inputTokens >= 0 && outputTokens >= 0 ? inputTokens + outputTokens : -1);
+                log.info("qwen usage model={} inputTokens={} outputTokens={} totalTokens={}",
+                        model, inputTokens, outputTokens, totalTokens);
+            } else {
+                log.info("qwen usage unavailable model={} (promptLength is characters, not tokens)", model);
+            }
 
 
 
@@ -185,7 +181,7 @@ public class QwenClient implements LlmClient {
 
         } catch (Exception e) {
             log.error(
-                    "qwen call failed url={} model={} timeout",
+                    "qwen call failed url={} model={}",
                     url,
                     model,
                     e

@@ -35,10 +35,14 @@ public class WorkspaceIgnoreMatcher {
 
         String path =
                 normalize(
-                        file.getAbsolutePath()
+                        workspaceService.relativePath(file)
                 );
 
 
+
+        if(path.isEmpty()){
+            return false;
+        }
 
         String name =
                 file.getName();
@@ -67,7 +71,7 @@ public class WorkspaceIgnoreMatcher {
             /*
              * 路径匹配
              */
-            if(path.contains("/"+rule+"/")){
+            if(("/"+path+"/").contains("/"+rule+"/")){
 
                 return true;
 

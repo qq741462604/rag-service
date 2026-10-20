@@ -77,7 +77,7 @@ public class AhiHttpInvokerHandler {
         // 构造 post 请求
         RequestBuilder requestBuilder = RequestBuilder.post();
 
-        long beginTime = System.currentTime
+        long beginTime = System.currentTimeMillis();
             // 评估分值，得分范围：[0 - 1]
         JsonObject predictResponseBody = null;
         StringEntity ahiRequestEntity = null;
@@ -128,7 +128,6 @@ public class AhiHttpInvokerHandler {
             logger.error("Invoke Ahi Service UnExpected Exception: ", e);
         } finally {
             // 监控需求，把时延和请求体结合在一起，并在前加标识符
-            long timeCos = System.currentTimeMillis() - beginTime;
             long timeCos = System.currentTimeMillis() - beginTime;
             logger.info(
                     "AhiRequestBodyAndResponseTime - Rtd seqNo: {}, Ahi request body: {}, AhiHttpInvokerEventHandler doPost costs time: {}",

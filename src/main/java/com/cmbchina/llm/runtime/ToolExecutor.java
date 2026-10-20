@@ -6,6 +6,7 @@ import com.cmbchina.llm.agent.observation.Observation;
 import com.cmbchina.llm.agent.policy.AgentPolicy;
 import com.cmbchina.llm.planner.CodePlan;
 import com.cmbchina.llm.planner.PlanStep;
+import com.cmbchina.llm.planner.SkillTemplateCoordinator;
 import com.cmbchina.llm.tool.AgentTool;
 import com.cmbchina.llm.tool.FileContent;
 import com.cmbchina.llm.tool.FileOperationResult;
@@ -29,6 +30,7 @@ public class ToolExecutor {
     private final ToolRegistry toolRegistry;
     private final AgentPolicy agentPolicy;
     private final WorkspaceService workspaceService;
+    private final SkillTemplateCoordinator skillTemplateCoordinator;
 
     public List<ToolCallResult> execute(CodePlan plan, AgentContext context) {
         int beforeSize = context.getObservations().size();
@@ -81,6 +83,7 @@ public class ToolExecutor {
             AgentTool tool
     ) {
         try {
+            skillTemplateCoordinator.validateStep(context, step);
             String protectionError = validateFileProtection(step, context);
             if (protectionError != null) {
                 log.error("file protection blocked tool={} error={}", step.getTool(), protectionError);
@@ -130,9 +133,10 @@ public class ToolExecutor {
         if (path == null) {
             return null;
         }
-        // write_file / create_file 已放开"不得覆盖已存在文件"的限制：
-        // 分轮读取模板生成代码时，下一轮常会遇到已存在文件，这是正常场景，
-        // 直接放行覆盖写入（WriteFileTool 已支持覆盖）。
+        if (("write_file".equals(step.getTool()) || "create_file".equals(step.getTool()))
+                && pathExists(path)) {
+            return "File Protection: existing file requires read_file then patch_file path=" + path;
+        }
         if ("patch_file".equals(step.getTool()) && !pathExists(path)) {
             // 做一次"按文件名唯一匹配"的路径纠正，避免因模型漏写包路径段而误报找不到文件
             String corrected = correctedPath(path);
@@ -193,8 +197,7 @@ public class ToolExecutor {
     }
 
     private boolean shouldSkipDuplicateCreate(PlanStep step, AgentContext context) {
-        // write_file 已放开覆盖已存在文件，重复创建拦截只针对 create_file，
-        // 避免 LLM 同一轮重复 create 同一文件浪费调用；write_file 覆盖写入是正常场景。
+        // create_file 额外检查任务内重复创建；已有文件覆盖由统一文件保护拦截。
         if (!"create_file".equals(step.getTool()) || !(step.getInput() instanceof ToolInput)) {
             return false;
         }

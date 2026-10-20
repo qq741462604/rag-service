@@ -46,3 +46,8 @@ application-local.yml
 /.idea/
 /.mvn/
 /src/main/resources/application-bak.yml
+/graphify-out/
+/.uv-cache-graphify/
+/.idea/
+/.graphify-venv/
+/docs/superpowers/

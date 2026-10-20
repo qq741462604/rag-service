@@ -45,15 +45,6 @@ public class AgentExecutor {
     }
 
     private String findFailure(AgentContext context) {
-        // 兜底：如果 Agent 已经成功执行过写代码动作（patch_file / write_file / create_file），
-        // 说明核心改造任务已完成。此时 verifyErrors 中残留的往往只是"连续只读计划"这类引导性
-        // 警告（由 AgentLoop 在 CODING/REPAIR 阶段注入，用于提示模型生成写入动作），并非真正的
-        // 代码验证失败。为避免把已成功落盘的任务误判为失败，这里优先检查是否已有成功的代码修改，
-        // 与 AgentLoop#hasSuccessfulCodeChange 的判断逻辑保持一致。
-        if (hasSuccessfulCodeChange(context)) {
-            return null;
-        }
-
         if (context.getVerifyErrors() != null && !context.getVerifyErrors().isEmpty()) {
             return "verify failed: " + String.join("; ", context.getVerifyErrors());
         }

@@ -3,24 +3,29 @@ package com.cmbchina.llm.verify;
 
 import com.cmbchina.llm.agent.AgentContext;
 import com.cmbchina.llm.agent.observation.Observation;
+import com.cmbchina.llm.planner.MavenDependencySupport;
 import com.cmbchina.llm.skill.Skill;
 import com.cmbchina.llm.tool.FileContent;
 import com.cmbchina.llm.tool.ToolInput;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
 import lombok.extern.slf4j.Slf4j;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class CodeValidator {
 
+    private final MavenDependencySupport dependencySupport;
 
     public List<String> validate(
             AgentContext context
@@ -102,8 +107,8 @@ public class CodeValidator {
     /**
      * 校验 Skill 要求的 pom.xml 依赖是否已添加。
      *
-     * 从匹配 Skill 的 implementation 中提取 <groupId>/<artifactId> 依赖声明，
-     * 并检查观察记录中 pom.xml 的快照内容是否包含这些依赖；
+     * 从匹配 Skill 的 implementation 中提取 artifactId 依赖声明，
+     * 并检查所属模块真实完整 POM 及本地父 POM 的编译依赖；
      * 若缺失则记录错误，促使 Agent 进入 REPAIR 补充依赖。
      *
      * @param context Agent 上下文（含匹配的 Skills）
@@ -139,34 +144,15 @@ public class CodeValidator {
         }
 
 
-        String pomContent =
-                collectPomContent(
-                        context.getObservations()
-                );
-
-        if(pomContent==null){
-
-            errors.add(
-                    "缺少pom.xml依赖检查：Skill要求添加依赖，但未读取或修改pom.xml"
-            );
-
-            return;
-
-        }
-
-
-        for(String dep: requiredDeps){
-
-            if(!pomContent.contains(dep)){
-
-                errors.add(
-                        "pom.xml缺少Skill要求的依赖: "
-                                +
-                                dep
-                );
-
+        try {
+            Set<String> available = dependencySupport.compileDependencies(context);
+            for (String dependency : requiredDeps) {
+                if (available.stream().noneMatch(coordinate -> coordinate.endsWith(":" + dependency))) {
+                    errors.add("pom.xml 缺少 Skill 要求的编译依赖: " + dependency);
+                }
             }
-
+        } catch (Exception exception) {
+            errors.add("pom.xml 依赖检查失败: " + exception.getMessage());
         }
 
     }
@@ -246,96 +232,6 @@ public class CodeValidator {
 
 
         return deps;
-
-    }
-    /**
-     * 从观察记录中收集 pom.xml 的最新快照内容。
-     *
-     * 优先取 write_file/patch_file 的 newText，
-     * 否则取 read_file 返回的真实内容。
-     *
-     * @param observations 观察记录列表
-     * @return pom.xml 内容；若从未读取则返回 null
-     */
-    private String collectPomContent(
-            List<Observation> observations
-    ){
-
-
-        if(observations==null
-                ||
-                observations.isEmpty()){
-
-            return null;
-
-        }
-
-
-        String latestContent =
-                null;
-
-
-        for(Observation o: observations){
-
-            if(o==null
-                    ||
-                    !o.isSuccess()){
-
-                continue;
-
-            }
-
-
-            String path =
-                    getInputPath(o);
-
-            if(path==null
-                    ||
-                    !path.replace("\\","/")
-                            .endsWith("pom.xml")){
-
-                continue;
-
-            }
-
-
-            if(isFileChangeTool(o.getTool())
-                    &&
-                    o.getInput() instanceof ToolInput){
-
-                ToolInput input =
-                        (ToolInput) o.getInput();
-
-                if(input.getNewText()!=null){
-
-                    latestContent =
-                            input.getNewText();
-
-                }
-
-                continue;
-
-            }
-
-
-            if("read_file".equals(o.getTool())
-                    &&
-                    o.getResult() instanceof FileContent){
-
-                FileContent file =
-                        (FileContent) o.getResult();
-
-                latestContent =
-                        stripReadLineNumbers(
-                                file.getLines()
-                        );
-
-            }
-
-        }
-
-
-        return latestContent;
 
     }
 

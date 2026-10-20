@@ -59,6 +59,10 @@ public class SkillMatcher {
         }
 
         List<Skill> skills = new ArrayList<>(result);
+        // 预测接口有独立的固定模板，不能再叠加通用 RestTemplate/DTO 调用链要求。
+        if (skills.stream().anyMatch(skill -> "predict-api".equals(skill.getName()))) {
+            skills.removeIf(skill -> "external-api".equals(skill.getName()));
+        }
         log.info("effective skills={}", buildSkillNames(skills));
         return skills;
     }

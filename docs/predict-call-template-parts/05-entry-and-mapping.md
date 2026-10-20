@@ -68,8 +68,6 @@ try {
                     if (AHI_INVOKE_SUCCESS_RET_CODE.equals(rstCode)) {
                         // 获取 body 体中的 responseData 结构
                         JsonObject responseBodyData = responseBody
-                                .getAsJsonObject("response_data")
-                            JsonObject responseBodyData = responseBody
                                 .getAsJsonObject("response_data");
                         if (responseBodyData != null) {
                             predictScore = responseBodyData.get("predict_rescale_score").getAsFloat();

@@ -125,6 +125,7 @@ public class RunTestTool extends BaseTool {
         }
         return cmd;
     }
+
     /**
      * 从 mvn 输出中解析关键失败信息。
      *
@@ -244,12 +245,16 @@ public class RunTestTool extends BaseTool {
     @Data
     @Builder
     public static class TestRunResult {
+
         /** 测试是否通过 */
         private boolean success;
+
         /** 进程退出码（0=成功，非0=失败，-1=启动失败/超时） */
         private int exitCode;
+
         /** mvn 完整输出 */
         private String output;
+
         /** 解析出的失败信息列表 */
         private List<String> errorMessages;
     }

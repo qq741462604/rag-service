@@ -14,6 +14,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 
 @Data
@@ -74,6 +76,24 @@ public class AgentContext {
      */
     @Builder.Default
     private CodingTrack codingTrack = CodingTrack.S1_BUSINESS;
+
+    /**
+     * 当前任务已通过产物检查的模板，读取成功本身不代表模板实现完成。
+     */
+    @Builder.Default
+    private Set<String> completedTemplates = new LinkedHashSet<>();
+
+    /**
+     * 当前模板尚未满足的结构约束，单独保存以免覆盖工具或模型错误。
+     */
+    @Builder.Default
+    private List<String> templateErrors = new ArrayList<>();
+
+    /**
+     * 当前任务实际发起的规划模型调用数，不含系统直接构造的模板读取计划。
+     */
+    @Builder.Default
+    private int modelCalls = 0;
 
 }
 

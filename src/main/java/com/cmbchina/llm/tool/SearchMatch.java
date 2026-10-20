@@ -24,36 +24,30 @@ import java.util.List;
 @Builder
 public class SearchMatch {
 
-
     /**
      * 文件相对路径
      */
     private String path;
-
 
     /**
      * 命中行号
      */
     private Integer lineNumber;
 
-
     /**
      * 命中行内容
      */
     private String content;
-
 
     /**
      * 上下文行
      */
     private List<String> context;
 
-
     /**
      * 相对路径（冗余字段，保留兼容）
      */
     private String relativePath;
-
 
     /**
      * 匹配类型：
@@ -63,5 +57,4 @@ public class SearchMatch {
      * </ul>
      */
     private String matchType;
-
 }
