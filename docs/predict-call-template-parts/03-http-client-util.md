@@ -3,6 +3,13 @@
 > 完整工具类示例，连接池、超时、重试、链路追踪均从 `ReadConfig` 读取，禁止硬编码。
 > 该工具类为固定写法，直接复用即可；若目标项目已有等价工具类，则复用已有类，不重复创建。
 
+#### 公共追踪组件完整性约束
+
+- `BeeTraceClientHelper` 固定引用 `com.cmb.bee.tracer.util.BeeTraceClientHelper`；`HttpClientInjectAdapter` 固定引用 `com.cmb.bee.tracer.codec.HttpClientInjectAdapter`。这两个公共类型的包名不随业务根包迁移。
+- 必须同时保留正确 import、静态字段 `beeTraceClientHelper`、通过 `SpringContextBeanUtil.getApplicationContext().getBean(BeeTraceClientHelper.class)` 获取 Bean，以及该字段上的 `startTracing`、`inject`、`finishTracing` 调用。只出现调用名不代表模板实现完整。
+- 禁止新建业务包或内部类中的同名替身，禁止改成自造 `getInstance()`、`GlobalTracer` 或空实现。缺字段、import 时应局部补齐原类，而不是另建公共组件。
+- 公共组件依赖必须在 S1 核对目标 POM、已有源码或可确认的依赖依据；不能将 OpenTracing API 依赖当作 Bee 追踪组件已经存在的证明。私有坐标或版本无法确认时明确报告缺失信息，不猜测、不删除追踪逻辑绕过检查，也不留给 S2 仿造实现。
+
 ```java
 package com.cmbchina.plugin.utils;
 

@@ -34,6 +34,8 @@ import java.util.*;
 @RequiredArgsConstructor
 public class QwenPlanner implements Planner {
 
+    private static final int READ_RESULT_LIMIT = 20000;
+
     @Value("${codex.agent.max-model-calls:40}")
     private int maxModelCalls;
 
@@ -49,6 +51,7 @@ public class QwenPlanner implements Planner {
     private final ObjectMapper objectMapper;
     private final WorkspaceService workspaceService;
     private final SkillTemplateCoordinator skillTemplateCoordinator;
+    private final S2TestCoordinator testCoordinator;
     private final PlanResponseParser planResponseParser;
     private final PatchFileTool patchFileTool;
 
@@ -56,6 +59,17 @@ public class QwenPlanner implements Planner {
     public CodePlan createPlan(AgentContext context) {
         long start = System.currentTimeMillis();
         log.info("planner start phase={} task={}", context.getPhase(), summarize(context.getTask(), 120));
+
+        Object refreshPath = context.getVariables().remove("patch_preflight_refresh_path");
+        if (refreshPath instanceof String) {
+            List<PlanStep> steps = singleReadStep((String) refreshPath);
+            ToolInput input = (ToolInput) steps.get(0).getInput();
+            input.setEndLine(10000);
+            steps.get(0).setDescription("刷新预检失败文件的真实原文，旧计划全部未执行，不重放旧补丁");
+            context.getVariables().put("patch_preflight_recovery_plan", Boolean.TRUE);
+            log.info("patch preflight recovery read path={}", refreshPath);
+            return CodePlan.builder().task(context.getTask()).steps(steps).build();
+        }
 
         // 目标定位、当前模板读取均由系统安排，不为确定性的读取额外调用模型。
         if (context.getPhase() == AgentPhase.ANALYSIS || context.getPhase() == AgentPhase.CODING) {
@@ -66,7 +80,13 @@ public class QwenPlanner implements Planner {
                 }
             }
         }
-        if (context.getPhase() == AgentPhase.CODING) {
+        if (isS2(context) && context.getPhase() == AgentPhase.CODING) {
+            CodePlan currentRead = testCoordinator.ensureCurrentRead(context);
+            if (currentRead != null) {
+                return currentRead;
+            }
+        }
+        if (context.getPhase() == AgentPhase.CODING && !isS2(context)) {
             CodePlan templateRead = skillTemplateCoordinator.ensureTemplatesRead(context, null);
             if (templateRead != null) {
                 return templateRead;
@@ -79,7 +99,8 @@ public class QwenPlanner implements Planner {
 
         Map<String, String> vars = new HashMap<>();
         vars.put("PROJECT", buildProjectSummary());
-        vars.put("SKILLS", skillManager.buildContext(context.getTask()));
+        vars.put("SKILLS", isS2(context) ? "S1 模板已完成；只执行当前 S2 清单与修复规则。"
+                : skillManager.buildContext(context.getTask()));
         vars.put("TASK", context.getTask());
         vars.put("MEMORIES", "");
         vars.put("TARGET_RULE", buildTargetRule(context));
@@ -93,17 +114,25 @@ public class QwenPlanner implements Planner {
 
         if (plan != null && plan.getSteps() != null) {
             for (PlanStep step : plan.getSteps()) {
+                validateAllowedTool(step);
                 skillTemplateCoordinator.validateStep(context, step);
+                if (isS2(context)) {
+                    testCoordinator.validateStep(context, step);
+                }
             }
         }
+        rejectRedundantS1ReadPlan(context, plan);
         plan = repairExistingFileWritePlan(context, plan);
 
         // 不吞掉校验失败，更不能把被拒绝的写入计划继续交给工具执行。
         planValidator.validate(plan, context);
-        validatePatchSequence(plan);
+        validatePatchSequence(plan, context);
         if (plan != null && plan.getSteps() != null) {
             for (PlanStep step : plan.getSteps()) {
                 skillTemplateCoordinator.validateStep(context, step);
+                if (isS2(context)) {
+                    testCoordinator.validateStep(context, step);
+                }
             }
         }
 
@@ -191,40 +220,80 @@ public class QwenPlanner implements Planner {
      * 每个文件只读一次，在内存中按执行顺序应用补丁，避免后续步骤被旧磁盘内容误拒绝。
      * 任一步失败均不落盘，返回具体步骤和真实片段供下一次规划纠正。
      */
-    private void validatePatchSequence(CodePlan plan) {
+    private void validatePatchSequence(CodePlan plan, AgentContext context) {
         if (plan == null || plan.getSteps() == null) {
             return;
         }
         Map<File, String> previews = new HashMap<>();
+        Map<File, String> originals = new HashMap<>();
         int index = 0;
         for (PlanStep step : plan.getSteps()) {
             index++;
-            if (!"patch_file".equals(step.getTool()) || !(step.getInput() instanceof ToolInput)) {
+            if (!(step.getInput() instanceof ToolInput)) {
                 continue;
             }
             ToolInput input = (ToolInput) step.getInput();
+            if (isS2(context) && isCreateTool(step.getTool())) {
+                File file = workspaceService.resolve(input.getPath());
+                if (previews.containsKey(file)) {
+                    throw new IllegalArgumentException("同一计划重复创建文件: " + input.getPath());
+                }
+                originals.put(file, "");
+                previews.put(file, input.getContent());
+                continue;
+            }
+            if (!"patch_file".equals(step.getTool())) {
+                continue;
+            }
             String content = null;
             try {
                 File file = workspaceService.resolveExistingFile(input.getPath()).getCanonicalFile();
                 content = previews.get(file);
                 if (content == null) {
                     content = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+                    originals.put(file, content);
                 }
                 if (!content.isEmpty() && isInvalidPatchOldText(input.getOldText())) {
                     throw new IllegalArgumentException("oldText 为空或占位符");
                 }
                 previews.put(file, patchFileTool.previewPatch(content, input));
             } catch (Exception e) {
+                // 每个任务对同一文件最多安排一次原文刷新，不增加模型预算或无限重试。
+                if (content != null) {
+                    String path = workspaceService.relativePath(
+                            workspaceService.resolveExistingFile(input.getPath()));
+                    String refreshKey = "patch_preflight_refreshed:" + path;
+                    if (!Boolean.TRUE.equals(context.getVariables().put(refreshKey, Boolean.TRUE))) {
+                        context.getVariables().put("patch_preflight_refresh_path", path);
+                    }
+                }
                 String message = "第 " + index + " 步 patch_file 预检失败，原计划全部未执行。path="
                         + input.getPath() + "；原因=" + e.getMessage()
                         + "\n失败的 oldText:\n" + summarize(input.getOldText(), 700)
                         + "\n文件在本步骤之前的实际内容（含前序补丁预演，未落盘）:\n"
                         + patchSourceExcerpt(content, input.getOldText())
                         + "\n请从真实内容复制唯一局部片段，保留原注释，不要重排未修改的上下文。"
-                        + "前序步骤未落盘，纠正后需重新提交完整计划；禁止降级整文件覆盖。";
+                        + "前序步骤未落盘，纠正后需重新提交完整计划；禁止降级整文件覆盖。"
+                        + "若只是新增 Maven 依赖，请选择真实唯一的 dependencies 结束标签作为插入锚点，"
+                        + "保留已有依赖及其格式，不要为了插入依赖顺便重排 artifactId 等 XML。";
                 log.warn("patch preflight rejected step={} path={} error={}", index, input.getPath(), e.getMessage());
                 throw new IllegalArgumentException(message, e);
             }
+        }
+        if (isS2(context)) {
+            previews.forEach((file, after) -> testCoordinator.validatePreview(context, file, originals.get(file), after));
+        }
+    }
+
+    private boolean isS2(AgentContext context) {
+        return testGenerationEnabled && (context.getCodingTrack() == CodingTrack.S2_TEST
+                || context.getPhase() == AgentPhase.REPAIR);
+    }
+
+    private void validateAllowedTool(PlanStep step) {
+        if (!Arrays.asList("read_file", "search_code", "list_files", "write_file", "create_file", "patch_file")
+                .contains(step.getTool())) {
+            throw new IllegalArgumentException("模型不允许调用工具: " + step.getTool() + "；测试仅由服务端验证阶段执行");
         }
     }
 
@@ -236,19 +305,33 @@ public class QwenPlanner implements Planner {
             return content;
         }
         int start = 0;
+        int bestLength = 0;
         if (oldText != null) {
             for (String line : oldText.split("\\R")) {
-                if (line.trim().length() >= 8) {
-                    int match = content.indexOf(line.trim());
-                    if (match >= 0) {
+                String candidate = line.trim();
+                // 通用 XML 标签不是定位依据，优先选真实存在且唯一的坐标或业务语句。
+                if (candidate.length() > bestLength && candidate.matches(".*[A-Za-z0-9_].*")
+                        && !candidate.matches("</?[\\w:.-]+\\s*/?>")) {
+                    int match = content.indexOf(candidate);
+                    if (match >= 0 && content.indexOf(candidate, match + 1) < 0) {
                         start = Math.max(0, match - 300);
-                        break;
+                        bestLength = candidate.length();
                     }
                 }
             }
         }
-        return content.substring(start, Math.min(content.length(), start + 2400))
-                + "\n...（仅展示相关片段，需要更多上下文时按范围 read_file）";
+        start = Math.max(0, Math.min(start, content.length() - 2400));
+        int lineStart = content.lastIndexOf('\n', Math.max(0, start - 1));
+        start = lineStart < 0 ? 0 : lineStart + 1;
+        int end = Math.min(content.length(), start + 2400);
+        if (end < content.length()) {
+            int lineEnd = content.lastIndexOf('\n', end);
+            if (lineEnd > start) {
+                end = lineEnd + 1;
+            }
+        }
+        return (start > 0 ? "...（前文省略）\n" : "") + content.substring(start, end)
+                + (end < content.length() ? "\n...（后文省略，需要更多上下文时按范围 read_file）" : "");
     }
 
     private boolean isCreateTool(String tool) {
@@ -571,6 +654,25 @@ public class QwenPlanner implements Planner {
                         "- search_code\n";
 
             case REPAIR:
+                if (testGenerationEnabled) {
+                    return "当前阶段 REPAIR：只依据 VERIFY_ERRORS 修复本任务的编译、断言或运行错误。\n"
+                            + "修复范围: " + testCoordinator.testClassNames(context)
+                            + " 对应的本次业务类/测试，以及模块 " + testCoordinator.modulePom(context) + "。\n"
+                            + "读取失败涉及的最新源码后做局部 patch；不能删除测试方法、减少断言、禁用用例或改跳过配置。"
+                            + "保留 S1 模板协议、签名与调用链；不得为通过测试放宽需求。"
+                            + "公共类无法解析或变量未定义时，先核对真实 import、字段声明和已有依赖，禁止自行仿造公共类。"
+                            + "HttpClientUtil 的 beeTraceClientHelper 必须是通过 SpringContextBeanUtil 获取的 "
+                            + "com.cmb.bee.tracer.util.BeeTraceClientHelper Bean；适配器固定为 "
+                            + "com.cmb.bee.tracer.codec.HttpClientInjectAdapter。缺字段先补字段，缺 import 先补 import，"
+                            + "不能创建业务包同名类、编造 getInstance 或切换 GlobalTracer 迁就编译。"
+                            + "Maven 明确报告依赖 version 缺失时，允许在模块 POM 仅为该依赖补齐空缺版本；"
+                            + "不能删除依赖、改变已有非空版本、scope、exclusions 或其它配置。"
+                            + "已有重复坐标例外：只允许保留一份原有完整声明并删除冗余份，不可同时修改被保留声明。"
+                            + "直接用带前后唯一上下文的局部补丁删除冗余份，不要先把两份改成相同内容再删除。"
+                            + "先核对已读 POM、properties 和父链中的版本依据，无法确认时明确说明缺失信息，不猜版本。"
+                            + "环境或私有依赖信息缺失明确报告，不猜坐标/版本。"
+                            + "禁止 run_test 或命令工具；写入后系统重新检查全部契约及测试并重测。\n";
+                }
                 return "当前阶段 REPAIR：只修复 VERIFY_ERRORS 指明的静态检查问题。\n"
                         + "S2 暂停期间不生成测试类、不执行编译或测试；系统最多允许两轮静态修正。\n"
                         + "已有文件先 read_file 再 patch_file；新文件确认不存在后 write_file。\n"
@@ -596,18 +698,71 @@ public class QwenPlanner implements Planner {
      */
     private String buildCodingPhaseRules(AgentContext context) {
         if (context.getCodingTrack() == CodingTrack.S2_TEST && testGenerationEnabled) {
-            return "当前 CODING S2：仅生成或修改 src/test 下的测试类。先读取真实业务签名，再生成有断言的测试。"
-                    + "已有文件必须 read_file 后 patch_file；禁止覆盖或改写业务代码。";
+            return testCoordinator.buildRules(context);
         }
         StringBuilder sb = new StringBuilder();
-        sb.append("当前阶段 CODING（S1 业务代码）。S2 测试生成和自动测试已暂停。\n");
+        sb.append("当前阶段 CODING（S1 业务代码）。本阶段不生成测试、不运行 Maven。\n");
         sb.append("本轮只处理当前模板产物，按模板固定结构、协议字段和调用链生成。\n");
         sb.append("新文件必须确认不存在后 write_file；已有文件必须先 read_file，再 patch_file。\n");
         sb.append("patch_file 的 oldText 是已读真实片段，newText 是该片段的替换内容，不能用整文件替换局部片段。\n");
         sb.append("允许读取当前模板对应的已有类、配置、pom 和依赖以补齐真实信息。\n");
         sb.append("目标入口在最后一份入口模板才修改，禁止先引用尚未实现的依赖类。\n");
         sb.append(skillTemplateCoordinator.buildCurrentRules(context));
+        sb.append("\n当前模板已读文件（均已放入 Observations；系统读取同样满足先读再改）:\n");
+        for (Observation observation : skillTemplateCoordinator.currentArtifactObservations(context)) {
+            FileContent content = (FileContent) observation.getResult();
+            sb.append(describeFileRead(content));
+            if (formatObservationResult(content).length() > READ_RESULT_LIMIT) {
+                sb.append("\n本条观察被提示词限长截断，需要时指定 startLine/endLine 补读缺少的片段。\n");
+            } else {
+                sb.append("\n上述读取范围已完整提供且此后未被本任务修改；需要修改且在当前允许范围内时，"
+                        + "直接取本文件真实片段生成局部 patch_file；只读依赖仅供核对。不要为准备修改再次读取相同范围。\n");
+            }
+        }
+        sb.append("最近一次读取按同一文件判断：读取 pom、模板或其它支持类不会使入口文件的读取失效。"
+                + "先按尚缺结构补齐当前产物；只有缺少其它文件或尚未提供的行范围时才继续读取。\n");
         return sb.toString();
+    }
+
+    /**
+     * 拒绝没有新增信息的 S1 纯读取计划，将具体已读路径反馈给模型推进局部修改。
+     * 只使用当前模板在最后一次修改后的快照；截断内容与未读范围仍允许补读。
+     */
+    private void rejectRedundantS1ReadPlan(AgentContext context, CodePlan plan) {
+        if (context.getPhase() != AgentPhase.CODING || isS2(context)
+                || plan == null || plan.getSteps() == null || plan.getSteps().isEmpty()) {
+            return;
+        }
+        List<Observation> current = skillTemplateCoordinator.currentArtifactObservations(context);
+        List<String> covered = new ArrayList<>();
+        for (PlanStep step : plan.getSteps()) {
+            if (!"read_file".equals(step.getTool()) || !(step.getInput() instanceof ToolInput)) {
+                return;
+            }
+            ToolInput input = (ToolInput) step.getInput();
+            int start = input.getStartLine() == null ? 1 : input.getStartLine();
+            long end = input.getEndLine() == null ? (long) start + 200 : input.getEndLine();
+            boolean alreadyProvided = false;
+            for (Observation observation : current) {
+                FileContent content = (FileContent) observation.getResult();
+                if (content.getStartLine() != null && content.getEndLine() != null
+                        && start >= content.getStartLine() && end <= content.getEndLine()
+                        && sameWorkspaceFile(input.getPath(), content.getPath())
+                        && formatObservationResult(content).length() <= READ_RESULT_LIMIT) {
+                    alreadyProvided = true;
+                    break;
+                }
+            }
+            if (!alreadyProvided) {
+                return;
+            }
+            covered.add(input.getPath() + " [" + start + "-" + end + "]");
+        }
+        log.warn("S1 redundant read rejected template={} reads={} pending={}",
+                skillTemplateCoordinator.currentTemplate(context), covered, context.getTemplateErrors());
+        throw new IllegalArgumentException("这些文件范围已完整放入本轮 Observations，且此后未被本任务修改: " + covered
+                + "。不要再次准备读取；直接从对应文件内容提取唯一 oldText，提交局部 patch_file。当前尚缺: "
+                + context.getTemplateErrors() + "。如确实缺少其它上下文，仅读取未提供的文件或明确行范围。");
     }
 
     private boolean hasSuccessfulReadOfTarget(List<Observation> observations, AgentContext context) {
@@ -713,7 +868,7 @@ public class QwenPlanner implements Planner {
                 // 仅保留总览、当前模板和最近源码，分别限长；截断时明确提示补读。
                 int maxResultLength;
                 if ("read_file".equals(o.getTool())) {
-                    maxResultLength = 20000;
+                    maxResultLength = READ_RESULT_LIMIT;
                 } else {
                     maxResultLength = 500;
                 }
@@ -732,12 +887,19 @@ public class QwenPlanner implements Planner {
     private String formatObservationResult(Object result) {
         if (result instanceof FileContent) {
             FileContent content = (FileContent) result;
-            return "path="
-                    + content.getPath()
+            return describeFileRead(content)
                     + "\ncontent:\n"
                     + stripReadLineNumbers(content.getLines());
         }
         return String.valueOf(result);
+    }
+
+    private String describeFileRead(FileContent content) {
+        int start = content.getStartLine() == null ? 1 : content.getStartLine();
+        int count = content.getLines() == null ? 0 : content.getLines().size();
+        return "path=" + content.getPath() + "\nstartLine=" + start
+                + " actualEndLine=" + ((long) start + count - 1)
+                + " requestedEndLine=" + content.getEndLine() + " returnedLines=" + count;
     }
 
     private String extractObservationPath(Observation observation) {
@@ -796,8 +958,13 @@ public class QwenPlanner implements Planner {
     }
 
     private List<Observation> getPlannerObservations(AgentContext context) {
-        List<Observation> result = new ArrayList<>(skillTemplateCoordinator.templateObservations(context));
-        result.addAll(skillTemplateCoordinator.currentArtifactObservations(context));
+        List<Observation> result = new ArrayList<>();
+        if (isS2(context)) {
+            result.addAll(testCoordinator.observations(context));
+        } else {
+            result.addAll(skillTemplateCoordinator.templateObservations(context));
+            result.addAll(skillTemplateCoordinator.currentArtifactObservations(context));
+        }
         List<Observation> history = context.getObservations();
         List<Observation> recent = new ArrayList<>();
         for (int i = history.size() - 1; i >= 0 && recent.size() < 3; i--) {

@@ -5,6 +5,9 @@ import com.cmbchina.llm.agent.observation.Observation;
 import com.cmbchina.llm.runtime.ToolRegistry;
 import com.cmbchina.llm.tool.AgentTool;
 import com.cmbchina.llm.tool.ToolInput;
+import com.cmbchina.llm.tool.FileContent;
+import com.cmbchina.llm.tool.FileOperationResult;
+import com.cmbchina.llm.workspace.WorkspaceService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -18,12 +21,12 @@ import java.util.Set;
 public class VerifyFileLoader {
 
     private final ToolRegistry toolRegistry;
+    private final WorkspaceService workspaceService;
 
     public void loadChangedFiles(AgentContext context) {
         AgentTool readTool = toolRegistry.getTool("read_file");
         if (readTool == null) {
-            log.warn("read_file tool not found");
-            return;
+            throw new IllegalStateException("read_file tool not found");
         }
 
         Set<String> paths = extractPaths(context);
@@ -45,6 +48,7 @@ public class VerifyFileLoader {
                 );
             } catch (Exception e) {
                 log.error("verify read file failed path={}", path, e);
+                throw new IllegalStateException("验证读取最新文件失败: " + path, e);
             }
         }
     }
@@ -55,14 +59,19 @@ public class VerifyFileLoader {
             if (!isChangedFileObservation(observation) || observation.getResult() == null) {
                 continue;
             }
-            String text = observation.getResult().toString();
-            if (text.contains("path=")) {
-                int start = text.indexOf("path=") + 5;
-                int end = text.indexOf(",", start);
-                if (end < 0) {
-                    end = text.length();
-                }
-                paths.add(text.substring(start, end));
+            String path = null;
+            if (observation.getResult() instanceof FileOperationResult) {
+                path = ((FileOperationResult) observation.getResult()).getPath();
+            } else if (observation.getResult() instanceof FileContent) {
+                path = ((FileContent) observation.getResult()).getPath();
+            } else if (observation.getInput() instanceof ToolInput) {
+                path = ((ToolInput) observation.getInput()).getPath();
+            } else if (observation.getInput() instanceof java.util.Map) {
+                Object value = ((java.util.Map<?, ?>) observation.getInput()).get("path");
+                path = value instanceof String ? (String) value : null;
+            }
+            if (path != null) {
+                paths.add(workspaceService.relativePath(workspaceService.resolve(path)));
             }
         }
         return paths;

@@ -23,6 +23,15 @@ public class VerifyResult {
     /** 整体验证是否通过（静态检查 + 测试均通过才为 true） */
     private boolean success;
 
+    /** 环境/读取异常不交给模型盲目修复。 */
+    private boolean blocked;
+
+    private int testsRun;
+    private int skipped;
+
+    @Builder.Default
+    private List<String> reports = new ArrayList<>();
+
     /** 静态检查 / 验证错误列表 */
     @Builder.Default
     private List<String> errors = new ArrayList<>();
@@ -101,7 +110,6 @@ public class VerifyResult {
         if (output == null) {
             return null;
         }
-        // 只保留前 15000 字符，避免 OBSERVATIONS 过大导致 prompt 暴涨
-        return output.length() <= 15000 ? output : output.substring(0, 15000);
+        return output.length() <= 8192 ? output : output.substring(output.length() - 8192);
     }
 }

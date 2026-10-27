@@ -7,6 +7,7 @@ import com.cmbchina.llm.planner.MavenDependencySupport;
 import com.cmbchina.llm.skill.Skill;
 import com.cmbchina.llm.tool.FileContent;
 import com.cmbchina.llm.tool.ToolInput;
+import com.cmbchina.llm.workspace.WorkspaceService;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
 import lombok.extern.slf4j.Slf4j;
@@ -26,6 +27,7 @@ import java.util.regex.Pattern;
 public class CodeValidator {
 
     private final MavenDependencySupport dependencySupport;
+    private final WorkspaceService workspaceService;
 
     public List<String> validate(
             AgentContext context
@@ -48,6 +50,22 @@ public class CodeValidator {
         List<Observation> observations =
                 context.getObservations();
 
+        java.util.Map<String, Observation> latestFiles = new java.util.LinkedHashMap<>();
+        for (Observation observation : observations) {
+            if (observation.isSuccess() && "read_file".equals(observation.getTool())
+                    && observation.getResult() instanceof FileContent) {
+                FileContent file = (FileContent) observation.getResult();
+                if (file.getPath() != null) {
+                    try {
+                        latestFiles.put(workspaceService.relativePath(workspaceService.resolve(file.getPath())), observation);
+                    } catch (IllegalArgumentException referenceOutsideWorkspace) {
+                        // 生成器模板不是目标工程的待验证源码。
+                    }
+                }
+            }
+        }
+
+        Set<Observation> currentReads = new java.util.HashSet<>(latestFiles.values());
 
         for(int i=0;i<observations.size();i++){
 
@@ -72,23 +90,18 @@ public class CodeValidator {
 
 
 
-            validateFile(
-                    o,
-                    errors
-            );
+            if (currentReads.contains(o)) {
+                validateFile(o, errors);
+            }
 
 
-            validateChangedFile(
-                    o,
-                    errors
-            );
 
 
         }
 
 
         validateExternalApiContext(
-                observations,
+                new ArrayList<>(latestFiles.values()),
                 errors
         );
 

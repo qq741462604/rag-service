@@ -9,6 +9,7 @@ import com.cmbchina.llm.workspace.WorkspaceService;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.expr.MethodCallExpr;
@@ -24,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,6 +63,14 @@ public class TemplateContractValidator {
             requireFields(body, errors, "requestHeader", "requestData");
             CompilationUnit header = javaFile(files, "AhiHttpBodyHeaderEntity.java", errors);
             requireFields(header, errors, "entityId", "businessNo", "requestTime", "isTestEvent");
+            if (header != null) {
+                header.findAll(FieldDeclaration.class).forEach(field -> field.getVariables().stream()
+                        .filter(variable -> "isTestEvent".equals(variable.getNameAsString()))
+                        .filter(variable -> field.isStatic() || !Arrays.asList("Boolean", "java.lang.Boolean")
+                                .contains(variable.getType().asString()))
+                        .forEach(variable -> errors.add("AhiHttpBodyHeaderEntity.isTestEvent 必须为实例字段 Boolean，"
+                                + "与 setIsTestEvent(false) 保持一致，禁止 String 或 boolean")));
+            }
             CompilationUnit data = javaFile(files, "AhiHttpBodyDataEntity.java", errors);
             for (CompilationUnit unit : Arrays.asList(body, header, data)) {
                 if (unit == null) {
@@ -88,11 +98,7 @@ public class TemplateContractValidator {
             }
             validateConfiguration(files, errors);
         } else if (template.contains("03-http-client-util")) {
-            CompilationUnit client = javaFile(files, "HttpClientUtil.java", errors);
-            requireMethods(client, errors, "invoke", "invoke0", "init");
-            requireCalls(client, errors, "setSocketTimeout", "setConnectTimeout",
-                    "setConnectionRequestTimeout", "setConnectionManager", "setRetryHandler",
-                    "startTracing", "inject", "finishTracing", "execute", "handleResponse");
+            errors.addAll(validateHttpClientSource(files.get("HttpClientUtil.java")));
         } else if (template.contains("04-invoke-handler")) {
             CompilationUnit handler = javaFile(files, "AhiHttpInvokerHandler.java", errors);
             requireMethods(handler, errors, "doPost", "buildRequestBody", "getUUID", "getDdApdatestr");
@@ -145,6 +151,88 @@ public class TemplateContractValidator {
             }
         }
         return errors;
+    }
+
+    /** S1 完成检查和 S2 修复预演共用，不能只保留调用名而遗漏公共类型与字段。 */
+    public List<String> validateHttpClientSource(String source) {
+        List<String> errors = new ArrayList<>();
+        CompilationUnit client = javaFile(Collections.singletonMap("HttpClientUtil.java", source),
+                "HttpClientUtil.java", errors);
+        requireMethods(client, errors, "invoke", "invoke0", "init");
+        requireCalls(client, errors, "setSocketTimeout", "setConnectTimeout",
+                "setConnectionRequestTimeout", "setConnectionManager", "setRetryHandler",
+                "startTracing", "inject", "finishTracing", "execute", "handleResponse");
+        if (client == null) {
+            return errors;
+        }
+        if (!client.getClassByName("HttpClientUtil").isPresent()) {
+            errors.add("HttpClientUtil 必须声明真实工具类，不能以接口或其它类型冒充模板产物");
+            return errors;
+        }
+        String helperType = "com.cmb.bee.tracer.util.BeeTraceClientHelper";
+        String adapterType = "com.cmb.bee.tracer.codec.HttpClientInjectAdapter";
+        boolean helperDeclared = client.getClassByName("HttpClientUtil").get().getFields().stream()
+                .filter(FieldDeclaration::isStatic)
+                .flatMap(field -> field.getVariables().stream())
+                .filter(variable -> "beeTraceClientHelper".equals(variable.getNameAsString())
+                        && isPublicType(client, variable.getType().asString(), helperType))
+                .filter(variable -> variable.getInitializer().isPresent()
+                        && variable.getInitializer().get().isMethodCallExpr())
+                .map(variable -> variable.getInitializer().get().asMethodCallExpr())
+                .anyMatch(call -> "getBean".equals(call.getNameAsString())
+                        && call.getArguments().size() == 1 && call.getArgument(0).isClassExpr()
+                        && isPublicType(client, call.getArgument(0).asClassExpr().getType().asString(), helperType)
+                        && call.getScope().isPresent() && call.getScope().get().isMethodCallExpr()
+                        && "SpringContextBeanUtil.getApplicationContext()"
+                        .equals(call.getScope().get().toString()));
+        if (!helperDeclared) {
+            errors.add("HttpClientUtil 必须声明静态字段 beeTraceClientHelper，类型为 " + helperType
+                    + "，通过 SpringContextBeanUtil.getApplicationContext().getBean(BeeTraceClientHelper.class)"
+                    + " 获取真实 Bean；不能只添加 startTracing/inject/finishTracing 调用。"
+                    + "请补齐真实 import 和字段，禁止自建同名辅助类或改用 GlobalTracer/getInstance。");
+        }
+        boolean adapterBound = client.findAll(MethodCallExpr.class).stream()
+                .filter(call -> "inject".equals(call.getNameAsString()) && call.getScope().isPresent()
+                        && ("beeTraceClientHelper".equals(call.getScope().get().toString())
+                        || "HttpClientUtil.beeTraceClientHelper".equals(call.getScope().get().toString())))
+                .filter(call -> call.getArguments().size() == 3 && call.getArgument(2).isObjectCreationExpr())
+                .anyMatch(call -> isPublicType(client,
+                        call.getArgument(2).asObjectCreationExpr().getType().asString(), adapterType));
+        if (!adapterBound) {
+            errors.add("HttpClientUtil 必须引用真实公共适配器 " + adapterType
+                    + " 并创建实例；补齐正确 import，不得在业务包或内部类中仿造适配器。");
+        }
+        for (String name : Arrays.asList("startTracing", "inject", "finishTracing")) {
+            boolean bound = client.findAll(MethodCallExpr.class).stream()
+                    .filter(call -> name.equals(call.getNameAsString()) && call.getScope().isPresent())
+                    .anyMatch(call -> "beeTraceClientHelper".equals(call.getScope().get().toString())
+                            || "HttpClientUtil.beeTraceClientHelper".equals(call.getScope().get().toString()));
+            if (!bound) {
+                errors.add("模板追踪调用必须通过 beeTraceClientHelper." + name + "，不得用同名方法替代");
+            }
+        }
+        return errors;
+    }
+
+    private boolean isPublicType(CompilationUnit unit, String actualType, String qualifiedName) {
+        if (qualifiedName.equals(actualType)) {
+            return true;
+        }
+        int separator = qualifiedName.lastIndexOf('.');
+        String simpleName = qualifiedName.substring(separator + 1);
+        if (!simpleName.equals(actualType) || unit.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .anyMatch(declaration -> simpleName.equals(declaration.getNameAsString()))) {
+            return false;
+        }
+        if (unit.getImports().stream().anyMatch(declaration -> !declaration.isStatic()
+                && !declaration.isAsterisk() && declaration.getNameAsString().endsWith("." + simpleName)
+                && !qualifiedName.equals(declaration.getNameAsString()))) {
+            return false;
+        }
+        return unit.getImports().stream().anyMatch(declaration -> !declaration.isStatic()
+                && (qualifiedName.equals(declaration.getNameAsString())
+                || declaration.isAsterisk() && qualifiedName.substring(0, separator)
+                .equals(declaration.getNameAsString())));
     }
 
     public boolean isImplementationTemplate(String path) {

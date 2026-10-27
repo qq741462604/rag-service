@@ -13,7 +13,7 @@ logging:
     com.cmbchina.llm: INFO
 
 
-
+CODEX_TEST_JAVA_HOME: D:/Program Files/Java/jdk-11/jdk-11.0.32.101-hotspot
 LLM_API_KEY: BExxxx88oGurMqzhV9zgudJC0Aw==
 
 #=============================================================================
@@ -53,8 +53,11 @@ minicodex:
 #目标  D:\ideaProject\target\LW45.07_RT_PfPlugin
 codex:
   agent:
-    test-generation-enabled: false # 暂停 S2 测试生成及自动执行
+    test-generation-enabled: true # S1 完成后按清单生成测试，再统一执行与局部修复
     max-model-calls: 40 # 单任务规划调用上限，确定性模板读取不消耗该预算
+    max-repair-rounds: 5 # S2 验证失败后最多修复轮数，允许 0～10
+    test-timeout-seconds: 300 # 单次模块测试超时，允许 30～1800 秒
+    test-java-home: ${CODEX_TEST_JAVA_HOME:} # 目标工程专用 JDK 根目录，如 D:/tools/Java/jdk-11；不影响生成器 JDK8
   workspace:
     root: D:/ideaProject/target/LW45.07_RT_PfPlugin
 

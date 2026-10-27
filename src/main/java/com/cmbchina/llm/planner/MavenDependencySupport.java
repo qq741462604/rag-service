@@ -121,6 +121,13 @@ public class MavenDependencySupport {
     public List<String> validate(AgentContext context, Collection<String> sources) {
         List<String> errors = new ArrayList<>();
         try {
+            declaredDependencies(parse(modulePom(context))).forEach((coordinate, declarations) -> {
+                if (declarations.size() > 1) {
+                    errors.add("S1 模块 POM 依赖重复: " + coordinate
+                            + "；保留一份适用的原有完整声明，局部删除冗余声明，不新增相同依赖。"
+                            + "版本、scope 或 exclusions 不同的声明需先核实，禁止盲目合并配置。");
+                }
+            });
             Map<String, String> mappings = mappings();
             Map<String, String> required = new LinkedHashMap<>();
             JavaParser parser = new JavaParser();
@@ -281,7 +288,134 @@ public class MavenDependencySupport {
     }
 
     private Element parse(File file) {
+        return parseXml(read(file));
+    }
+
+    public void validateTestPom(String before, String after, boolean generation, Set<String> missingVersions) {
+        Element previous = parseXml(before);
+        Element next = parseXml(after);
+        Map<String, List<Element>> oldDependencies = declaredDependencies(previous);
+        Map<String, List<Element>> newDependencies = declaredDependencies(next);
+        newDependencies.forEach((coordinate, declarations) -> {
+            if (declarations.size() != 1) {
+                throw new IllegalArgumentException("修复后的 POM 依赖仍重复: " + coordinate
+                        + "；一次性移除冗余声明，oldText 必须包含唯一上下文");
+            }
+        });
+        for (Map.Entry<String, List<Element>> dependency : oldDependencies.entrySet()) {
+            List<Element> originals = dependency.getValue();
+            List<Element> replacements = newDependencies.get(dependency.getKey());
+            Element replacement = replacements == null ? null : replacements.get(0);
+            if (originals.size() > 1) {
+                boolean retained = replacement != null && originals.stream()
+                        .anyMatch(original -> xmlSignature(original).equals(xmlSignature(replacement)));
+                if (generation || !retained) {
+                    throw new IllegalArgumentException("S2 去重只能保留一份原有完整依赖声明，禁止同时改版本、scope、"
+                            + "exclusions 或拼接新声明: " + dependency.getKey());
+                }
+                continue;
+            }
+            Element original = originals.get(0);
+            boolean fillMissingVersion = !generation && replacement != null
+                    && missingVersions.contains(text(original, "groupId") + ":" + text(original, "artifactId"))
+                    && isVersionOnlyAddition(original, replacement);
+            if (replacement == null
+                    || !xmlSignature(original).equals(xmlSignature(replacement)) && !fillMissingVersion) {
+                throw new IllegalArgumentException("S2 不得删除或改变已有依赖: " + dependency.getKey());
+            }
+        }
+        if (generation) {
+            Element dependencies = child(next, "dependencies");
+            if (dependencies != null) {
+                for (Node node = dependencies.getFirstChild(); node != null; node = node.getNextSibling()) {
+                    if (node instanceof Element && "dependency".equals(node.getNodeName())) {
+                        Element dependency = (Element) node;
+                        if (!oldDependencies.containsKey(dependencyKey(dependency))
+                                && !"test".equals(text(dependency, "scope"))) {
+                            throw new IllegalArgumentException("S2 生成阶段只能新增 test scope 依赖");
+                        }
+                    }
+                }
+            }
+        }
+        Element oldContainer = child(previous, "dependencies");
+        Element newContainer = child(next, "dependencies");
+        if (oldContainer != null) {
+            previous.removeChild(oldContainer);
+        }
+        if (newContainer != null) {
+            next.removeChild(newContainer);
+        }
+        if (!xmlSignature(previous).equals(xmlSignature(next))) {
+            throw new IllegalArgumentException("S2 只允许局部补充模块直接依赖及修复 Maven 明确报错的缺失版本，"
+                    + "不能改插件、属性、父 POM 或跳过测试配置");
+        }
+    }
+
+    /** 仅允许将空缺版本补为非空值，其余依赖结构保持一致，不放开已有版本升级。 */
+    private boolean isVersionOnlyAddition(Element before, Element after) {
+        if (!text(before, "version").isEmpty() || text(after, "version").isEmpty()) {
+            return false;
+        }
+        Element original = (Element) before.cloneNode(true);
+        Element replacement = (Element) after.cloneNode(true);
+        Element oldVersion = child(original, "version");
+        if (oldVersion != null) {
+            original.removeChild(oldVersion);
+        }
+        replacement.removeChild(child(replacement, "version"));
+        return xmlSignature(original).equals(xmlSignature(replacement));
+    }
+
+    private Map<String, List<Element>> declaredDependencies(Element project) {
+        Map<String, List<Element>> result = new LinkedHashMap<>();
+        Element dependencies = child(project, "dependencies");
+        if (dependencies != null) {
+            for (Node node = dependencies.getFirstChild(); node != null; node = node.getNextSibling()) {
+                if (node instanceof Element) {
+                    Element dependency = (Element) node;
+                    String key = dependencyKey(dependency);
+                    if (!"dependency".equals(node.getNodeName())) {
+                        throw new IllegalArgumentException("POM 依赖结构异常: " + key);
+                    }
+                    result.computeIfAbsent(key, ignored -> new ArrayList<>()).add(dependency);
+                }
+            }
+        }
+        return result;
+    }
+
+    private String dependencyKey(Element dependency) {
+        String type = text(dependency, "type");
+        return text(dependency, "groupId") + ":" + text(dependency, "artifactId") + ":"
+                + (type.isEmpty() ? "jar" : type) + ":" + text(dependency, "classifier");
+    }
+
+    private String xmlSignature(Node node) {
+        if (node.getNodeType() == Node.TEXT_NODE || node.getNodeType() == Node.CDATA_SECTION_NODE) {
+            return node.getTextContent().trim();
+        }
+        if (!(node instanceof Element)) {
+            return "";
+        }
+        StringBuilder value = new StringBuilder("<").append(node.getNodeName());
+        Map<String, String> attributes = new java.util.TreeMap<>();
+        for (int index = 0; index < node.getAttributes().getLength(); index++) {
+            Node attribute = node.getAttributes().item(index);
+            attributes.put(attribute.getNodeName(), attribute.getNodeValue());
+        }
+        value.append(attributes).append('>');
+        for (Node child = node.getFirstChild(); child != null; child = child.getNextSibling()) {
+            value.append(xmlSignature(child));
+        }
+        return value.append("</").append(node.getNodeName()).append('>').toString();
+    }
+
+    private Element parseXml(String source) {
         try {
+            if (source.length() > MAX_POM_BYTES) {
+                throw new IllegalArgumentException("POM 超过 256 KiB");
+            }
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
             factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
             factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
@@ -289,9 +423,9 @@ public class MavenDependencySupport {
             factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
             factory.setXIncludeAware(false);
             factory.setExpandEntityReferences(false);
-            return factory.newDocumentBuilder().parse(new InputSource(new StringReader(read(file)))).getDocumentElement();
+            return factory.newDocumentBuilder().parse(new InputSource(new StringReader(source))).getDocumentElement();
         } catch (Exception exception) {
-            throw new IllegalArgumentException("POM XML 无法安全解析: " + file + ": " + exception.getMessage(), exception);
+            throw new IllegalArgumentException("POM XML 无法安全解析: " + exception.getMessage(), exception);
         }
     }
 

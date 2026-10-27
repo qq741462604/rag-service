@@ -30,7 +30,7 @@ type: existing
 Rules:
 
 1. 外调外部 API 接口必须使用固定写法：固定实体类 + 统一 Client/Handler 调用 + DTO/JsonObject 取值赋值，禁止散落 Map 拼请求体或业务类直接调 HTTP。
-2. 请求 body 必须使用固定实体类（如 AhiHttpBodyEntity / AhiHttpBodyHeaderEntity / AhiHttpBodyDataEntity），字段通过 @JsonProperty 映射，禁止改成小写驼峰直接发出去。
+2. 请求 body 必须使用固定实体类（如 AhiHttpBodyEntity / AhiHttpBodyHeaderEntity / AhiHttpBodyDataEntity），字段通过 @JsonProperty 映射，禁止改成小写驼峰直接发出去。请求头 isTestEvent 固定为 Boolean（禁止 String/boolean），保留 setIsTestEvent(Boolean)，调用使用 setIsTestEvent(false)，JSON 输出布尔值而非字符串。
 3. 调用必须走统一 Client / Handler 方法，禁止业务类直接 new RestTemplate、HttpClient 或 HttpURLConnection。
 4. URL、超时时间必须来自配置（application.yml + Config 类），禁止硬编码到 Java 代码。
 5. 返回结构（response_header / response_data）必须统一解析后再取值；取值赋值必须通过 eventData.putDataAndOriginData 写回，禁止 eventFields.put、eventData.set 或直接改 eventData.getData()。
@@ -40,6 +40,8 @@ Rules:
 9. 新增 Java 类必须包含正确 package、import、类级 Javadoc（作者 summer，日期为创建日期）。
 10. S1 必须同步识别当前模板实际使用的公共依赖。先读取入口所属模块 POM 及可访问的本地父 POM，已有编译依赖及明确的传递提供方优先复用，缺项通过 patch_file 局部补齐模块 POM，不能留给 S2 才补。
 11. 系统提供包名前缀与 Maven 坐标映射作为识别依据，不是固定整份 POM。dependencyManagement/BOM 只管理版本，不能当作依赖已引入；业务依赖不能只有 test/runtime scope。私有包或版本无可靠依据时先说明，不猜坐标，不升级已有依赖，不修改父 POM。
+
+12. 03 模板的公共追踪类型固定为 com.cmb.bee.tracer.util.BeeTraceClientHelper 和 com.cmb.bee.tracer.codec.HttpClientInjectAdapter，不随业务包迁移。HttpClientUtil 必须同时补齐正确 import、静态 beeTraceClientHelper 字段、SpringContextBeanUtil.getApplicationContext().getBean(BeeTraceClientHelper.class) 初始化及该字段上的三步追踪调用。禁止仿造同名业务类/内部类、编造 getInstance 或改用 GlobalTracer；OpenTracing API 依赖不等于 Bee 公共组件依赖。缺私有依赖依据应明确报告，不得删字段/import 后继续推进。
 
 Implementation:
 

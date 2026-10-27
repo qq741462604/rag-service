@@ -58,7 +58,7 @@ public class PlanValidator {
                 && isFileMutationTool(tool)) {
             validateCodingTrackPath(path, tool, context);
         }
-        if (isCreateTool(tool) && isExistingFile(path)) {
+        if (isCreateTool(tool) && isExistingFileExact(path)) {
             throw new IllegalArgumentException("existing file requires read_file then patch_file path=" + path);
         }
         if ("patch_file".equals(tool)) {
@@ -70,10 +70,8 @@ public class PlanValidator {
      * 校验 CODING 阶段写入路径是否符合当前子行程约束。
      *
      * <p>S1_BUSINESS 阶段只允许写入 src/main 目录，禁止写 src/test（防止 LLM 在 S1 阶段
-     * 顺便生成测试类导致 S2 被跳过）；S2_TEST 阶段的约束有所放宽：
-     * 仅禁止 write_file 整文件覆盖 src/main（防止 S2 阶段重写业务代码），
-     * 但允许 patch_file 局部修改 src/main（测试失败后往往需要小幅修复业务代码），
-     * 使得 S2 阶段既能写测试类、又能针对测试失败定位修复 src/main 的编译/逻辑错误。</p >
+     * 顺便生成测试类导致 S2 被跳过）；S2_TEST 生成阶段不能修改业务代码。
+     * 测试失败后由 REPAIR 在本任务清单范围内局部修复。</p >
      *
      * @param path    文件路径
      * @param tool    工具名称
@@ -88,14 +86,11 @@ public class PlanValidator {
                     tool + " blocked: S1 phase only allows src/main, cannot write src/test path=" + path
             );
         }
-        // S2_TEST：write_file 整文件覆盖 src/main 禁止，patch_file 局部修改 src/main 允许
-        // （测试失败后 LLM 需要修复业务代码的编译/逻辑错误，patch_file 是精确局部修改）。
-        if (track == CodingTrack.S2_TEST
-                && normalized.contains("/main/")
-                && "write_file".equals(tool)) {
+        // 测试生成与业务修复分阶段，不能在补测试时顺便改写业务。
+        if (track == CodingTrack.S2_TEST && normalized.contains("/main/")) {
             throw new RuntimeException(
                     tool + " blocked: S2 phase cannot write_file src/main path=" + path
-                            + ", 如需修改业务代码请使用 patch_file 局部修改"
+                            + ", 生成阶段不能修改业务，测试失败后在 REPAIR 局部修复"
             );
         }
     }
@@ -128,6 +123,15 @@ public class PlanValidator {
         try {
             // 使用"按文件名唯一匹配"的纠正解析，避免模型漏写包路径段导致误判文件不存在
             File file = workspaceService.resolveExistingFile(path);
+            return file.exists() && file.isFile();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isExistingFileExact(String path) {
+        try {
+            File file = workspaceService.resolve(path);
             return file.exists() && file.isFile();
         } catch (Exception e) {
             return false;

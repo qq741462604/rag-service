@@ -159,6 +159,7 @@ public class AhiHttpInvokerHandler {
         ahiHttpBodyHeaderEntity.setEntityId("TBX");
         ahiHttpBodyHeaderEntity.setBusinessNo(getUUID());
         ahiHttpBodyHeaderEntity.setRequestTime(requestTime);
+        // 请求头 isTestEvent 固定为 Boolean；不得将 false 改为字符串或改用 setTestEvent。
         ahiHttpBodyHeaderEntity.setIsTestEvent(false);
 
         // 创建 AhiHttpBodyDataEntity 参数

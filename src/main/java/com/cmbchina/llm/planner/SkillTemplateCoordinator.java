@@ -2,6 +2,7 @@ package com.cmbchina.llm.planner;
 
 import com.cmbchina.llm.agent.AgentContext;
 import com.cmbchina.llm.agent.AgentPhase;
+import com.cmbchina.llm.agent.CodingTrack;
 import com.cmbchina.llm.agent.observation.Observation;
 import com.cmbchina.llm.skill.Skill;
 import com.cmbchina.llm.skill.SkillMatcher;
@@ -258,7 +259,7 @@ public class SkillTemplateCoordinator {
                 + "\n先按当前模板完成全部产物（可分多轮写入），服务端检查通过后才切换下一模板。"
                 + "禁止提前读取或实现后续模板；允许定位/读取当前产物、pom 依赖和必要上下文。"
                 + "已有等价实现必须先 read_file 确认复用，禁止重复创建。"
-                + "本次暂停 S2：禁止生成测试类、禁止运行测试。\n"
+                + "当前 S1 阶段禁止生成测试类、禁止运行测试；全部模板完成后由系统安排后续阶段。\n"
                 + "当前模板允许产物: " + allowedFileNames(context, current)
                 + buildArtifactRules(context)
                 + (contractValidator.isImplementationTemplate(current) ? dependencySupport.buildRules(context, current) : "")
@@ -291,7 +292,8 @@ public class SkillTemplateCoordinator {
                 throw new IllegalArgumentException("只能修改入口所属模块 POM，本地父 POM 与其它模块只读: " + path);
             }
         }
-        if (context.getPhase() != AgentPhase.CODING || !hasTemplates(context)) {
+        if (context.getPhase() != AgentPhase.CODING
+                || context.getCodingTrack() != CodingTrack.S1_BUSINESS || !hasTemplates(context)) {
             return;
         }
         String current = currentTemplate(context);

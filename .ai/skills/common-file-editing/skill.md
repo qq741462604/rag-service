@@ -5,8 +5,8 @@ Rules:
 
 1. 修改已有文件前必须先通过 search_code 或 read_file 确认真实路径。
 2. 已有文件只能使用 patch_file 修改，禁止 write_file 覆盖已有文件。
-3. patch_file 前必须 read_file 读取同一路径的完整文件。
-4. patch_file 的 oldText 必须来自最近一次 read_file 的真实内容，禁止使用 search_code 片段、模板片段或自行拼接内容。
+3. patch_file 前必须通过 read_file 读取同一路径的真实源码和修改所需上下文。系统提供在 Observations 中的成功读取同样有效；内容未变化且未截断时，直接复用，不必在 patch 前重新读取。缺少片段时指定 startLine/endLine 补读，不重复读取已提供的范围。
+4. patch_file 的 oldText 必须来自同一文件在最后一次修改之后成功读取的真实内容；读取其它文件不使这份内容失效。禁止使用 search_code 片段、模板片段或自行拼接内容。
 5. patch_file 的 newText 必须基于 oldText 增量修改，并保留原有 package、import、class 定义、继承关系、已有字段、已有方法签名和已有业务逻辑。
 6. 禁止为了新增依赖而重写目标类、替换目标类、移动目标代码或删除无关逻辑。
 7. 新文件只能在确认不存在后使用 write_file 创建；如果文件已存在，必须 read_file 后 patch_file。

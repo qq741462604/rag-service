@@ -122,6 +122,57 @@ public class AhiHttpBodyDataEntity {
 }
 ```
 
-> 配套的请求外层结构 `AhiHttpBodyEntity`（含 `requestHeader` + `requestData`）与请求头 `AhiHttpBodyHeaderEntity`（含 `entityId`、`businessNo`、`requestTime`、`isTestEvent`）与此同理，字段按实际接口文档补齐。
+> 配套的请求外层结构 `AhiHttpBodyEntity` 包含 `AhiHttpBodyHeaderEntity requestHeader` 和 `AhiHttpBodyDataEntity requestData`，字段按实际接口文档补齐。
+
+### 请求头固定字段类型
+
+`AhiHttpBodyHeaderEntity` 的前三个字段为 `String`，但 `isTestEvent` **必须为包装类型 `Boolean`**，禁止一律生成 `String`，也不能改为基本类型 `boolean`。保持字段名 `isTestEvent` 及 Lombok 生成的 `getIsTestEvent()` / `setIsTestEvent(Boolean)`，调用 `setIsTestEvent(false)` 时自动装箱，JSON 输出为布尔值 `false`，不是字符串 `"false"`。已有实体也必须按此契约局部修正，不能靠把调用参数改成字符串来迁就错误类型。
+
+```java
+package com.cmbchina.plugin.entity;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+/**
+ * 模型接口请求头，package 按目标工程真实包名调整。
+ *
+ * @author summer
+ * @date 2026-10-23 00:00:00
+ */
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class AhiHttpBodyHeaderEntity {
+
+    /**
+     * 实体标识
+     */
+    @JsonProperty("entityId")
+    private String entityId;
+
+    /**
+     * 业务流水号
+     */
+    @JsonProperty("businessNo")
+    private String businessNo;
+
+    /**
+     * 请求时间，格式 yyyyMMddHHmmss
+     */
+    @JsonProperty("requestTime")
+    private String requestTime;
+
+    /**
+     * 是否测试事件，必须作为 JSON 布尔值传输
+     */
+    @JsonProperty("isTestEvent")
+    private Boolean isTestEvent;
+}
+```
+
+> 字段类型与 setter 参数属于固定契约，不得按业务裁剪或改名。生成日期按实际创建日期填写，不照抄示例日期。
 
 ---

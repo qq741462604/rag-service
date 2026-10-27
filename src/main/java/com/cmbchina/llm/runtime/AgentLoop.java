@@ -11,6 +11,7 @@ import com.cmbchina.llm.planner.CodePlan;
 import com.cmbchina.llm.planner.PlanStep;
 import com.cmbchina.llm.planner.Planner;
 import com.cmbchina.llm.planner.SkillTemplateCoordinator;
+import com.cmbchina.llm.planner.S2TestCoordinator;
 import com.cmbchina.llm.project.ProjectIndex;
 import com.cmbchina.llm.project.ProjectIndexer;
 import com.cmbchina.llm.tool.FileContent;
@@ -43,9 +44,20 @@ public class AgentLoop {
     private final PhaseManager phaseManager;
     private final VerifyEngine verifyEngine;
     private final SkillTemplateCoordinator skillTemplateCoordinator;
+    private final S2TestCoordinator testCoordinator;
 
     @Value("${codex.agent.test-generation-enabled:false}")
     private boolean testGenerationEnabled;
+
+    @Value("${codex.agent.max-repair-rounds:5}")
+    private int maxRepairRounds;
+
+    @javax.annotation.PostConstruct
+    public void validateConfiguration() {
+        if (maxRepairRounds < 0 || maxRepairRounds > 10) {
+            throw new IllegalArgumentException("codex.agent.max-repair-rounds 必须为 0～10");
+        }
+    }
 
     public void run(AgentContext context) {
         log.info("agent loop start agentId={} task={} s2Enabled={}",
@@ -68,6 +80,25 @@ public class AgentLoop {
             if (context.getPhase() == AgentPhase.CODING) {
                 context.setCodingTrack(codingS1Done && !codingS2Done
                         ? CodingTrack.S2_TEST : CodingTrack.S1_BUSINESS);
+                if (testGenerationEnabled && context.getCodingTrack() == CodingTrack.S2_TEST) {
+                    try {
+                        testCoordinator.initialize(context);
+                        int completed = testCoordinator.completedCount(context);
+                        codingS2Done = testCoordinator.advance(context);
+                        if (testCoordinator.completedCount(context) > completed) {
+                            readOnlyRounds = 0;
+                            duplicateRounds = 0;
+                            executedPlans.clear();
+                        }
+                        if (codingS2Done) {
+                            context.setPhase(AgentPhase.VERIFY);
+                            continue;
+                        }
+                    } catch (RuntimeException exception) {
+                        stop(context, "S2 清单或源码异常: " + exception.getMessage());
+                        return;
+                    }
+                }
             }
             if (context.getPhase() == AgentPhase.VERIFY) {
                 if (!codingS1Done || !codingS2Done) {
@@ -77,17 +108,23 @@ public class AgentLoop {
                 if (handleVerifyPhase(context)) {
                     return;
                 }
-                if (++repairRounds > 2) {
-                    stop(context, "静态验证修正达到上限，保留错误供人工检查: " + context.getVerifyErrors());
+                int limit = testGenerationEnabled ? maxRepairRounds : 2;
+                if (++repairRounds > limit) {
+                    stop(context, "验证修复达到上限 " + limit + "，保留错误供人工检查: " + context.getVerifyErrors());
                     return;
                 }
+                log.info("repair round={}/{} modelCalls={}", repairRounds, limit, context.getModelCalls());
                 continue;
             }
 
             CodePlan plan;
+            boolean recoveryRead;
             try {
                 plan = planner.createPlan(context);
-                planningFailures = 0;
+                recoveryRead = Boolean.TRUE.equals(context.getVariables().remove("patch_preflight_recovery_plan"));
+                if (!recoveryRead) {
+                    planningFailures = 0;
+                }
             } catch (Exception e) {
                 // HTTP/额度/鉴权/网络错误不由外层重试，避免与客户端重试相乘。
                 if (isModelFailure(e) || ++planningFailures >= 3
@@ -95,12 +132,24 @@ public class AgentLoop {
                     stop(context, "规划失败，停止模型调用: " + failureMessage(e));
                     return;
                 }
-                context.getVerifyErrors().clear();
+                if (context.getPhase() != AgentPhase.REPAIR) {
+                    context.getVerifyErrors().clear();
+                }
+                context.getVerifyErrors().removeIf(error -> error.startsWith("上一计划被拒绝"));
                 context.getVerifyErrors().add("上一计划被拒绝，请修正后重试: " + e.getMessage());
                 log.warn("plan rejected attempt={} error={}", planningFailures, e.getMessage());
                 continue;
             }
             if (isEmptyPlan(plan)) {
+                if (context.getPhase() == AgentPhase.REPAIR
+                        || context.getPhase() == AgentPhase.CODING && context.getCodingTrack() == CodingTrack.S2_TEST) {
+                    if (++emptyRounds >= 2) {
+                        stop(context, "清单或验证尚未通过却连续返回空计划: " + context.getVerifyErrors());
+                        return;
+                    }
+                    context.getVerifyErrors().add("空计划不能替代测试清单完成或修复，请处理实际未满足项");
+                    continue;
+                }
                 if (context.getPhase() == AgentPhase.CODING
                         && skillTemplateCoordinator.currentTemplate(context) != null) {
                     if (++emptyRounds >= 2) {
@@ -124,8 +173,11 @@ public class AgentLoop {
             // 忽略模型自然语言描述，按工具与参数判断相同计划；只在真实写入后清空集合。
             String planKey = plan.getSteps().stream()
                     .map(step -> step.getTool() + ":" + step.getInput()).collect(Collectors.joining("|"));
-            if (!executedPlans.add(planKey)) {
-                context.getVerifyErrors().clear();
+            // 仅服务端安排的一次补丁恢复读取允许重复；不重置此前规划失败计数。
+            if (!executedPlans.add(planKey) && !recoveryRead) {
+                if (context.getPhase() != AgentPhase.REPAIR) {
+                    context.getVerifyErrors().clear();
+                }
                 context.getVerifyErrors().add("检测到重复计划，请使用已有观察完成当前产物，禁止重复读取相同内容。");
                 log.warn("duplicate plan agentId={} count={} signature={}",
                         context.getAgentId(), duplicateRounds + 1, Integer.toHexString(planKey.hashCode()));
@@ -163,6 +215,10 @@ public class AgentLoop {
             }
             context.setProjectIndex(projectIndexer.build(context.getObservations()));
             AgentPhase current = context.getPhase();
+            if (current == AgentPhase.CODING && context.getCodingTrack() == CodingTrack.S2_TEST) {
+                // 清单由下一轮读取最新落盘结果后推进，单次写测试不等于 S2 完成。
+                continue;
+            }
             if (current == AgentPhase.CODING && context.getCodingTrack() == CodingTrack.S1_BUSINESS
                     && skillTemplateCoordinator.hasTemplates(context)) {
                 int completedBefore = context.getCompletedTemplates().size();
@@ -224,7 +280,8 @@ public class AgentLoop {
             return "模型 HTTP " + ((org.springframework.web.client.HttpStatusCodeException) cause).getRawStatusCode()
                     + "，请检查额度、鉴权或模型配置";
         }
-        return cause.getMessage();
+        // 业务预检外层携带路径、步骤和真实片段，不能只显示最底层的笼统匹配失败。
+        return isModelFailure(error) ? cause.getMessage() : error.getMessage();
     }
 
     private void stop(AgentContext context, String reason) {
@@ -444,6 +501,7 @@ public class AgentLoop {
         List<String> contractErrors = skillTemplateCoordinator.validateAll(context);
         VerifyResult verifyResult = contractErrors.isEmpty()
                 ? verifyEngine.verify(context) : VerifyResult.failed(contractErrors);
+        context.getVariables().put("verify_result", verifyResult);
         if (verifyResult.isSuccess()) {
             context.getVerifyErrors().clear();
             context.setPhase(AgentPhase.FINISH);
@@ -452,14 +510,30 @@ public class AgentLoop {
         context.setPhase(AgentPhase.REPAIR);
         context.getVerifyErrors().clear();
         context.getVerifyErrors().addAll(verifyResult.getErrors());
+        if (verifyResult.isBlocked()) {
+            stop(context, "测试环境阻塞，停止自动修复: " + context.getVerifyErrors());
+            return true;
+        }
+        if (testGenerationEnabled) {
+            try {
+                String signature = testCoordinator.fingerprint(context) + ":" + context.getVerifyErrors();
+                if (signature.equals(context.getVariables().put("s2_last_failure", signature))) {
+                    stop(context, "同一错误重复且代码无实质变化，停止自动修复: " + context.getVerifyErrors());
+                    return true;
+                }
+            } catch (RuntimeException exception) {
+                stop(context, "修复状态读取异常: " + exception.getMessage());
+                return true;
+            }
+        }
 
-        // 测试执行过且失败：补充 mvn 输出关键摘要（前 5000 字符），
+        // 测试执行过且失败：补充 mvn 输出末尾摘要，
         // 帮助 REPAIR 阶段 LLM 看到具体编译错误 / 断言失败位置。
         if (verifyResult.isTestExecuted() && !verifyResult.isTestPassed()) {
             String output = verifyResult.getTestOutput();
             if (output != null && !output.isEmpty()) {
                 String summary = output.length() > 5000
-                        ? output.substring(0, 5000) + "\n... (输出过长，已截断)"
+                        ? output.substring(output.length() - 5000)
                         : output;
                 context.getVerifyErrors().add("[mvn test 输出摘要]\n" + summary);
             }
