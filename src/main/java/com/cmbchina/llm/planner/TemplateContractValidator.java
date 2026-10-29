@@ -12,6 +12,7 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
@@ -26,11 +27,11 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -106,6 +107,7 @@ public class TemplateContractValidator {
                     "writeValueAsString", "getStatusCode", "getAsJsonObject");
             requireText(handler, errors, "AhiHttpBodyEntity", "AhiHttpBodyHeaderEntity",
                     "AhiHttpBodyDataEntity", "response_header", "rst_code");
+            validateEntitySetters(handler, files, errors);
             if (handler != null && handler.findAll(StringLiteralExpr.class).stream()
                     .anyMatch(value -> value.asString().matches("https?://.*"))) {
                 errors.add("AhiHttpInvokerHandler 的 URL 必须来自 ReadConfig，禁止硬编码");
@@ -444,9 +446,78 @@ public class TemplateContractValidator {
         }
     }
 
+    /** 根据真实实体字段或显式 setter 核对 Handler，避免靠新增错误协议字段迁就拼写错误。 */
+    private void validateEntitySetters(CompilationUnit handler, Map<String, String> files, List<String> errors) {
+        if (handler == null) {
+            return;
+        }
+        Map<String, Set<String>> settersByType = new LinkedHashMap<>();
+        for (String name : Arrays.asList("AhiHttpBodyEntity", "AhiHttpBodyHeaderEntity", "AhiHttpBodyDataEntity")) {
+            CompilationUnit entity = javaFile(files, name + ".java", errors);
+            if (entity == null || !entity.getClassByName(name).isPresent()) {
+                continue;
+            }
+            ClassOrInterfaceDeclaration declaration = entity.getClassByName(name).get();
+            Set<String> setters = new HashSet<>();
+            declaration.getMethods().stream().filter(method -> !method.isStatic()
+                    && method.getParameters().size() == 1).forEach(method -> setters.add(method.getNameAsString()));
+            boolean classSetter = declaration.getAnnotationByName("Data").isPresent()
+                    || declaration.getAnnotationByName("Setter").isPresent();
+            boolean classSetterDisabled = declaration.getAnnotationByName("Setter")
+                    .map(annotation -> annotation.toString().contains("NONE")).orElse(false);
+            for (FieldDeclaration field : declaration.getFields()) {
+                boolean fieldSetter = field.getAnnotationByName("Setter").isPresent();
+                boolean disabled = field.getAnnotationByName("Setter")
+                        .map(annotation -> annotation.toString().contains("NONE")).orElse(classSetterDisabled);
+                if (!field.isStatic() && !field.isFinal() && !disabled && (classSetter || fieldSetter)) {
+                    field.getVariables().forEach(variable -> {
+                        String fieldName = variable.getNameAsString();
+                        setters.add("set" + Character.toUpperCase(fieldName.charAt(0)) + fieldName.substring(1));
+                    });
+                }
+            }
+            settersByType.put(name, setters);
+        }
+        Map<String, String> variableTypes = new LinkedHashMap<>();
+        handler.findAll(VariableDeclarator.class).forEach(variable -> {
+            String type = variable.getType().asString();
+            String simpleType = type.substring(type.lastIndexOf('.') + 1);
+            if (settersByType.containsKey(simpleType)) {
+                variableTypes.put(variable.getNameAsString(), simpleType);
+            }
+        });
+        handler.findAll(MethodCallExpr.class).stream()
+                .filter(call -> call.getNameAsString().startsWith("set") && call.getArguments().size() == 1
+                        && call.getScope().isPresent() && call.getScope().get().isNameExpr())
+                .forEach(call -> {
+                    String type = variableTypes.get(call.getScope().get().asNameExpr().getNameAsString());
+                    if (type != null && !settersByType.get(type).contains(call.getNameAsString())) {
+                        errors.add("AhiHttpInvokerHandler 调用 " + type + "." + call.getNameAsString()
+                                + " 与真实实体不一致；可用 setter: " + settersByType.get(type)
+                                + "。先读取实体和调用方，按已有 @JsonProperty 对齐调用；"
+                                + "SLF_EQP_ADR 不得改成或新增为 SLF_REQ_ADR，不要新增协议字段迁就方法拼写。");
+                    }
+                });
+    }
+
     private void validateDataMappings(CompilationUnit data, AgentContext context, List<String> errors) {
         if (data == null) {
             return;
+        }
+        for (FieldDeclaration field : data.findAll(FieldDeclaration.class)) {
+            boolean addressField = field.getVariables().stream().anyMatch(variable ->
+                    Arrays.asList("slfReqAdr", "slfEqpAdr").contains(variable.getNameAsString()));
+            String property = jsonProperty(field);
+            if ((addressField && !"SLF_EQP_ADR".equals(property)) || "SLF_REQ_ADR".equals(property)) {
+                errors.add("AhiHttpBodyDataEntity 自助设备地址字段必须映射 SLF_EQP_ADR，"
+                        + "禁止为适配错误 setter 新增 SLF_REQ_ADR；应修改 AhiHttpInvokerHandler 的调用");
+            }
+        }
+        long addressMappings = data.findAll(FieldDeclaration.class).stream()
+                .filter(field -> !field.isStatic() && "SLF_EQP_ADR".equals(jsonProperty(field)))
+                .mapToLong(field -> field.getVariables().size()).sum();
+        if (addressMappings > 1) {
+            errors.add("SLF_EQP_ADR 只能映射一个实体字段，禁止新增重复字段来兼容错误 setter；应修改调用方");
         }
         // 示例字段允许按需求裁剪；保留下来的同名字段不允许改写协议大小写。
         for (Observation observation : context.getObservations()) {
@@ -466,10 +537,25 @@ public class TemplateContractValidator {
                 data.findAll(FieldDeclaration.class).stream()
                         .filter(field -> field.getVariables().stream()
                                 .anyMatch(variable -> fieldName.equals(variable.getNameAsString())))
-                        .filter(field -> !field.toString().contains("@JsonProperty(\"" + property + "\")"))
+                        .filter(field -> !property.equals(jsonProperty(field)))
                         .forEach(field -> errors.add("字段 " + fieldName + " 必须保留协议映射 " + property));
             }
         }
+    }
+
+    private String jsonProperty(FieldDeclaration field) {
+        return field.getAnnotationByName("JsonProperty").map(annotation -> {
+            if (annotation.isSingleMemberAnnotationExpr()
+                    && annotation.asSingleMemberAnnotationExpr().getMemberValue().isStringLiteralExpr()) {
+                return annotation.asSingleMemberAnnotationExpr().getMemberValue().asStringLiteralExpr().asString();
+            }
+            if (annotation.isNormalAnnotationExpr()) {
+                return annotation.asNormalAnnotationExpr().getPairs().stream()
+                        .filter(pair -> "value".equals(pair.getNameAsString()) && pair.getValue().isStringLiteralExpr())
+                        .map(pair -> pair.getValue().asStringLiteralExpr().asString()).findFirst().orElse("");
+            }
+            return "";
+        }).orElse("");
     }
 
     private boolean isMutation(String tool) {

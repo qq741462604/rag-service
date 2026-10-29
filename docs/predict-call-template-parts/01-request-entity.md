@@ -2,6 +2,8 @@
 
 > 固定结构，字段按业务实际增删。字段名 + `@JsonProperty` 的映射关系是**固定写法**，禁止改成小写驼峰直接发出去。
 
+自助设备地址统一使用 `slfEqpAdr` / `setSlfEqpAdr`，JSON 键固定为 `SLF_EQP_ADR`。复用已有 `slfReqAdr` 时可以保留旧字段名，但必须保留同一 JSON 键并让 Handler 调用真实存在的 setter；禁止新增 `SLF_REQ_ADR` 或两个字段映射同一协议键来迁就错误调用。
+
 ```java
 package com.cmbchina.plugin.entity;
 
@@ -96,7 +98,7 @@ public class AhiHttpBodyDataEntity {
      * 自助设备地址
      */
     @JsonProperty("SLF_EQP_ADR")
-    private String slfReqAdr;
+    private String slfEqpAdr;
     /**
      * 客户摘要
      */

@@ -2,8 +2,12 @@ package com.cmbchina.llm.planner;
 
 import com.cmbchina.llm.tool.ToolInput;
 import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -12,6 +16,8 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 解析模型返回的计划，兼容常见的 JSON 格式偏差。
@@ -23,6 +29,14 @@ import java.util.List;
 @Component
 @RequiredArgsConstructor
 public class PlanResponseParser {
+
+    private static final String TOOL_SECTION_BEGIN = "<|tool_calls_section_begin|>";
+    private static final String TOOL_SECTION_END = "<|tool_calls_section_end|>";
+    private static final String TOOL_CALL_BEGIN = "<|tool_call_begin|>";
+    private static final String TOOL_ARGUMENT_BEGIN = "<|tool_call_argument_begin|>";
+    private static final String TOOL_CALL_END = "<|tool_call_end|>";
+    private static final Pattern SPECIAL_TOOL_HEADER = Pattern.compile(
+            "functions\\.(search_code|read_file|list_files|write_file|create_file|patch_file):[0-9]+");
 
     private final ObjectMapper objectMapper;
 
@@ -42,9 +56,10 @@ public class PlanResponseParser {
             // 兼容 trailing comma，修复未转义的反斜杠（如 Windows 路径 D:\FlinkTest\demo），
             // 以及将字符串值内部真实存在的控制字符（换行/回车/制表符）转义为 JSON 转义序列，
             // 避免因这些内容导致整个 plan 解析失败。
+            String planJson = normalizeSpecialTokenToolCalls(json);
             String cleanedJson = fixInvalidBackslashEscapes(
                     escapeControlCharsInStrings(
-                            removeTrailingCommas(extractJson(json))
+                            removeTrailingCommas(extractJson(planJson))
                     )
             );
 
@@ -54,14 +69,21 @@ public class PlanResponseParser {
             // 先按标准方式解析；若因对象未闭合失败，再尝试结构修复后重试，对合法 JSON 无副作用。
             JsonNode root;
             try {
-                root = objectMapper.readTree(cleanedJson);
+                root = readPlanJson(cleanedJson);
             } catch (JsonParseException e) {
                 if (isUnclosedObjectError(e)) {
                     String repaired = repairUnclosedObjects(cleanedJson);
-                    root = objectMapper.readTree(repaired);
+                    root = readPlanJson(repaired);
                 } else {
-                    throw e;
+                    String repaired = removeRedundantObjectCloser(cleanedJson, e);
+                    if (repaired.equals(cleanedJson)) {
+                        throw e;
+                    }
+                    root = readPlanJson(repaired);
                 }
+            }
+            if (root == null || !root.isObject()) {
+                throw invalidPlan("根节点必须是 JSON 对象");
             }
             validateModelResponse(root);
 
@@ -74,13 +96,17 @@ public class PlanResponseParser {
             } else if (root.has("plan")) {
                 stepArray = root.get("plan");
             } else {
-                throw new RuntimeException("plan field not found");
+                throw invalidPlan("缺少 steps 数组");
+            }
+            if (!stepArray.isArray()) {
+                throw invalidPlan("steps/plan 必须是数组");
             }
 
             for (JsonNode node : stepArray) {
-                // 单步容错：模型偶发会输出结构不规范的步骤（如 tool 缺失、或 keyword/path 未包进 input，
-                // 或 input 是字符串等无法反序列化为 ToolInput）。为避免单个坏步骤让整个计划解析失败
-                // 并中断任务，这里对该步骤做兜底：可修复则修复，不可修复则跳过并记录日志。
+                // 任一步骤不可解析时拒绝整份计划，避免静默丢弃修改后执行不完整计划。
+                if (!node.isObject()) {
+                    throw invalidPlan("第 " + index + " 步必须是对象");
+                }
                 try {
                     JsonNode inputNode;
                     if (node.has("input")) {
@@ -106,11 +132,12 @@ public class PlanResponseParser {
                         }
                     }
 
-                    if (!node.has("tool") || node.get("tool").isNull()
+                    if (!node.has("tool") || !node.get("tool").isTextual()
                             || node.get("tool").asText().trim().isEmpty()) {
-                        // tool 缺失无法执行，跳过该坏步骤，避免整个计划解析失败中断任务
-                        log.warn("plan step missing tool, skip step={}", node.size());
-                        continue;
+                        throw invalidPlan("第 " + index + " 步缺少非空字符串 tool");
+                    }
+                    if (!inputNode.isObject()) {
+                        throw invalidPlan("第 " + index + " 步的 input/args 必须是对象");
                     }
 
                     ToolInput input = objectMapper.treeToValue(inputNode, ToolInput.class);
@@ -123,11 +150,8 @@ public class PlanResponseParser {
                                     .description(node.has("description") ? node.get("description").asText() : "")
                                     .build()
                     );
-                } catch (Exception singleStepError) {
-                    // 单步反序列化失败（例如 input 为字符串无法转 ToolInput），跳过该坏步骤，
-                    // 保留其余正确步骤继续执行，避免单个模型输出异常导致整个任务 parse plan failed。
-                    log.warn("skip invalid plan step, node={}, err={}",
-                            node.size(), singleStepError.getMessage());
+                } catch (JsonProcessingException singleStepError) {
+                    throw invalidPlan("第 " + index + " 步的 input/args 字段类型不符合工具参数要求");
                 }
             }
             return CodePlan.builder()
@@ -137,45 +161,154 @@ public class PlanResponseParser {
 
         } catch (RuntimeException e) {
             throw e;
-        } catch (Exception e) {
-            // 模型偶发会输出无法修复的非法 JSON（例如 patch_file 的 oldText/newText 字段内含
-            // 超大真实源码，其反斜杠/引号/花括号转义错乱，字符串级修复器无法可靠兜底，二次 readTree
-            // 仍失败）。此时若继续抛异常会导致整个 Agent 任务以 parse plan failed 中断。
-            // 稳健做法：记录告警并降级返回空计划，让上层走 isEmptyPlan 兜底（不硬中断任务，
-            // 由后续迭代/修复流程继续推进或正常收敛），避免一次模型输出格式问题击穿整个任务。
-            if (isRecoverableFormatterError(e)) {
-                log.warn("plan json irrecoverable, fallback to empty plan. err={}", e.getMessage());
-                return CodePlan.builder()
-                        .task(task)
-                        .steps(new ArrayList<>())
-                        .build();
+        } catch (JsonProcessingException e) {
+            // 只反馈位置和纠正要求，不把整段源码或 Jackson 的原文摘录送回模型。
+            String location = e.getLocation() == null ? ""
+                    : "，第 " + e.getLocation().getLineNr() + " 行，第 "
+                    + e.getLocation().getColumnNr() + " 列";
+            log.warn("plan json rejected type={} location={}", e.getClass().getSimpleName(), location);
+            String reason = e.getOriginalMessage();
+            if (reason != null) {
+                reason = reason.replaceAll("[\\r\\n]+", " ");
+                reason = reason.substring(0, Math.min(160, reason.length()));
             }
-            throw new RuntimeException("parse plan failed:" + json, e);
+            throw invalidPlan("JSON 无法解析" + location + "，原因：" + reason);
+        } catch (Exception e) {
+            throw new RuntimeException("解析计划失败（" + e.getClass().getSimpleName() + "）", e);
         }
     }
 
     /**
-     * 判断是否为"模型输出不可修复的非法 JSON"类错误。
-     *
-     * <p>这类错误通常源于模型在超大字符串字段（如 patch_file 的 oldText/newText，内含完整源码）
-     * 中的反斜杠/引号/花括号转义错乱，导致对象结构被破坏，字符串级的容错修复器既无法恢复、
-     * 也不代表模型调用本身失败。此时应降级返回空计划而非中断任务。</p >
-     *
-     * @param e 解析阶段捕获的异常
-     * @return 若属于不可修复的格式/结构类错误则返回 true
+     * 仅兼容完整的特殊标记工具调用响应；普通 JSON 原样交给原有解析链。
+     * 所有调用、参数及结束标记确认完整后才返回计划，不能执行部分识别出的步骤。
      */
-    private boolean isRecoverableFormatterError(Exception e) {
-        Throwable cause = e;
-        while (cause != null) {
-            if (cause instanceof JsonParseException) {
-                return true;
-            }
-            if (cause instanceof com.fasterxml.jackson.databind.JsonMappingException) {
-                return true;
-            }
-            cause = cause.getCause();
+    private String normalizeSpecialTokenToolCalls(String response) throws JsonProcessingException {
+        String text = response.trim();
+        if (!text.startsWith(TOOL_SECTION_BEGIN)) {
+            return response;
         }
-        return false;
+        ObjectNode plan = objectMapper.createObjectNode();
+        ArrayNode steps = plan.putArray("steps");
+        int position = TOOL_SECTION_BEGIN.length();
+        while (position < text.length()) {
+            position = skipToolWhitespace(text, position);
+            if (text.startsWith(TOOL_SECTION_END, position)) {
+                position = skipToolWhitespace(text, position + TOOL_SECTION_END.length());
+                if (position != text.length() || steps.isEmpty()) {
+                    throw invalidPlan("特殊标记工具调用为空或结束标记后存在额外内容");
+                }
+                log.info("plan special-token tool calls normalized steps={}", steps.size());
+                return objectMapper.writeValueAsString(plan);
+            }
+            if (!text.startsWith(TOOL_CALL_BEGIN, position)) {
+                throw invalidPlan("特殊标记工具调用缺少完整的调用开始或区段结束标记");
+            }
+            int headerStart = position + TOOL_CALL_BEGIN.length();
+            int argumentsMarker = text.indexOf(TOOL_ARGUMENT_BEGIN, headerStart);
+            if (argumentsMarker < 0) {
+                throw invalidPlan("特殊标记工具调用缺少参数开始标记");
+            }
+            Matcher header = SPECIAL_TOOL_HEADER.matcher(text.substring(headerStart, argumentsMarker).trim());
+            if (!header.matches()) {
+                throw invalidPlan("特殊标记调用头必须为 functions.<现有工具名>:<序号>，不支持未知工具");
+            }
+            int argumentsStart = skipToolWhitespace(text, argumentsMarker + TOOL_ARGUMENT_BEGIN.length());
+            int argumentsEnd = findToolArgumentsEnd(text, argumentsStart);
+            String arguments = text.substring(argumentsStart, argumentsEnd);
+            JsonNode input = readPlanJson(fixInvalidBackslashEscapes(
+                    escapeControlCharsInStrings(removeTrailingCommas(arguments))));
+            if (input == null || !input.isObject()) {
+                throw invalidPlan("特殊标记工具调用的参数必须是 JSON 对象");
+            }
+            position = skipToolWhitespace(text, argumentsEnd);
+            if (!text.startsWith(TOOL_CALL_END, position)) {
+                throw invalidPlan("特殊标记工具调用的参数后缺少调用结束标记");
+            }
+            position += TOOL_CALL_END.length();
+            ObjectNode step = steps.addObject();
+            step.put("tool", header.group(1));
+            step.set("input", input);
+        }
+        throw invalidPlan("特殊标记工具调用被截断，缺少区段结束标记");
+    }
+
+    private int skipToolWhitespace(String text, int position) {
+        while (position < text.length() && Character.isWhitespace(text.charAt(position))) {
+            position++;
+        }
+        return position;
+    }
+
+    /** 按字符串转义状态寻找完整参数对象，不将源码字符串中的花括号或工具标记当作边界。 */
+    private int findToolArgumentsEnd(String text, int start) {
+        if (start >= text.length() || text.charAt(start) != '{') {
+            throw invalidPlan("特殊标记工具调用的参数必须以 JSON 对象开始");
+        }
+        int depth = 0;
+        boolean inString = false;
+        for (int position = start; position < text.length(); position++) {
+            char character = text.charAt(position);
+            if (inString) {
+                if (character == '\\') {
+                    position++;
+                } else if (character == '"') {
+                    inString = false;
+                }
+            } else if (character == '"') {
+                inString = true;
+            } else if (character == '{') {
+                depth++;
+            } else if (character == '}' && --depth == 0) {
+                return position + 1;
+            }
+        }
+        throw invalidPlan("特殊标记工具调用的参数 JSON 未完整闭合");
+    }
+
+    private JsonNode readPlanJson(String json) throws JsonProcessingException {
+        // 不接受合法计划后另附的对象或垃圾字符，防止只解析部分响应。
+        return objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(json);
+    }
+
+    /** 仅移除 Jackson 已确认出现在数组闭合前的一枚多余对象闭合符，不猜测缺失步骤。 */
+    private String removeRedundantObjectCloser(String json, JsonParseException error) {
+        String reason = error.getOriginalMessage();
+        if (reason == null || !reason.contains("Unexpected close marker '}'")
+                || !reason.contains("expected ']'") || error.getLocation() == null) {
+            return json;
+        }
+        long offset = error.getLocation().getCharOffset() - 1;
+        if (offset < 0 || offset >= json.length() || json.charAt((int) offset) != '}') {
+            return json;
+        }
+        int position = (int) offset;
+        int previous = position - 1;
+        while (previous >= 0 && Character.isWhitespace(json.charAt(previous))) {
+            previous--;
+        }
+        int next = position + 1;
+        while (next < json.length() && Character.isWhitespace(json.charAt(next))) {
+            next++;
+        }
+        if (previous < 0 || json.charAt(previous) != '}' || next >= json.length() || json.charAt(next) != ']') {
+            return json;
+        }
+        log.warn("plan json removing redundant object closer line={} column={}",
+                error.getLocation().getLineNr(), error.getLocation().getColumnNr());
+        return json.substring(0, position) + json.substring(position + 1);
+    }
+
+    /**
+     * 返回可交给现有规划重试流程的有界格式反馈，不能将解析失败伪装成空计划。
+     */
+    private IllegalArgumentException invalidPlan(String detail) {
+        return new IllegalArgumentException("计划 JSON 格式或结构错误：" + detail
+                + "。请重新提交完整合法 JSON 对象及 steps 数组；每步包含 tool 字符串和 input 对象。"
+                + "content/oldText/newText 必须各为一个正确转义的 JSON 字符串，"
+                + "源码中的双引号、反斜杠、换行必须按 JSON 转义，禁止在 JSON 字符串外用 + 拼接。"
+                + "不要输出分析文字、Markdown 代码围栏、<tool_call> 或 ToolInput(...) 伪调用；"
+                + "读取也必须使用 JSON，例如 {\"steps\":[{\"tool\":\"read_file\",\"input\":{\"path\":\"已确认的真实路径\"}}]}。"
+                + "检查对象和数组闭合括号，不要用空 steps 代替尚未完成的操作。");
     }
 
     private void validateModelResponse(
@@ -209,6 +342,19 @@ public class PlanResponseParser {
     }
 
     private String extractJson(String text) {
+        // 优先提取独立代码围栏，避免说明文字中的花括号被误认为计划起点。
+        java.util.regex.Matcher fence = java.util.regex.Pattern
+                .compile("(?m)^[\\t ]*```(?:json)?[\\t ]*\\r?\\n")
+                .matcher(text);
+        if (fence.find()) {
+            int start = fence.end();
+            java.util.regex.Matcher closing = java.util.regex.Pattern
+                    .compile("(?m)^[\\t ]*```[\\t ]*(?:\\r?$)")
+                    .matcher(text);
+            if (closing.find(start)) {
+                return text.substring(start, closing.start()).trim();
+            }
+        }
         int start = text.indexOf("{");
         int end = text.lastIndexOf("}");
         if (start >= 0 && end > start) {

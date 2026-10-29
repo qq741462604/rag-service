@@ -7,6 +7,7 @@ import com.cmbchina.llm.agent.observation.Observation;
 import com.cmbchina.llm.skill.Skill;
 import com.cmbchina.llm.skill.SkillMatcher;
 import com.cmbchina.llm.tool.FileContent;
+import com.cmbchina.llm.tool.FileOperationResult;
 import com.cmbchina.llm.tool.ToolInput;
 import com.cmbchina.llm.workspace.WorkspaceService;
 import org.springframework.stereotype.Component;
@@ -75,7 +76,9 @@ public class SkillTemplateCoordinator {
             return null;
         }
         List<PlanStep> steps = new ArrayList<>();
-        for (String path : currentArtifactPaths(context)) {
+        Set<String> paths = new LinkedHashSet<>(currentArtifactPaths(context));
+        paths.addAll(currentDependencyPaths(context));
+        for (String path : paths) {
             if (workspaceService.resolve(path).isFile() && latestArtifactRead(path, context) == null) {
                 steps.add(PlanStep.builder().order(steps.size() + 1).tool("read_file")
                         .input(ToolInput.builder().path(path).startLine(1).endLine(1000).build())
@@ -94,6 +97,12 @@ public class SkillTemplateCoordinator {
         for (String path : currentArtifactPaths(context)) {
             Observation observation = latestArtifactRead(path, context);
             if (observation != null) {
+                result.add(observation);
+            }
+        }
+        for (String path : currentDependencyPaths(context)) {
+            Observation observation = latestArtifactRead(path, context);
+            if (observation != null && !result.contains(observation)) {
                 result.add(observation);
             }
         }
@@ -119,6 +128,41 @@ public class SkillTemplateCoordinator {
             }
         }
         return result;
+    }
+
+    /** 固定调用模板所需的已确认依赖源码，避免被最近的搜索结果挤出上下文。 */
+    private List<String> currentDependencyPaths(AgentContext context) {
+        String current = currentTemplate(context);
+        if (current == null || !current.contains("04-invoke-handler")) {
+            return Collections.emptyList();
+        }
+        Set<String> names = new LinkedHashSet<>(Arrays.asList("ReadConfig.java", "HttpClientUtil.java",
+                "SpringContextBeanUtil.java", "AhiHttpBodyEntity.java", "AhiHttpBodyHeaderEntity.java",
+                "AhiHttpBodyDataEntity.java"));
+        List<String> paths = new ArrayList<>();
+        List<Observation> observations = context.getObservations();
+        for (int index = observations.size() - 1; index >= 0 && !names.isEmpty(); index--) {
+            Observation observation = observations.get(index);
+            if (!observation.isSuccess()) {
+                continue;
+            }
+            String path = null;
+            if ("read_file".equals(observation.getTool()) && observation.getResult() instanceof FileContent) {
+                path = ((FileContent) observation.getResult()).getPath();
+            } else if (Arrays.asList("write_file", "create_file", "patch_file", "edit_file")
+                    .contains(observation.getTool()) && observation.getResult() instanceof FileOperationResult) {
+                path = ((FileOperationResult) observation.getResult()).getPath();
+            }
+            if (path == null || !names.contains(new File(path).getName())) {
+                continue;
+            }
+            File file = workspaceService.resolve(path);
+            if (file.isFile()) {
+                paths.add(workspaceService.relativePath(file));
+                names.remove(file.getName());
+            }
+        }
+        return paths;
     }
 
     private Observation latestArtifactRead(String path, AgentContext context) {

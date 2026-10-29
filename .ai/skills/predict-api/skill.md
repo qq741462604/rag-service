@@ -43,6 +43,8 @@ Rules:
 
 12. 03 模板的公共追踪类型固定为 com.cmb.bee.tracer.util.BeeTraceClientHelper 和 com.cmb.bee.tracer.codec.HttpClientInjectAdapter，不随业务包迁移。HttpClientUtil 必须同时补齐正确 import、静态 beeTraceClientHelper 字段、SpringContextBeanUtil.getApplicationContext().getBean(BeeTraceClientHelper.class) 初始化及该字段上的三步追踪调用。禁止仿造同名业务类/内部类、编造 getInstance 或改用 GlobalTracer；OpenTracing API 依赖不等于 Bee 公共组件依赖。缺私有依赖依据应明确报告，不得删字段/import 后继续推进。
 
+13. 请求实体与 Handler 的 setter 必须按真实源码核对；自助设备地址新代码统一为 slfEqpAdr / setSlfEqpAdr，JSON 键固定 SLF_EQP_ADR。复用旧字段 slfReqAdr 时保留该 JSON 键并调用真实 setter，禁止新增 SLF_REQ_ADR、重复映射或通过删除协议字段迁就拼写错误；S2 修复前同时读取实体和调用方。
+
 Implementation:
 
 Step1:

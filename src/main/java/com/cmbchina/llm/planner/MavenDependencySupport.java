@@ -211,6 +211,24 @@ public class MavenDependencySupport {
     }
 
     private Map<String, Element> compileDeclarations(AgentContext context) {
+        return availableDeclarations(context, false);
+    }
+
+    /** 只提供已声明的测试依赖线索，不把 starter 或静态父链误当作完整测试类路径。 */
+    public String testDependencyRules(AgentContext context) {
+        return "当前模块及可访问本地父链的编译/测试依赖声明: "
+                + availableDeclarations(context, true).keySet() + "\n"
+                + "先确认真实测试框架再生成 import；JUnit4 使用 org.junit.Test/org.junit.Assert，"
+                + "JUnit5 使用 org.junit.jupiter.api.Test/Assertions，不能混用。"
+                + "spring-boot-starter-test 不等于 junit:junit；Boot 2.7 的 starter 默认使用 Jupiter，"
+                + "没有 JUnit4 依据时新测试沿用 Jupiter，不能凭习惯生成 org.junit.Test。"
+                + "已有 JUnit4 测试保留框架、方法和断言，缺包时按已确认版本管理补 junit:junit test 依赖；"
+                + "若当前 Surefire 使用 JUnit Platform，JUnit4 还需兼容的 junit-vintage-engine 才能执行，"
+                + "不能只补编译包或凭空升级插件；确认当前执行器和版本依据后局部补测试依赖。"
+                + "已有依赖未显式写 version 可能由父 POM/BOM 管理；进入编译阶段并不表示依赖缺版本。\n";
+    }
+
+    private Map<String, Element> availableDeclarations(AgentContext context, boolean includeTest) {
         List<File> files = new ArrayList<>(pomFiles(context));
         Collections.reverse(files);
         List<Element> projects = new ArrayList<>();
@@ -240,7 +258,8 @@ public class MavenDependencySupport {
                 scope = text(managed.get(coordinate), "scope");
             }
             scope = expand(scope, properties);
-            if (scope.isEmpty() || "compile".equals(scope) || "provided".equals(scope) || "system".equals(scope)) {
+            if (scope.isEmpty() || "compile".equals(scope) || "provided".equals(scope) || "system".equals(scope)
+                    || (includeTest && "test".equals(scope))) {
                 result.put(coordinate, dependency);
             }
         });
@@ -321,7 +340,10 @@ public class MavenDependencySupport {
                     && isVersionOnlyAddition(original, replacement);
             if (replacement == null
                     || !xmlSignature(original).equals(xmlSignature(replacement)) && !fillMissingVersion) {
-                throw new IllegalArgumentException("S2 不得删除或改变已有依赖: " + dependency.getKey());
+                throw new IllegalArgumentException("S2 不得删除或改变已有依赖: " + dependency.getKey()
+                        + "；未显式声明版本不等于缺少版本，可能由父 POM/BOM 管理。"
+                        + "只有 Maven 明确报告该依赖 version is missing 时才允许补空版本；"
+                        + "org.junit 缺包应核对 JUnit4/5 import 与实际测试框架，不能修改 Mockito 版本替代修复。");
             }
         }
         if (generation) {

@@ -80,7 +80,7 @@ public class QwenPlanner implements Planner {
                 }
             }
         }
-        if (isS2(context) && context.getPhase() == AgentPhase.CODING) {
+        if (isS2(context) && (context.getPhase() == AgentPhase.CODING || context.getPhase() == AgentPhase.REPAIR)) {
             CodePlan currentRead = testCoordinator.ensureCurrentRead(context);
             if (currentRead != null) {
                 return currentRead;
@@ -123,6 +123,7 @@ public class QwenPlanner implements Planner {
         }
         rejectRedundantS1ReadPlan(context, plan);
         plan = repairExistingFileWritePlan(context, plan);
+        plan = foldNewFilePatches(plan);
 
         // 不吞掉校验失败，更不能把被拒绝的写入计划继续交给工具执行。
         planValidator.validate(plan, context);
@@ -160,6 +161,8 @@ public class QwenPlanner implements Planner {
         if (context.getModelCalls() >= maxModelCalls) {
             throw new IllegalStateException("规划模型调用已达到任务预算 " + maxModelCalls);
         }
+        log.info("planner feedback agentId={} phase={} errors={}",
+                context.getAgentId(), context.getPhase(), summarize(vars.get("VERIFY_ERRORS"), 1800));
         context.setModelCalls(context.getModelCalls() + 1);
         log.info("planner model call agentId={} call={}/{}", context.getAgentId(), context.getModelCalls(), maxModelCalls);
         String response = llmClient.chat(prompt);
@@ -203,6 +206,78 @@ public class QwenPlanner implements Planner {
             }
         }
         return false;
+    }
+
+    /**
+     * 将新文件的后续局部补丁按顺序合并进创建内容，再交给原有整计划预检。
+     * 仅处理同一路径且磁盘上不存在的文件，不跨越读取操作改变模型观察到的内容。
+     */
+    private CodePlan foldNewFilePatches(CodePlan plan) {
+        if (plan == null || plan.getSteps() == null) {
+            return plan;
+        }
+        Map<File, ToolInput> pendingCreates = new HashMap<>();
+        Set<File> createdFiles = new HashSet<>();
+        List<PlanStep> normalized = new ArrayList<>();
+        int folded = 0;
+        int index = 0;
+        for (PlanStep step : plan.getSteps()) {
+            index++;
+            if (!(step.getInput() instanceof ToolInput)
+                    || !isCreateTool(step.getTool()) && !"patch_file".equals(step.getTool())) {
+                // 读取/搜索可能观察创建时的中间状态，不能把后续修改提前到它们之前。
+                pendingCreates.clear();
+                normalized.add(step);
+                continue;
+            }
+            ToolInput input = (ToolInput) step.getInput();
+            File file = workspaceService.resolve(input.getPath());
+            if (isCreateTool(step.getTool()) && !file.exists()) {
+                if (!createdFiles.add(file)) {
+                    throw new IllegalArgumentException("同一计划重复创建文件: " + input.getPath());
+                }
+                String content = input.getContent();
+                if (content == null && "write_file".equals(step.getTool())) {
+                    content = input.getNewText();
+                }
+                if (content == null) {
+                    throw new IllegalArgumentException("新文件 content 为空，原计划全部未执行: " + input.getPath());
+                }
+                ToolInput merged = ToolInput.builder().path(input.getPath()).content(content).build();
+                pendingCreates.put(file, merged);
+                normalized.add(PlanStep.builder().order(step.getOrder()).tool(step.getTool())
+                        .input(merged).description(step.getDescription()).build());
+            } else if ("patch_file".equals(step.getTool()) && pendingCreates.containsKey(file)) {
+                ToolInput creation = pendingCreates.get(file);
+                try {
+                    if (!creation.getContent().isEmpty() && isInvalidPatchOldText(input.getOldText())) {
+                        throw new IllegalArgumentException("oldText 为空或占位符");
+                    }
+                    creation.setContent(patchFileTool.previewPatch(creation.getContent(), input));
+                } catch (Exception exception) {
+                    throw new IllegalArgumentException("第 " + index + " 步新文件补丁合并失败，原计划全部未执行。path="
+                            + input.getPath() + "；原因=" + exception.getMessage()
+                            + "。oldText 必须匹配同一计划前序创建及补丁后的内容，请纠正后重新提交完整计划。", exception);
+                }
+                folded++;
+                log.info("new file patch folded in memory step={} path={}", index, input.getPath());
+            } else {
+                if ("patch_file".equals(step.getTool()) && createdFiles.contains(file)) {
+                    throw new IllegalArgumentException("同一计划新建文件后插入了读取操作，不能提前合并后续补丁: "
+                            + input.getPath() + "；请直接在创建内容中补齐修改，或分轮创建、读取后再修改。原计划全部未执行。");
+                }
+                normalized.add(step);
+            }
+        }
+        if (folded == 0) {
+            return plan;
+        }
+        List<PlanStep> steps = new ArrayList<>();
+        for (PlanStep step : normalized) {
+            steps.add(PlanStep.builder().order(steps.size() + 1).tool(step.getTool())
+                    .input(step.getInput()).description(step.getDescription()).build());
+        }
+        return CodePlan.builder().task(plan.getTask()).steps(steps).build();
     }
 
     private String stripReadLineNumbers(List<String> lines) {
@@ -658,8 +733,19 @@ public class QwenPlanner implements Planner {
                     return "当前阶段 REPAIR：只依据 VERIFY_ERRORS 修复本任务的编译、断言或运行错误。\n"
                             + "修复范围: " + testCoordinator.testClassNames(context)
                             + " 对应的本次业务类/测试，以及模块 " + testCoordinator.modulePom(context) + "。\n"
+                            + testCoordinator.testDependencyRules(context)
+                            + testCoordinator.testIsolationRules()
                             + "读取失败涉及的最新源码后做局部 patch；不能删除测试方法、减少断言、禁用用例或改跳过配置。"
                             + "保留 S1 模板协议、签名与调用链；不得为通过测试放宽需求。"
+                            + "MockMaker 不支持 static/construction mocks 是 Mockito 测试能力问题，先核对真实版本和配置；"
+                            + "Mockito 3/4 缺 inline 时局部补与 core 同版本的 mockito-inline test 依赖，"
+                            + "版本复用已确认的管理依据，不猜版本或升级；Mockito 5 默认 inline，检查是否被覆盖。"
+                            + "不得把此错误臆断成业务 NPE，禁止删除生产 Bean/静态初始化或将配置、URL、Client 置空。"
+                            + "测试先 Mock Spring 上下文及全部 Bean 再首次使用目标类；类初始化只执行一次，"
+                            + "反射置空不会重新初始化，禁止反射改写 static final；可变静态状态注入正确 Mock 后须恢复。"
+                            + "实体 setter 编译失败时必须同时核对实体和调用方；优先修正调用拼写，不得新增或删除协议字段来回试错。"
+                            + "自助设备地址的 JSON 键固定 SLF_EQP_ADR，字段 slfEqpAdr 对应 setSlfEqpAdr；"
+                            + "若复用旧字段 slfReqAdr，仍须映射 SLF_EQP_ADR 且调用其真实 setter，禁止发明 SLF_REQ_ADR。"
                             + "公共类无法解析或变量未定义时，先核对真实 import、字段声明和已有依赖，禁止自行仿造公共类。"
                             + "HttpClientUtil 的 beeTraceClientHelper 必须是通过 SpringContextBeanUtil 获取的 "
                             + "com.cmb.bee.tracer.util.BeeTraceClientHelper Bean；适配器固定为 "
@@ -992,7 +1078,12 @@ public class QwenPlanner implements Planner {
         if (context.getVerifyErrors() == null || context.getVerifyErrors().isEmpty()) {
             return "";
         }
-        Set<String> uniqueErrors = new LinkedHashSet<>(context.getVerifyErrors());
+        // 上次计划的拒绝原因必须先呈现，避免被长编译日志截掉后反复提交同一错误计划。
+        Set<String> uniqueErrors = new LinkedHashSet<>();
+        context.getVerifyErrors().stream().filter(error -> error.startsWith("上一计划被拒绝"))
+                .forEach(error -> uniqueErrors.add(error.substring(0, Math.min(2000, error.length()))));
+        context.getVerifyErrors().stream().filter(error -> !error.startsWith("上一计划被拒绝"))
+                .forEach(uniqueErrors::add);
         String errors = String.join("\n", uniqueErrors);
         int maxLength = 8000;
         if (errors.length() > maxLength) {

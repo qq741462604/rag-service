@@ -178,13 +178,53 @@ public class S2TestCoordinator {
                 + "；模块 POM: " + state.pom + "\n"
                 + "当前测试文件存在: " + (entry != null && workspaceService.resolve(entry.test).isFile()) + "\n"
                 + "当前未满足项: " + (entry == null ? "无" : validate(entry)) + "\n"
+                + testDependencyRules(context)
+                + testIsolationRules()
                 + "使用真实业务签名和已有 JUnit4/5、断言/Mockito；测试须有实际业务断言。"
                 + "覆盖正常、异常、空值及本需求分支；HTTP/DB/私有服务使用 mock，不启动 Spring 全上下文或真实网络。"
                 + "已有测试先读后局部 patch；禁止重写业务、空壳、恒定值断言、禁用、assume 或删除既有测试/断言。"
                 + "缺测试依赖只局部补模块 POM test scope，版本复用已有管理；不能猜私有依赖坐标或版本。"
+                + "使用 Mockito.mockStatic/mockConstruction 前核对实际 Mockito 版本及 MockMaker；"
+                + "spring-boot-starter-test 或 mockito-core 的存在不代表支持静态/构造器 Mock。"
+                + "Mockito 3/4 须启用 inline，缺失时局部补同现有 core 版本的 mockito-inline test 依赖，"
+                + "版本优先复用已确认的 BOM 管理，不升级已有依赖；Mockito 5 默认 inline，仍须检查覆盖配置。"
+                + "测试须先准备 SpringContextBeanUtil 的 Mock 和所需 Bean，再首次主动使用有静态 Bean 字段的业务类。"
+                + "类初始化只执行一次，反射置空不会重新初始化；不要反射写 static final 字段或把生产依赖置空，"
+                + "可变静态状态只注入正确 Mock，并在测试结束后恢复，不能修改生产初始化来迁就测试。"
                 + "新增依赖使用已读 POM 中真实且唯一的 dependencies 结束标签作局部插入锚点；"
                 + "不要为添加依赖重排已有 dependency/artifactId 的格式，不能拼造 oldText。"
                 + "Maven 由服务端验证阶段执行，模型不得调用 run_test、shell、exec 或其他命令工具。\n";
+    }
+
+    public String testDependencyRules(AgentContext context) {
+        return dependencySupport.testDependencyRules(context);
+    }
+
+    public String testIsolationRules() {
+        return "测试隔离必须依据真实可访问类型及实际创建路径：禁止 import 或全限定引用包私有 "
+                + "InternalHttpClient，全限定名不能绕过访问控制；禁止对抽象 CloseableHttpClient 做构造器 Mock。"
+                + "HttpClientUtil 调用 HttpClients.custom()，可 mockStatic(HttpClients.class)，"
+                + "返回 mock(HttpClientBuilder.class, RETURNS_SELF)，让 builder.build() 返回普通 "
+                + "mock(CloseableHttpClient.class)；单独拦截不在实际创建链上的构造器无效。"
+                + "公开工厂 Mock 与 SpringContextBeanUtil 及全部所需 Bean 必须在业务类首次初始化前就绪；"
+                + "mockConstruction(业务类) 也会触发类初始化，不自动屏蔽静态字段/静态块。"
+                + "constructed() 只包含已实际构造的对象；不要在被测调用之前取 constructed().get(0)，"
+                + "应在 mockConstruction 的初始化回调中设置 doPost 等桩，业务调用之后再验证构造结果。"
+                + "开关关闭等不应构造对象的分支应验证未构造，不能人为 new 业务类填充 constructed()。"
+                + "禁止反射改写 AhiHttpInvokerHandler 的 static final httpClientUtil/REQUEST_URL，"
+                + "应在首次初始化前控制公开工厂或业务构造链；不能删除生产 final 或 Bean 初始化。"
+                + "MockedStatic/MockedConstruction 同线程同类型不得重复注册；使用 try-with-resources "
+                + "或可靠的清理钩子关闭，禁止类级、setUp 和方法级对同一类型重叠注册。"
+                + "构造器 Mock 回调直接 stub 回调给出的 mock；不能在尚未完成的 when(...).thenReturn(...) "
+                + "链中创建另一个 Mock 或触发构造器回调里的 stub，应先准备依赖对象，再独立登记返回值，"
+                + "避免把 ReadConfig 返回值登记到返回 Boolean 的 getAhiHttpInvokeEnable 上。"
+                + "EventData 等公共业务类型按已读真实 API 使用，不能猜测 setData；"
+                + "缺 setter 时使用真实可变集合 API 或 stub getData()，不为测试篡改公共类型。"
+                + "空值分支按真实异常契约断言，不要仅凭测试名猜测 assertDoesNotThrow。"
+                + "仅当本次用例报告 Unexpected exception thrown、源码明确声明并抛出同一异常时，"
+                + "可将同一被测调用的 assertDoesNotThrow 更正为该具体类型的 assertThrows；"
+                + "其它既有断言和交互验证仍须逐字保留，不得顺便修改返回值预期。"
+                + "任何修复必须保留业务断言，不能通过跳过测试、调用真实网络或改生产契约迁就测试。\n";
     }
 
     public List<Observation> observations(AgentContext context) {
@@ -242,7 +282,9 @@ public class S2TestCoordinator {
                     .anyMatch(template -> template.contains("03-http-client-util"))) {
                 List<String> errors = contractValidator.validateHttpClientSource(after);
                 if (!errors.isEmpty()) {
-                    throw new IllegalArgumentException("S2 修复不得破坏 S1 公共追踪契约: " + errors);
+                    throw new IllegalArgumentException("S2 修复不得破坏 S1 公共追踪契约: " + errors
+                            + "；Mockito MockMaker 报错先修复测试依赖与配置；初始化问题先修复测试 Mock 顺序及状态恢复。"
+                            + "禁止删除生产 Bean/静态初始化，或将生产配置、URL、Client 置空来通过测试。");
                 }
             }
             if (entry.test.equals(path)) {
@@ -254,7 +296,8 @@ public class S2TestCoordinator {
                     }
                 }
                 if (!before.isEmpty()) {
-                    inspector.preserveAssertions(before, after);
+                    inspector.preserveAssertions(before, after, inspector.read(workspaceService.resolve(entry.source)),
+                            entry.testClass, context.getVerifyErrors());
                 }
                 List<String> errors = validateSource(entry, after);
                 if (!errors.isEmpty()) {
@@ -315,6 +358,20 @@ public class S2TestCoordinator {
         if (entry != null) {
             paths.add(entry.source);
             paths.add(entry.test);
+        }
+        if (context.getPhase() == AgentPhase.REPAIR) {
+            String errors = String.join("\n", context.getVerifyErrors());
+            // 仅固定本次错误点名的清单文件，避免修复阶段只剩 POM、反复猜测实体和调用方。
+            for (Entry candidate : state.entries) {
+                if (errors.contains(candidate.sourceClass) || errors.contains(candidate.testClass)) {
+                    if (!paths.contains(candidate.source)) {
+                        paths.add(candidate.source);
+                    }
+                    if (!paths.contains(candidate.test)) {
+                        paths.add(candidate.test);
+                    }
+                }
+            }
         }
         for (File pom : dependencySupport.pomFiles(context)) {
             paths.add(workspaceService.relativePath(pom));

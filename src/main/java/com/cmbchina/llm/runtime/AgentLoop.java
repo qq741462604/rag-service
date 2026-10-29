@@ -195,6 +195,20 @@ public class AgentLoop {
                             + skillTemplateCoordinator.currentTemplate(context));
                     return;
                 }
+                if (readOnlyRounds >= 3 && context.getPhase() == AgentPhase.CODING
+                        && context.getCodingTrack() == CodingTrack.S1_BUSINESS
+                        && skillTemplateCoordinator.currentTemplate(context) != null) {
+                    context.getVerifyErrors().removeIf(error -> error.startsWith("连续只读提醒:"));
+                    context.getVerifyErrors().add("连续只读提醒: 已连续 " + readOnlyRounds + "/"
+                            + MAX_READ_ONLY_ROUNDS + " 轮未修改代码，当前模板="
+                            + skillTemplateCoordinator.currentTemplate(context)
+                            + "。请复用已固定的真实依赖源码和搜索结果，补齐当前模板产物；"
+                            + "标准产物路径已确认不存在且搜索无等价实现时可按模板新建，不要重复搜索同一类型。"
+                            + "依赖包中的公共类在源码搜索不到不代表缺依赖；按模板 import 和已有依赖依据处理，"
+                            + "确有未知签名或依赖信息时明确指出，不猜测。只读上限保持不变。");
+                    log.warn("S1 read-only progress warning rounds={}/{} template={}", readOnlyRounds,
+                            MAX_READ_ONLY_ROUNDS, skillTemplateCoordinator.currentTemplate(context));
+                }
             }
 
             List<ToolCallResult> results = toolExecutor.execute(plan, context);
@@ -209,6 +223,7 @@ public class AgentLoop {
                 readOnlyRounds = 0;
                 duplicateRounds = 0;
                 executedPlans.clear();
+                context.getVerifyErrors().removeIf(error -> error.startsWith("连续只读提醒:"));
                 if (context.getPhase() == AgentPhase.CODING) {
                     context.getVerifyErrors().clear();
                 }
@@ -228,6 +243,7 @@ public class AgentLoop {
                     readOnlyRounds = 0;
                     duplicateRounds = 0;
                     executedPlans.clear();
+                    context.getVerifyErrors().removeIf(error -> error.startsWith("连续只读提醒:"));
                 }
                 codingS1Done = skillTemplateCoordinator.currentTemplate(context) == null;
                 // 不能以一次成功写入代替整个 S1 完成，模板产物齐全才允许进入验证。

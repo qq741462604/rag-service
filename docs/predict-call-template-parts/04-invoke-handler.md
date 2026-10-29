@@ -194,7 +194,8 @@ public class AhiHttpInvokerHandler {
         ahiHttpBodyDataEntity.setCustId(eventFields.getOrDefault("customerId", "").toString());
         ahiHttpBodyDataEntity.setEacSeqNbr("EAA00001");
         ahiHttpBodyDataEntity.setEacNm(eventFields.getOrDefault("cltNam", "").toString());
-        ahiHttpBodyDataEntity.setSlfReqAdr(slf_eqp_adr);
+        // 与真实实体的 slfEqpAdr 字段及 SLF_EQP_ADR 协议键一致，禁止另造 SLF_REQ_ADR 字段。
+        ahiHttpBodyDataEntity.setSlfEqpAdr(slf_eqp_adr);
 
         ahiHttpBodyDataEntity.setCustSmr(eventFields.getOrDefault("memo", "").toString());
         ahiHttpBodyDataEntity.setOppTrxTxtSmr("");

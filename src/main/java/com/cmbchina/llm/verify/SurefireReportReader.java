@@ -17,6 +17,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -83,6 +84,8 @@ public class SurefireReportReader {
                 if (test.getElementsByTagName("failure").getLength() > 0
                         || test.getElementsByTagName("error").getLength() > 0) {
                     result.addError("测试失败: " + className + "#" + test.getAttribute("name"));
+                    addFailureDetails(test, "failure", result);
+                    addFailureDetails(test, "error", result);
                 }
             }
             if (relevant) {
@@ -100,6 +103,36 @@ public class SurefireReportReader {
             }
         });
         return result;
+    }
+
+    /** 异常消息可能独占无 Maven 前缀的下一行，必须从本次 XML 保留根因并去重。 */
+    private void addFailureDetails(Element test, String tag, Evidence result) {
+        NodeList failures = test.getElementsByTagName(tag);
+        for (int index = 0; index < failures.getLength(); index++) {
+            Element failure = (Element) failures.item(index);
+            String message = failure.getAttribute("message");
+            if (message.trim().isEmpty()) {
+                message = failure.getTextContent();
+            }
+            // Mockito 顶层消息可能先输出很长的环境说明，优先保留最后一个 Caused by 的真实原因。
+            String trace = failure.getTextContent();
+            int cause = trace.lastIndexOf("Caused by:");
+            if (cause >= 0) {
+                String rootCause = trace.substring(cause, Math.min(trace.length(), cause + 1024));
+                addFailureDetail("底层原因: " + rootCause, result);
+            }
+            String detail = failure.getAttribute("type") + ": "
+                    + message.substring(0, Math.min(2048, message.length())).replaceAll("\\s+", " ").trim();
+            addFailureDetail(detail, result);
+        }
+    }
+
+    private void addFailureDetail(String detail, Evidence result) {
+        String normalized = detail.replaceAll("\\s+", " ").trim();
+        normalized = normalized.substring(0, Math.min(512, normalized.length()));
+        if (result.failureDetails.size() < 32 && result.failureDetails.add(normalized)) {
+            result.addError("异常根因: " + normalized);
+        }
     }
 
     private void checkSuite(Element suite, Evidence result) {
@@ -153,6 +186,7 @@ public class SurefireReportReader {
         public int skipped;
         public final List<String> reports = new ArrayList<>();
         public final List<String> errors = new ArrayList<>();
+        private final Set<String> failureDetails = new LinkedHashSet<>();
 
         private void addError(String message) {
             if (errors.size() < 32) {

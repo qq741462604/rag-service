@@ -152,9 +152,15 @@ public class RunTestTool extends BaseTool {
                         + (output.rootCause == null ? "输出未包含 Caused by，需检查完整日志" : output.rootCause),
                         output, exitCode, true);
             }
+            if (exitCode != 0 && output.compilationFailed) {
+                // 编译失败时测试尚未开始，只返回根因，不为每个测试类追加缺少报告。
+                return failure("Maven 编译失败，测试尚未执行；先修复以下源码或依赖错误。\n"
+                        + String.join("\n", output.errors()), output, exitCode, output.blocked);
+            }
             SurefireReportReader.Evidence evidence = reportReader.inspect(module, expected, before);
-            List<String> errors = new ArrayList<>(output.errors());
-            errors.addAll(evidence.errors);
+            // 先保留本次报告中的失败用例与异常根因，避免被重复的控制台输出挤出有界摘要。
+            List<String> errors = new ArrayList<>(evidence.errors);
+            errors.addAll(output.errors());
             boolean success = exitCode == 0 && evidence.errors.isEmpty();
             if (!success && errors.isEmpty()) {
                 errors.add("Maven 测试失败，退出码=" + exitCode);
@@ -214,6 +220,9 @@ public class RunTestTool extends BaseTool {
         log.info("run_test Java environment generatorVersion={} generatorHome={} targetJavaHome={} configured={}",
                 System.getProperty("java.version"), System.getProperty("java.home"),
                 environment.getOrDefault("JAVA_HOME", "<未设置，按 PATH 查找>"), configured);
+        // Java 子进程日志必须与监督进程和读取器统一 UTF-8，避免中文编译诊断变成乱码。
+        String mavenOptions = environment.getOrDefault("MAVEN_OPTS", "");
+        environment.put("MAVEN_OPTS", mavenOptions + " -Dfile.encoding=UTF-8");
     }
 
     private List<String> command(String classes, String marker) {
@@ -304,7 +313,7 @@ public class RunTestTool extends BaseTool {
     }
 
     private List<String> boundedErrors(List<String> errors) {
-        String summary = String.join("\n", errors);
+        String summary = OutputBuffer.redact(String.join("\n", errors));
         return Collections.singletonList(summary.substring(0, Math.min(8192, summary.length())));
     }
 
@@ -312,10 +321,14 @@ public class RunTestTool extends BaseTool {
         private final String marker = "__S2_" + UUID.randomUUID().toString().replace("-", "") + "__";
         private final StringBuilder tail = new StringBuilder();
         private final StringBuilder failures = new StringBuilder();
+        private final StringBuilder compilerDiagnostics = new StringBuilder();
         private volatile boolean blocked;
         private volatile String readError;
         private volatile String commandLineError;
+        private String mockitoCapabilityError;
         private volatile boolean pomValidationFailed;
+        private volatile boolean compilationFailed;
+        private boolean collectingCompilerDiagnostics;
         private volatile String resourceFailure;
         private volatile String rootCause;
         private int rootCauseFrames;
@@ -371,6 +384,28 @@ public class RunTestTool extends BaseTool {
             log.info("[S2 Maven] {}", line);
             append(tail, line, 65536);
             String lower = line.toLowerCase(Locale.ROOT);
+            if (lower.contains("compilation error") || lower.contains(".java:[")) {
+                collectingCompilerDiagnostics = true;
+            }
+            if (collectingCompilerDiagnostics && lower.contains("[error]")
+                    && compilerDiagnostics.length() + line.length() + 1 <= 4096) {
+                // 保留最早的缺包/import 根因，滚动错误缓冲在大量后续符号错误中会丢失它。
+                compilerDiagnostics.append(line).append('\n');
+            }
+            if (mockitoCapabilityError == null && lower.contains("mockmaker")
+                    && lower.contains("does not support the creation of")
+                    && (lower.contains("static mocks") || lower.contains("construction mocks"))) {
+                // 此消息没有 [ERROR] 前缀，且可能被后续错误挤出滚动缓冲，单独保留。
+                mockitoCapabilityError = line.substring(0, Math.min(1024, line.length()))
+                        + "\nMockito 测试能力不匹配：先核对实际 MockMaker、Mockito 版本及 test scope 依赖。"
+                        + "Mockito 3/4 的静态/构造器 Mock 需要 inline MockMaker；"
+                        + "mockito-inline 应与现有 mockito-core 同版本，Mockito 5 默认 inline。"
+                        + "检查是否有 MockMaker 配置强制覆盖，禁止通过删除生产 Bean/静态初始化来修复此错误。";
+            }
+            if (lower.contains("failed to execute goal") && lower.contains("maven-compiler-plugin:")
+                    && (lower.contains(":compile ") || lower.contains(":testcompile "))) {
+                compilationFailed = true;
+            }
             if (lower.contains("failed to execute goal") && lower.contains("maven-resources-plugin:")) {
                 resourceFailure = line.substring(0, Math.min(2048, line.length()));
             }
@@ -424,7 +459,18 @@ public class RunTestTool extends BaseTool {
         }
 
         private synchronized List<String> errors() {
-            return failures.length() == 0 ? new ArrayList<>() : new ArrayList<>(Collections.singletonList(failures.toString()));
+            List<String> errors = new ArrayList<>();
+            if (compilationFailed && compilerDiagnostics.length() > 0) {
+                errors.add("首批编译诊断（优先按最早错误修复，后续找不到符号可能为次生错误）:\n"
+                        + compilerDiagnostics);
+            }
+            if (mockitoCapabilityError != null) {
+                errors.add(mockitoCapabilityError);
+            }
+            if (failures.length() > 0) {
+                errors.add(failures.toString());
+            }
+            return errors;
         }
 
         private static String redact(String value) {
