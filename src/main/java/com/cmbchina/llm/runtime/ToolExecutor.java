@@ -2,6 +2,8 @@ package com.cmbchina.llm.runtime;
 
 
 import com.cmbchina.llm.agent.AgentContext;
+import com.cmbchina.llm.agent.AgentPhase;
+import com.cmbchina.llm.agent.CodingTrack;
 import com.cmbchina.llm.agent.observation.Observation;
 import com.cmbchina.llm.agent.policy.AgentPolicy;
 import com.cmbchina.llm.planner.CodePlan;
@@ -35,7 +37,15 @@ public class ToolExecutor {
     public List<ToolCallResult> execute(CodePlan plan, AgentContext context) {
         int beforeSize = context.getObservations().size();
         List<ToolCallResult> results = new ArrayList<>();
+        boolean s2Repair = context.getPhase() == AgentPhase.REPAIR && context.getCodingTrack() == CodingTrack.S2_TEST;
         for (PlanStep step : plan.getSteps()) {
+            if (s2Repair && !results.isEmpty()
+                    && !results.get(results.size() - 1).isSuccess()) {
+                log.warn("S2流程 flow={} round={} 修复步骤失败，停止后续工具执行 executed={} remaining={}",
+                        context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"),
+                        results.size(), plan.getSteps().size() - results.size());
+                break;
+            }
             if (shouldSkipDuplicateCreate(step, context)) {
                 addFailure(results, context, step, "file already created in current agent run");
                 continue;
@@ -57,6 +67,15 @@ public class ToolExecutor {
                 context.getObservations().size()
         );
         context.setLastObservations(new ArrayList<>(currentObservations));
+        if (s2Repair) {
+            for (Observation observation : currentObservations) {
+                String path = observation.getInput() instanceof ToolInput
+                        ? ((ToolInput) observation.getInput()).getPath() : null;
+                log.info("S2流程 flow={} round={} 修复步骤结果 tool={} path={} success={}",
+                        context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"),
+                        observation.getTool(), path, observation.isSuccess());
+            }
+        }
         return results;
     }
 

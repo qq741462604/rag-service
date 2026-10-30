@@ -30,15 +30,21 @@ public class VerifyEngine {
             loader.loadChangedFiles(context);
             List<String> errors = validator.validate(context);
             if (!errors.isEmpty()) {
-                return VerifyResult.failed(errors);
+                VerifyResult result = VerifyResult.failed(errors);
+                result.setStage("STATIC_CHECK");
+                return result;
             }
             if (!testGenerationEnabled) {
                 log.info("static verify passed; S2 disabled");
-                return VerifyResult.success();
+                VerifyResult result = VerifyResult.success();
+                result.setStage("STATIC_CHECK");
+                return result;
             }
             errors = testCoordinator.validateAll(context);
             if (!errors.isEmpty()) {
-                return VerifyResult.failed(errors);
+                VerifyResult result = VerifyResult.failed(errors);
+                result.setStage("TEST_PREFLIGHT");
+                return result;
             }
             RunTestTool.TestRunResult test = (RunTestTool.TestRunResult) runTestTool.execute(
                     ToolInput.builder().path(testCoordinator.modulePom(context))
@@ -46,9 +52,13 @@ public class VerifyEngine {
             VerifyResult result = test.isSuccess() ? VerifyResult.testSuccess(test.getOutput())
                     : VerifyResult.testFailed(test.getErrorMessages(), test.getExitCode(), test.getOutput());
             result.setBlocked(test.isBlocked());
+            result.setStage(test.getStage());
+            result.setTestExitCode(test.getExitCode());
             // Maven 已启动不代表测试已启动，POM/编译失败时不能记录为测试执行过。
             result.setTestExecuted(test.getTestsRun() > 0 || test.getSkipped() > 0);
             result.setTestsRun(test.getTestsRun());
+            result.setFailedTests(test.getFailedTests());
+            result.setFailedFiles(testCoordinator.failedTestPaths(context, test.getFailedTestClasses()));
             result.setSkipped(test.getSkipped());
             result.setReports(test.getReports());
             return result;
@@ -56,6 +66,7 @@ public class VerifyEngine {
             log.warn("verify blocked", exception);
             VerifyResult result = VerifyResult.failed(Collections.singletonList("验证读取或环境异常: " + exception.getMessage()));
             result.setBlocked(true);
+            result.setStage("ENVIRONMENT");
             return result;
         }
     }

@@ -1,6 +1,7 @@
 package com.cmbchina.llm.tool;
 
 import com.cmbchina.llm.agent.AgentContext;
+import com.cmbchina.llm.planner.MavenDependencySupport;
 import com.cmbchina.llm.verify.SurefireReportReader;
 import com.cmbchina.llm.workspace.WorkspaceService;
 import lombok.Builder;
@@ -44,6 +45,7 @@ public class RunTestTool extends BaseTool {
 
     private final WorkspaceService workspaceService;
     private final SurefireReportReader reportReader;
+    private final MavenDependencySupport dependencySupport;
 
     @Value("${codex.agent.test-timeout-seconds:300}")
     private int timeoutSeconds;
@@ -94,7 +96,9 @@ public class RunTestTool extends BaseTool {
                     .redirectErrorStream(true);
             configureTargetJava(builder);
             Map<Path, String> before = reportReader.snapshot(module);
-            log.info("run_test start module={} tests={} timeout={}s", pom, classes, timeoutSeconds);
+            log.info("run_test start flow={} round={} module={} tests={} timeout={}s",
+                    context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"),
+                    pom, classes, timeoutSeconds);
             process = builder.start();
             Process running = process;
             reader = Executors.newSingleThreadExecutor(runnable -> {
@@ -142,7 +146,17 @@ public class RunTestTool extends BaseTool {
                 // POM 解析失败发生在测试启动之前，不再为每个测试类追加缺少报告的次生错误。
                 String details = String.join("\n", output.errors());
                 return failure("Maven POM 校验失败，测试尚未执行；先修复模块 POM 后重新验证。\n"
-                        + details.substring(0, Math.min(7000, details.length())), output, exitCode, output.blocked);
+                        + details.substring(0, Math.min(7000, details.length())), output, exitCode, output.blocked, "POM");
+            }
+            if (exitCode != 0 && output.dependencyResolutionFailed) {
+                // 依赖阶段失败没有测试报告；找不到制品可核对声明，传输/认证故障仍停止。
+                boolean blocked = output.blocked || !output.artifactNotFound
+                        || !dependencySupport.canRepairDependencyFailure(context, output.errors());
+                return failure("Maven 依赖解析失败，测试尚未执行。"
+                        + (blocked ? "存在环境故障或缺少本任务可安全撤回的错误声明，停止自动修复；请核对仓库与坐标依据。"
+                        : "先核对坐标与版本依据、已有 JAR 类型证据；仅可撤回本任务新增且本次报错的依赖，"
+                        + "禁止删除原有依赖、猜版本或修改业务逻辑绕过缺包。")
+                        + "\n" + String.join("\n", output.errors()), output, exitCode, blocked, "DEPENDENCY");
             }
             if (exitCode != 0 && output.resourceFailure != null) {
                 // 资源阶段未通过时测试还未启动；依赖重复警告不能代替真正的插件异常原因。
@@ -150,12 +164,12 @@ public class RunTestTool extends BaseTool {
                         + "请依据日志中的完整异常链检查资源文件或构建环境。\n"
                         + output.resourceFailure + "\n最深层原因: "
                         + (output.rootCause == null ? "输出未包含 Caused by，需检查完整日志" : output.rootCause),
-                        output, exitCode, true);
+                        output, exitCode, true, "RESOURCE");
             }
             if (exitCode != 0 && output.compilationFailed) {
                 // 编译失败时测试尚未开始，只返回根因，不为每个测试类追加缺少报告。
                 return failure("Maven 编译失败，测试尚未执行；先修复以下源码或依赖错误。\n"
-                        + String.join("\n", output.errors()), output, exitCode, output.blocked);
+                        + String.join("\n", output.errors()), output, exitCode, output.blocked, "COMPILE");
             }
             SurefireReportReader.Evidence evidence = reportReader.inspect(module, expected, before);
             // 先保留本次报告中的失败用例与异常根因，避免被重复的控制台输出挤出有界摘要。
@@ -165,9 +179,14 @@ public class RunTestTool extends BaseTool {
             if (!success && errors.isEmpty()) {
                 errors.add("Maven 测试失败，退出码=" + exitCode);
             }
-            log.info("run_test finished module={} exit={} testsRun={} skipped={} success={} reports={}",
-                    pom, exitCode, evidence.testsRun, evidence.skipped, success, evidence.reports);
+            String stage = evidence.missingExecutionEvidence ? "TEST_EVIDENCE" : "TEST";
+            log.info("run_test finished flow={} round={} module={} stage={} exit={} testsRun={} failedTests={} skipped={} success={} failedClasses={} reports={}",
+                    context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"),
+                    pom, stage, exitCode, evidence.testsRun, evidence.failedTests, evidence.skipped, success,
+                    evidence.failedTestClasses, evidence.reports);
             return TestRunResult.builder().success(success).blocked(!success && output.blocked)
+                    .stage(stage).failedTests(evidence.failedTests)
+                    .failedTestClasses(new ArrayList<>(evidence.failedTestClasses))
                     .exitCode(exitCode).testsRun(evidence.testsRun).skipped(evidence.skipped)
                     .reports(evidence.reports).output(output.tail()).errorMessages(boundedErrors(errors)).build();
         } catch (InterruptedException exception) {
@@ -306,8 +325,13 @@ public class RunTestTool extends BaseTool {
     }
 
     private TestRunResult failure(String error, OutputBuffer output, int exitCode, boolean blocked) {
-        log.warn("run_test stopped blocked={} reason={}", blocked, error);
+        return failure(error, output, exitCode, blocked, "ENVIRONMENT");
+    }
+
+    private TestRunResult failure(String error, OutputBuffer output, int exitCode, boolean blocked, String stage) {
+        log.warn("run_test stopped stage={} blocked={} reason={}", stage, blocked, error);
         return TestRunResult.builder().success(false).blocked(blocked).exitCode(exitCode)
+                .stage(stage)
                 .output(output.tail()).reports(Collections.emptyList())
                 .errorMessages(Collections.singletonList(error)).build();
     }
@@ -327,6 +351,8 @@ public class RunTestTool extends BaseTool {
         private volatile String commandLineError;
         private String mockitoCapabilityError;
         private volatile boolean pomValidationFailed;
+        private volatile boolean dependencyResolutionFailed;
+        private volatile boolean artifactNotFound;
         private volatile boolean compilationFailed;
         private boolean collectingCompilerDiagnostics;
         private volatile String resourceFailure;
@@ -438,9 +464,17 @@ public class RunTestTool extends BaseTool {
                 append(failures, line, 8192);
             }
             if (lower.contains("could not resolve dependencies") || lower.contains("could not resolve artifact")
-                    || lower.contains("could not transfer artifact") || lower.contains("non-resolvable parent")
+                    || lower.contains("could not find artifact") || lower.contains("failure to find ")) {
+                dependencyResolutionFailed = true;
+            }
+            if (lower.contains("could not find artifact") || lower.contains("failure to find ")) {
+                artifactNotFound = true;
+            }
+            if (lower.contains("could not transfer artifact") || lower.contains("non-resolvable parent")
                     || lower.contains("pkix") || lower.contains("unauthorized") || lower.contains("status code: 401")
                     || lower.contains("status code: 403")
+                    || lower.contains("unknown host") || lower.contains("unknownhostexception")
+                    || lower.contains("connection timed out") || lower.contains("connection refused")
                     || lower.contains("no plugin found for prefix") || lower.contains("not recognized as")
                     || lower.contains("不是内部或外部命令")) {
                 blocked = true;
@@ -489,8 +523,12 @@ public class RunTestTool extends BaseTool {
     public static class TestRunResult {
         private boolean success;
         private boolean blocked;
+        private String stage;
         private int exitCode;
         private int testsRun;
+        private int failedTests;
+        @Builder.Default
+        private List<String> failedTestClasses = Collections.emptyList();
         private int skipped;
         private String output;
         private List<String> reports;

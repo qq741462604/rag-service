@@ -117,6 +117,7 @@ public class TemplateContractValidator {
             CompilationUnit entry = javaFile(files, target, errors);
             requireMethods(entry, errors, "handle", "ahiInvoke", "verifyInvokeCondition");
             if (entry != null) {
+                validateEntryConfigLookup(entry, errors);
                 MethodDeclaration invoke = method(entry, "ahiInvoke");
                 if (invoke != null) {
                     String code = invoke.toString();
@@ -153,6 +154,26 @@ public class TemplateContractValidator {
             }
         }
         return errors;
+    }
+
+    /** 入口配置复用模板已确认的 Spring 工具，不为初始化 ReadConfig 猜测 Pipeline API。 */
+    private void validateEntryConfigLookup(CompilationUnit entry, List<String> errors) {
+        for (MethodDeclaration init : entry.findAll(MethodDeclaration.class)) {
+            if (!"init".equals(init.getNameAsString())) {
+                continue;
+            }
+            Set<String> pipelines = init.getParameters().stream().filter(parameter -> isPublicType(entry,
+                    parameter.getType().asString(), "com.cmbchina.rces.executor.pipeline.AbstractPipeline"))
+                    .map(parameter -> parameter.getNameAsString()).collect(Collectors.toSet());
+            if (init.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                    "getApplicationContext".equals(call.getNameAsString())
+                            && call.getScope().filter(scope -> scope.isNameExpr()
+                            && pipelines.contains(scope.asNameExpr().getNameAsString())).isPresent())) {
+                errors.add("入口 ReadConfig 初始化必须复用已确认的 SpringContextBeanUtil.getApplicationContext()"
+                        + ".getBean(ReadConfig.class)，并补齐真实 import；禁止猜测 pipeline.getApplicationContext()，"
+                        + "保留 super.init(pipeline) 与其它已有初始化逻辑，不能修改依赖基类补造 API。");
+            }
+        }
     }
 
     /** S1 完成检查和 S2 修复预演共用，不能只保留调用名而遗漏公共类型与字段。 */

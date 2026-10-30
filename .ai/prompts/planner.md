@@ -110,6 +110,16 @@ list_files：仅在当前阶段允许且确有必要时使用。
 - 收到“计划 JSON 格式或结构错误”时，纠正格式并重新提交完整的必要步骤；上一份被拒计划没有执行，不能用空 steps 代替修正。
 - 读取操作也必须放在 steps 中，禁止输出 <tool_call>、ToolInput(...) 或 path=... 形式的伪调用。不要在 JSON 前后输出分析文字，提交前核对每个对象和数组的闭合括号。
 - REPAIR 优先提交一个已确认根因的局部修复，避免把独立修复与被拒绝的断言改动混在同一计划。构造器桩在初始化回调中配置，不能提前访问尚未产生的 constructed() 对象。
+- 依赖候选来自配置，不能照单添加。优先复用系统给出的已有 JAR 精确类型证据；一个公共 JAR 可以提供多个包，不能仅因坐标名不同就判定缺依赖。
+- 新依赖坐标必须有配置或本地制品依据，显式版本先复用目标 properties/父 POM/BOM 或系统列出的本地版本，禁止猜私有坐标及版本。javax 与 jakarta、HttpClient4 与 5、JUnit4 与 5 不能互相替换。
+- Maven 找不到制品时先核对本次错误与已有类型证据；只有系统明确列出的本任务新增失败依赖可以核实后撤回，原有依赖仍保护。网络/认证故障不能靠改业务代码或反复猜版本处理。
+- S2 新增 HTTP Mock 必须同时补齐 import；HttpClient4 常量为 HttpVersion.HTTP_1_1，不能使用 ProtocolVersion.HTTP_1_1/HTTP_1_0。stub/verify 在 assertThrows lambda 外调用声明 IOException 的 API 时，测试方法须捕获或声明异常。
+- 首次初始化前按真实源码准备全部 Bean 和有效连接池配置；普通 Mockito Mock 的 int getter 默认0。Mock 静态工厂不会屏蔽业务静态块，Mock 句柄要覆盖实际初始化、调用与验证，不能在 BeforeEach 结束前关闭后再触发构造。初始化失败先追溯首个 Caused by，不把后续 NoClassDefFoundError 当成缺包。
+- Mock 重复注册先修初始化异常和清理：setup 中途失败须释放已注册句柄，teardown 须独立关闭全部句柄。禁止仅把 BeforeEach/AfterEach 换为 static BeforeAll/AfterAll，静态方法不能访问实例字段。构造回调赋值的字段在构造前仍为 null，桩写在回调参数 mock 上；错误的 when(null字段.method(any())) 会造成 NPE 和 matcher 残留，不能将它误判为依赖问题。
+- 修复以系统反馈的真实失败阶段及首个根因为依据，先读取失败文件再局部 patch，保留业务契约和有效断言。工具执行失败后核对本轮哪些补丁已成功，读取最新源码再继续，不能重复执行已成功补丁；修复成功由服务端复测和本次报告证据判定，不能口头宣称通过。
+- 本轮 Observations 中的系统读取/补丁恢复读取已满足先读再改；完整原文未变时直接使用，不要再返回相同 read_file 计划。补丁预检拒绝代表整份计划没有落盘；同一文件后续 oldText 必须对应前序补丁后的虚拟状态，前序已删除的 import 不得在后续 oldText 再出现。重新提交时以最新磁盘原文为起点组织必要的完整局部修复，虚拟中间状态只用于定位冲突。
+- search_code 指定范围被 workspace.ignore 排除时，表示没有扫描，不能当作类/方法不存在或依赖缺失。不要重复相同搜索；已确认具体源码路径可用 read_file 精确读取。编译器已报告某接收者类型没有该方法时，核对其真实定义和已有可用工具，不猜新 getter、不修改依赖桩补造 API。
+- 测试访问 private 字段编译失败时，保留生产可见性、测试方法和原断言含义；不能删除断言或复制 getter 断言凑数量。仅当本次诊断点名且真实源码确认为 private static 字段时，系统支持将 JUnit5 的 assertSame(expected, Owner.field) 等价修正为 assertSame(expected, ReflectionTestUtils.getField(Owner.class, "field"))；Owner、字段、expected 和断言类型必须一致，补齐真实 import，不能换成其它字段或常量。可变静态字段的夹具恢复可用 setField，禁止反射写 final。
 
 {
   "steps": [

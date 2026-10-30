@@ -83,6 +83,8 @@ public class SurefireReportReader {
                 executed.put(owner, executed.get(owner) + 1);
                 if (test.getElementsByTagName("failure").getLength() > 0
                         || test.getElementsByTagName("error").getLength() > 0) {
+                    result.failedTests++;
+                    result.failedTestClasses.add(owner);
                     result.addError("测试失败: " + className + "#" + test.getAttribute("name"));
                     addFailureDetails(test, "failure", result);
                     addFailureDetails(test, "error", result);
@@ -99,6 +101,8 @@ public class SurefireReportReader {
         }
         executed.forEach((name, count) -> {
             if (count == 0) {
+                result.missingExecutionEvidence = true;
+                result.failedTestClasses.add(name);
                 result.addError("缺少本次有效测试执行证据（未运行、全跳过或仅有旧报告）: " + name);
             }
         });
@@ -183,7 +187,10 @@ public class SurefireReportReader {
 
     public static class Evidence {
         public int testsRun;
+        public int failedTests;
         public int skipped;
+        public boolean missingExecutionEvidence;
+        public final Set<String> failedTestClasses = new LinkedHashSet<>();
         public final List<String> reports = new ArrayList<>();
         public final List<String> errors = new ArrayList<>();
         private final Set<String> failureDetails = new LinkedHashSet<>();

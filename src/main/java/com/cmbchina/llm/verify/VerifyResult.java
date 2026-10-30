@@ -26,7 +26,11 @@ public class VerifyResult {
     /** 环境/读取异常不交给模型盲目修复。 */
     private boolean blocked;
 
+    /** 本次验证停留阶段，用于区分编译、测试失败与证据不完整。 */
+    private String stage;
+
     private int testsRun;
+    private int failedTests;
     private int skipped;
 
     @Builder.Default
@@ -46,8 +50,9 @@ public class VerifyResult {
     /** 测试是否通过 */
     private boolean testPassed;
 
-    /** 测试进程退出码（0=成功，非0=失败，-1=启动失败/超时） */
-    private int testExitCode;
+    /** 测试进程退出码（0=成功，非0=失败，-1=未执行/启动失败/超时） */
+    @Builder.Default
+    private int testExitCode = -1;
 
     /** 测试工具解析出的失败信息列表（编译错误/断言失败/异常堆栈等） */
     @Builder.Default

@@ -16,6 +16,13 @@ try {
 
 > 说明：`context` 为 `PipelineContext`，`eventData` 为从 `context.getUserData().get(ContextKeyConstant.EVENT_DATA)` 取出的 `EventData`。若入口方法中没有这两个对象，需先按目标 Handler 的既有写法获取。
 
+### 入口 ReadConfig 初始化约束
+
+- `verifyInvokeCondition` 使用的 `readConfig` 必须有有效初始化；保留已有配置字段及已验证的注入方式。
+- 需要在 `init(AbstractPipeline pipeline)` 中补充取 Bean 时，保留 `super.init(pipeline)` 和原有初始化逻辑，使用本项目已有的 `SpringContextBeanUtil.getApplicationContext().getBean(ReadConfig.class)`。该工具的真实包名以当前 03/04 模板产物的 import 和已有源码为准，并补齐入口 import。
+- 禁止猜测 `pipeline.getApplicationContext()` 或其它未确认的 Pipeline getter；本地编译依赖的 `AbstractPipeline` 不提供该方法，不能为了通过编译修改依赖桩或添加同名替身。
+- 配置获取失败不能靠吞掉异常后留下 null 继续推进；沿用目标工程已有的初始化错误处理方式，不修改无关初始化逻辑。
+
 ---
 
 ## 五、取值赋值方式（方法片段）—— ⚠️ `ahiInvoke` 和 `verifyInvokeCondition` 必须原样复制

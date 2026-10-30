@@ -52,6 +52,13 @@ public class SearchCodeTool extends BaseTool {
         }
 
         File root = workspaceService.resolve(path);
+        if (matcher.match(root)) {
+            // 显式范围被忽略不能伪装为搜索成功，否则模型会将“没有扫描”误解成“没有该 API”。
+            throw new IllegalArgumentException("search_code 指定范围被 workspace.ignore 排除，未扫描: "
+                    + workspaceService.relativePath(root)
+                    + "。不要重复相同搜索；已知具体源码路径时使用 read_file 精确读取，"
+                    + "或改查未被忽略的真实源码范围。此结果不能证明类/方法不存在，也不能据此补造依赖 API。");
+        }
         if (!root.exists()) {
             // 当 LLM 指定的搜索路径不存在时，不直接报错失败，
             // 而是回退到 workspace 根目录进行全量搜索。

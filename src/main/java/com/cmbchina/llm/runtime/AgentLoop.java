@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 @Slf4j
 @Component
@@ -60,6 +61,9 @@ public class AgentLoop {
     }
 
     public void run(AgentContext context) {
+        context.getVariables().put("s2_flow_id", UUID.randomUUID().toString().substring(0, 8));
+        context.getVariables().put("s2_repair_round", 0);
+        context.getVariables().put("s2_verify_attempt", 0);
         log.info("agent loop start agentId={} task={} s2Enabled={}",
                 context.getAgentId(), context.getTask(), testGenerationEnabled);
         context.setStatus(AgentStatus.ANALYZING);
@@ -114,6 +118,12 @@ public class AgentLoop {
                     return;
                 }
                 log.info("repair round={}/{} modelCalls={}", repairRounds, limit, context.getModelCalls());
+                context.getVariables().put("s2_repair_round", repairRounds);
+                if (testGenerationEnabled) {
+                    log.info("S2流程 flow={} agentId={} 开始修复 round={}/{} modelCalls={}；按失败证据定位、读取、局部修改，修改后重新验证",
+                            context.getVariables().get("s2_flow_id"), context.getAgentId(), repairRounds,
+                            limit, context.getModelCalls());
+                }
                 continue;
             }
 
@@ -126,6 +136,10 @@ public class AgentLoop {
                     planningFailures = 0;
                 }
             } catch (Exception e) {
+                if (testGenerationEnabled && context.getPhase() == AgentPhase.REPAIR) {
+                    log.warn("S2流程 flow={} round={} 修复计划被拒绝，本计划未执行 reason={}",
+                            context.getVariables().get("s2_flow_id"), repairRounds, concise(failureMessage(e), 1200));
+                }
                 // HTTP/额度/鉴权/网络错误不由外层重试，避免与客户端重试相乘。
                 if (isModelFailure(e) || ++planningFailures >= 3
                         || e.getMessage() != null && e.getMessage().startsWith("规划模型调用已达到任务预算")) {
@@ -178,12 +192,16 @@ public class AgentLoop {
                 if (context.getPhase() != AgentPhase.REPAIR) {
                     context.getVerifyErrors().clear();
                 }
-                context.getVerifyErrors().add("检测到重复计划，请使用已有观察完成当前产物，禁止重复读取相同内容。");
+                context.getVerifyErrors().add("检测到重复计划，请使用已有观察和具体工具反馈完成当前产物，"
+                        + "禁止重复同一只读计划。搜索范围被忽略时使用已确认具体路径的 read_file；"
+                        + "编译器已指出不存在的方法，应核对真实 API 或复用已确认工具，不能继续搜索同一缺失方法。");
                 log.warn("duplicate plan agentId={} count={} signature={}",
                         context.getAgentId(), duplicateRounds + 1, Integer.toHexString(planKey.hashCode()));
                 if (++duplicateRounds >= 2) {
-                    stop(context, "连续重复计划，停止以避免空耗模型额度；当前模板="
-                            + skillTemplateCoordinator.currentTemplate(context));
+                    String pending = testGenerationEnabled && context.getPhase() == AgentPhase.REPAIR
+                            ? "当前验证问题=" + concise(String.join(" | ", context.getVerifyErrors()), 1200)
+                            : "当前模板=" + skillTemplateCoordinator.currentTemplate(context);
+                    stop(context, "连续重复计划，停止以避免空耗模型额度；" + pending);
                     return;
                 }
                 continue;
@@ -211,6 +229,13 @@ public class AgentLoop {
                 }
             }
 
+            if (testGenerationEnabled && context.getPhase() == AgentPhase.REPAIR) {
+                log.info("S2流程 flow={} round={} {} steps={} plan={}",
+                        context.getVariables().get("s2_flow_id"), repairRounds,
+                        recoveryRead ? "补丁预检失败，先重新读取文件"
+                                : isPureReadPlan(plan) ? "修复定位：读取或搜索相关源码" : "修复计划通过预检",
+                        plan.getSteps().size(), repairPlanSummary(plan));
+            }
             List<ToolCallResult> results = toolExecutor.execute(plan, context);
             if (shouldStopRepeatedFailure(results, failureCounts)) {
                 stop(context, "相同工具错误重复发生: " + failureSignature(results));
@@ -230,6 +255,17 @@ public class AgentLoop {
             }
             context.setProjectIndex(projectIndexer.build(context.getObservations()));
             AgentPhase current = context.getPhase();
+            if (testGenerationEnabled && current == AgentPhase.REPAIR
+                    && results.stream().anyMatch(result -> !result.isSuccess())) {
+                // 已落盘的补丁不回滚；后续步骤未完成时先修正工具错误，不能把部分执行当作修复完成。
+                context.getVerifyErrors().removeIf(error -> error.startsWith("修复工具执行失败:"));
+                context.getVerifyErrors().add("修复工具执行失败: " + concise(failureSignature(results), 1800)
+                        + "。本轮已成功的修改保留，失败后的步骤未执行；先读取最新文件并修正失败步骤，不能重复套用已成功的补丁。");
+                log.warn("S2流程 flow={} round={} 修复执行未完成 changed={}，保留修改并继续修复，不进入复测 reason={}",
+                        context.getVariables().get("s2_flow_id"), repairRounds, wrote,
+                        concise(failureSignature(results), 1200));
+                continue;
+            }
             if (current == AgentPhase.CODING && context.getCodingTrack() == CodingTrack.S2_TEST) {
                 // 清单由下一轮读取最新落盘结果后推进，单次写测试不等于 S2 完成。
                 continue;
@@ -253,6 +289,10 @@ public class AgentLoop {
             if (current == AgentPhase.REPAIR && !wrote) {
                 // 只读不能触发 REPAIR -> VERIFY，避免读取/验证之间空转。
                 continue;
+            }
+            if (testGenerationEnabled && current == AgentPhase.REPAIR) {
+                log.info("S2流程 flow={} round={} 修复修改已执行，进入重新验证",
+                        context.getVariables().get("s2_flow_id"), repairRounds);
             }
             AgentPhase next = phaseManager.next(current, context);
             if (current == AgentPhase.CODING && next == AgentPhase.VERIFY) {
@@ -304,6 +344,11 @@ public class AgentLoop {
         context.getVerifyErrors().clear();
         context.getVerifyErrors().add(reason);
         context.setPhase(AgentPhase.FINISH);
+        if (testGenerationEnabled) {
+            log.warn("S2流程 flow={} agentId={} round={} 停止，尚未通过验证 reason={}",
+                    context.getVariables().get("s2_flow_id"), context.getAgentId(),
+                    context.getVariables().get("s2_repair_round"), concise(reason, 1600));
+        }
         log.warn("agent stopped agentId={} modelCalls={} reason={}",
                 context.getAgentId(), context.getModelCalls(), reason);
     }
@@ -514,10 +559,28 @@ public class AgentLoop {
      * @return true 表示验证通过、任务完成，false 表示进入 REPAIR
      */
     private boolean handleVerifyPhase(AgentContext context) {
+        int attempt = ((Number) context.getVariables().get("s2_verify_attempt")).intValue() + 1;
+        context.getVariables().put("s2_verify_attempt", attempt);
+        if (testGenerationEnabled) {
+            log.info("S2流程 flow={} round={} 开始验证 attempt={}：S1契约 → 静态检查 → 测试预检 → Maven编译及测试 → 本次报告证据",
+                    context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"), attempt);
+        }
         List<String> contractErrors = skillTemplateCoordinator.validateAll(context);
         VerifyResult verifyResult = contractErrors.isEmpty()
                 ? verifyEngine.verify(context) : VerifyResult.failed(contractErrors);
+        if (!contractErrors.isEmpty()) {
+            verifyResult.setStage("S1_CONTRACT");
+        }
         context.getVariables().put("verify_result", verifyResult);
+        if (testGenerationEnabled) {
+            log.info("S2流程 flow={} round={} attempt={} {} stage={} blocked={} exit={} executed={} passed={} failed={} skipped={} reports={} diagnosis={}",
+                    context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"), attempt,
+                    verifyResult.isSuccess() ? "验证通过，S2流程完成" : "发现问题",
+                    verifyResult.getStage(), verifyResult.isBlocked(), verifyResult.getTestExitCode(),
+                    verifyResult.getTestsRun(), Math.max(0, verifyResult.getTestsRun() - verifyResult.getFailedTests()),
+                    verifyResult.getFailedTests(), verifyResult.getSkipped(), verifyResult.getReports().size(),
+                    concise(String.join(" | ", verifyResult.getErrors()), 1600));
+        }
         if (verifyResult.isSuccess()) {
             context.getVerifyErrors().clear();
             context.setPhase(AgentPhase.FINISH);
@@ -558,6 +621,21 @@ public class AgentLoop {
         log.warn("verify failed errors={} testExecuted={} testPassed={}",
                 verifyResult.getErrors(), verifyResult.isTestExecuted(), verifyResult.isTestPassed());
         return false;
+    }
+
+    /** 日志只展示有界单行摘要；原始诊断仍保留给修复规划，不打印工具输入中的整份源码。 */
+    private String concise(String value, int limit) {
+        if (value == null || value.trim().isEmpty()) {
+            return "无";
+        }
+        String line = value.replace('\r', ' ').replace('\n', ' ');
+        return line.length() > limit ? line.substring(0, limit) + "…" : line;
+    }
+
+    private String repairPlanSummary(CodePlan plan) {
+        return plan.getSteps().stream().limit(12).map(step -> step.getTool()
+                + "(" + concise(extractPathFromInput(step.getInput()), 180) + ") "
+                + concise(step.getDescription(), 180)).collect(Collectors.joining("; "));
     }
 
     private boolean isEmptyPlan(CodePlan plan) {

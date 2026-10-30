@@ -294,6 +294,12 @@ public class SkillTemplateCoordinator {
         return errors;
     }
 
+    public void validatePomPreview(AgentContext context, File file, String before, String after) {
+        if (hasTemplates(context) && "pom.xml".equals(file.getName())) {
+            dependencySupport.validatePomAdditions(context, before, after);
+        }
+    }
+
     public String buildCurrentRules(AgentContext context) {
         String current = currentTemplate(context);
         if (current == null) {
