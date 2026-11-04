@@ -9,6 +9,7 @@
 - 必须同时保留正确 import、静态字段 `beeTraceClientHelper`、通过 `SpringContextBeanUtil.getApplicationContext().getBean(BeeTraceClientHelper.class)` 获取 Bean，以及该字段上的 `startTracing`、`inject`、`finishTracing` 调用。只出现调用名不代表模板实现完整。
 - 禁止新建业务包或内部类中的同名替身，禁止改成自造 `getInstance()`、`GlobalTracer` 或空实现。缺字段、import 时应局部补齐原类，而不是另建公共组件。
 - 公共组件依赖必须在 S1 核对目标 POM、已有源码或可确认的依赖依据；不能将 OpenTracing API 依赖当作 Bee 追踪组件已经存在的证明。私有坐标或版本无法确认时明确报告缺失信息，不猜测、不删除追踪逻辑绕过检查，也不留给 S2 仿造实现。
+- 异常包装前必须用 `logger.error("Invoke AHI service failed", e)` 记录原异常及栈。仅记录固定文本并使用 `e.getMessage()` 包装会丢失空消息异常的类型和位置，妨碍 S2 定位；不假定公共 `CommonException` 支持未确认的 cause 构造器。
 
 ```java
 package com.cmbchina.plugin.utils;
@@ -194,7 +195,7 @@ public class HttpClientUtil {
                 beeTraceClientHelper.finishTracing(scope, returnCode);
             }
         } catch (Exception e) {
-            logger.error("Invoke AHI service failed");
+            logger.error("Invoke AHI service failed", e);
             throw new CommonException(e.getMessage());
         }
     }

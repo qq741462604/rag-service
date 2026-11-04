@@ -118,6 +118,13 @@ public class TemplateContractValidator {
             requireMethods(entry, errors, "handle", "ahiInvoke", "verifyInvokeCondition");
             if (entry != null) {
                 validateEntryConfigLookup(entry, errors);
+                entry.findAll(VariableDeclarator.class).stream()
+                        .filter(variable -> "boolean".equals(variable.getType().asString()))
+                        .filter(variable -> variable.getInitializer().map(value -> value.isMethodCallExpr()
+                                && "getAhiHttpInvokeEnable".equals(value.asMethodCallExpr().getNameAsString()))
+                                .orElse(false))
+                        .forEach(variable -> errors.add("调用开关为可空 Boolean，禁止自动拆箱到 boolean；"
+                                + "使用 Boolean.TRUE.equals(readConfig.getAhiHttpInvokeEnable())，null 按关闭处理"));
                 MethodDeclaration invoke = method(entry, "ahiInvoke");
                 if (invoke != null) {
                     String code = invoke.toString();

@@ -121,7 +121,7 @@ public class S2TestCoordinator {
         if (entry == null) {
             return true;
         }
-        List<String> errors = validate(entry);
+        List<String> errors = validate(state, entry);
         if (freshRead(context, entry.source) == null
                 || workspaceService.resolve(entry.test).isFile() && freshRead(context, entry.test) == null) {
             return false;
@@ -139,15 +139,14 @@ public class S2TestCoordinator {
         State state = state(context);
         List<String> errors = new ArrayList<>();
         for (Entry entry : state.entries) {
-            errors.addAll(validate(entry));
+            errors.addAll(validate(state, entry));
         }
         return errors;
     }
 
-    private List<String> validate(Entry entry) {
+    private List<String> validate(State state, Entry entry) {
         try {
-            List<String> errors = inspector.validate(inspector.read(workspaceService.resolve(entry.test)),
-                    entry.sourceClass, entry.testClass);
+            List<String> errors = validateSource(state, entry, inspector.read(workspaceService.resolve(entry.test)));
             return errors.isEmpty() ? errors : Collections.singletonList(entry.test + ": " + errors);
         } catch (RuntimeException exception) {
             return Collections.singletonList(entry.test + ": " + exception.getMessage());
@@ -190,7 +189,7 @@ public class S2TestCoordinator {
                 + "；唯一测试产物: " + (entry == null ? "全部完成" : entry.test)
                 + "；模块 POM: " + state.pom + "\n"
                 + "当前测试文件存在: " + (entry != null && workspaceService.resolve(entry.test).isFile()) + "\n"
-                + "当前未满足项: " + (entry == null ? "无" : validate(entry)) + "\n"
+                + "当前未满足项: " + (entry == null ? "无" : validate(state, entry)) + "\n"
                 + testDependencyRules(context)
                 + testIsolationRules()
                 + "使用真实业务签名和已有 JUnit4/5、断言/Mockito；测试须有实际业务断言。"
@@ -211,6 +210,8 @@ public class S2TestCoordinator {
 
     public String testDependencyRules(AgentContext context) {
         return initializationFeedback(context) + dependencySupport.testDependencyRules(context)
+                + "请求 JSON 必须逐字使用当前实体 @JsonProperty 的键名及大小写，不能将 requestHeader/requestData "
+                + "猜成 response_header 风格；当前真实映射（规范化名称=协议键）: " + requestJsonProperties(state(context)) + "。\n"
                 + (context.getPhase() == AgentPhase.REPAIR ? dependencySupport.repairDependencyRules(context) : "");
     }
 
@@ -218,6 +219,79 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        if (errors.contains("EventData") && errors.contains("setData")) {
+            rules.append("本次编译已确认 EventData 没有 setData(Map)，不能继续调用或搜索该缺失 setter。")
+                    .append("真实 EventData 实例的非空数据夹具使用 eventData.getData().putAll(eventFields)，保留原 Map 内容及全部断言；")
+                    .append("若测试必须让 getData 返回 null 或某个特殊 Map，改用 mock(EventData.class) 并 when(eventData.getData()).thenReturn(原值)。")
+                    .append("null 与空 Map 不能互换；有结果读取断言时让 putDataAndOriginData 的 Mock Answer 按真实 API 写回同一个结果集合，")
+                    .append("或保留真实实例并用已确认的测试隔离方法，不凭空补 setter，不改公共包源码。")
+                    .append("一次检查当前文件全部 setData 调用，包括后半文件；每个补丁使用所属方法的唯一上下文，")
+                    .append("成功补读的准确范围已加入 Observations，不要重复相同 read_file。\n");
+        }
+        if (errors.contains("无法转换") || errors.contains("incompatible types") || errors.contains("ReflectionTestUtils")) {
+            rules.append("Spring ReflectionTestUtils.getField 的返回类型固定是 Object，不支持按左值自动推断泛型。")
+                    .append("按真实字段类型显式转换：HttpClientUtil cached = (HttpClientUtil) ReflectionTestUtils.getField")
+                    .append("(AhiHttpInvokerHandler.class, \"httpClientUtil\")；实例 httpClient 读取也须转为 CloseableHttpClient。")
+                    .append("只读获取缓存后，仅保存/注入/恢复 cached 内部非 final 的 httpClient；")
+                    .append("禁止再 setField(AhiHttpInvokerHandler.class, \"httpClientUtil\", cached)，写回相同对象仍是写 final。\n");
+        }
+        if (errors.contains("AhiHttpInvokerHandlerTest") && (errors.contains("expected: not <null>")
+                || errors.contains("CommonException") || errors.contains("WrongTypeOfReturnValue"))) {
+            rules.append("Handler 成功响应为空时先检查该失败用例的执行日志与真实客户端身份，不能只改响应体桩。")
+                    .append("AhiHttpInvokerHandler.httpClientUtil 为 static final，可能已由先执行的入口测试初始化；")
+                    .append("当前 BeforeEach 的 new HttpClientUtil 和新 HttpClients 工厂 Mock 不会替换该缓存。")
+                    .append("在 Bean/工厂就绪后只读获取该缓存工具引用，保存其非 final httpClient 实例字段，")
+                    .append("将本用例 closeableHttpClient 注入这个真实缓存实例，结束后恢复；")
+                    .append("HttpClientUtil.readConfig/beeTraceClientHelper 的可变静态引用也按实际字段保存、注入、恢复。")
+                    .append("用 verify(本轮客户端).execute(any(HttpUriRequest.class)) 确认桩被业务调用，不能手工调用 Mock 凑验证。")
+                    .append("响应实体优先用真实 StringEntity(responseJson.toString(), Consts.UTF_8)，")
+                    .append("EntityUtils.toString 会读取内容流，HttpEntity.toString 桩无效；")
+                    .append("没有活动 mockStatic(EntityUtils.class) 不能 when(EntityUtils.toString(...))，否则真实方法会执行并产生错误返回类型登记。")
+                    .append("保留全部成功响应断言和空响应/非200分支，不能将 assertNotNull 改为 assertNull 或删除断言。\n");
+        }
+        if (errors.contains("protected") && (errors.contains("buildRequestBody") || errors.contains("getUUID"))) {
+            rules.append("跨包测试访问 protected 方法是测试组织问题，不能将生产方法改 public。")
+                    .append("按真实声明添加测试侧子类，以同签名 public override 直接 super 转发，测试变量使用该子类。")
+                    .append("保留断言内原方法调用、参数、预期与断言类型；不要复制被测生产实现。\n");
+        }
+        if (errors.contains("RequestBuilder") && errors.contains("execute")) {
+            rules.append("本轮 HttpClient4 的真实 execute 单参数类型为 HttpUriRequest，RequestBuilder 只是构建器，")
+                    .append("生产调用为 httpClient.execute(builder.build())。全部 stub 和 verify 同步改为 any(HttpUriRequest.class)，")
+                    .append("补 org.apache.http.client.methods.HttpUriRequest 的 import；不需要 HttpHost。")
+                    .append("该有实际源码依据的类型修正已受门禁支持，原 Mock、方法、次数及其它业务断言必须保持。")
+                    .append("禁止 (HttpUriRequest) any() 强转、裸 any() 或修改生产签名来绕过错误。\n");
+        }
+        if (errors.contains("already registered") || errors.contains("Mock 句柄未关闭就被置空")) {
+            rules.append("先检查最早泄漏源：MockedConstruction/MockedStatic 字段赋 null 不会关闭 Mock，")
+                    .append("尤其成功分支把构造句柄清空会污染后续全部测试类。保留句柄并独立 finally 清理；")
+                    .append("成功/错误响应各自使用 close 旧句柄后注册带回调的局部桩，默认仍返回 null，避免破坏空响应测试。")
+                    .append("构造拦截本身正常时，后续 buildRequestBody/getUUID 返回 null 可能是泄漏的 Mock，不要改业务返回值。\n");
+        }
+        if (errors.contains("expected: <1> but was: <0>") || errors.contains("减少有效断言")) {
+            rules.append("关闭分支若源码在 new AhiHttpInvokerHandler 前写 ahiResultAvailable=2 并 return，构造数应为0。")
+                    .append("保留结果=2的断言；可把错误的 assertEquals(1, handle.constructed().size()) 和")
+                    .append(" verify(handle.constructed().get(0), times(0)).doPost(...) 合并为一条")
+                    .append(" assertTrue(handle.constructed().isEmpty()) 或 assertEquals(0, handle.constructed().size())。")
+                    .append("系统仅在真实关闭条件/提前返回及同一构造句柄均确认时认可此合并，禁止其它分支随意删断言。\n");
+        }
+        if (errors.contains("NullPointerException") && errors.contains("AhiHttpInvokerHandlerTest")) {
+            rules.append("本轮 Handler 测试 NPE 必须先核对失败行：类的无关纯函数也全部返回 null 时先排查上一个套件的构造 Mock 泄漏；")
+                    .append("仅 JSON getAsJsonObject/get 后为空时核对键名，")
+                    .append("请求键来自已固定的三个请求实体 @JsonProperty，不能套用响应的 response_header/response_data。")
+                    .append("只有栈指向初始化/<clinit> 或存在初始化异常证据才修 Bean；Class.forName 不会修复 JSON 键名。")
+                    .append("请求体 assertEquals 实际值中的错误键名可按实体注解等价纠正，保持预期值及断言类型不变。\n");
+        }
+        if (errors.contains("NullPointerException") && errors.contains("DataPrepEventHandlerTest")) {
+            rules.append("入口调用开关是可空 Boolean；null 应按关闭处理。核对 verifyInvokeCondition 是否先拆箱成 boolean，")
+                    .append("若是，局部修生产条件为 Boolean.TRUE.equals(readConfig.getAhiHttpInvokeEnable())，保留 null 测试。\n");
+        }
+        if (errors.contains("expected: <0> but was: <true>")) {
+            rules.append("assertEquals(\"0\", String.valueOf(eventFields.size() >= 0)) 必然失败且未验证业务。")
+                    .append("保留测试方法，改为调用真实 ahiInvoke/handle，通过 Mock 隔离外调并 verify(eventData).putDataAndOriginData")
+                    .append("(\"ahiResultAvailable\", \"1\") 验证真实成功结果；不得在覆写 ahiInvoke 中自行写回再验证自己。")
+                    .append("此类静态已证明必败的断言可在门禁阶段替换，必须实际调用真实 handle/ahiInvoke 并新增上述验证，")
+                    .append("不能删除其它有效断言、只改预期为 true 或补恒定断言。\n");
+        }
         if (errors.contains("private") && errors.contains("SpringContextBeanUtil")
                 && errors.contains("applicationContext")) {
             rules.append("本轮测试编译失败是直接访问 SpringContextBeanUtil 的 private applicationContext 字段。")
@@ -286,10 +360,24 @@ public class S2TestCoordinator {
                 + "MockedStatic 工厂句柄应在字段保存到 AfterEach/After 关闭，或在同一测试 try 内覆盖初始化、"
                 + "调用、验证；不能在 BeforeEach 的 finally 或局部 try 结束时提前关闭后再在测试中触发构造。"
                 + "业务可变静态 Bean/配置/追踪字段会跨方法和测试类缓存；每次测试按真实字段保存、注入本轮 Mock 并恢复，"
+                + "HttpClientUtil.init() 才设置连接池容量；类已初始化后仅 new HttpClientUtil 不会再次调用 init，"
+                + "验证容量配置时显式调用真实 init 并检查连接池结果，不要求每次构造都重新调用这些 getter。"
+                + "构造 Mock 的回调必须把业务真正使用的对象交给桩/验证；另建 mock(HttpClientUtil.class) 不会替换 Handler 已缓存的 final 工具。"
+                + "可只读取得 final HttpClientUtil 引用，保存/替换/恢复它的非 final httpClient 实例字段，"
+                + "Handler 可能已由其它测试类初始化；每次新建工具或 Mock 工厂不会更新缓存，必须让 execute 桩作用于缓存中实际使用的客户端。"
+                + "ReflectionTestUtils.getField 返回 Object，赋给 HttpClientUtil/CloseableHttpClient 等具体类型必须显式转换；"
+                + "只读缓存不需要也不允许将同一缓存引用 setField 写回 static final 字段。"
+                + "响应 JSON 优先封装真实 StringEntity(json, Consts.UTF_8)，不对 HttpEntity.toString 配桩，"
+                + "没有活动静态 Mock 时不能 when(EntityUtils.toString(...))。"
+                + "并配置实际使用的可变静态 ReadConfig/BeeTraceClientHelper，不能改 final 引用。"
                 + "单纯换 Spring Bean Mock 不会让已初始化类再次取 Bean，禁止反射写 static final。"
                 + "HttpClient4 协议常量为 HttpVersion.HTTP_1_1，ProtocolVersion 没有 HTTP_1_1/HTTP_1_0；"
                 + "也可 new ProtocolVersion(\"HTTP\", 1, 1)。新增类型用法必须同时补真实 import。"
                 + "Mockito stub/verify 涉及声明 IOException 的 execute/close 等 API 时，测试方法也需捕获或声明异常；"
+                + "HttpClient4 的 execute 接收 HttpUriRequest；RequestBuilder 只传给业务 invoke，底层 execute 用 build 后的请求。"
+                + "stub/verify 使用 any(HttpUriRequest.class)，补真实 import，不能使用 any(RequestBuilder.class)。"
+                + "ReflectionTestUtils.setField(HttpClientUtil.class, ...) 也会触发首次静态初始化，"
+                + "必须先准备 ApplicationContext.getBean(ReadConfig.class)/getBean(BeeTraceClientHelper.class) 及有效容量配置。"
                 + "assertThrows lambda 外的 stub 不会被断言代为捕获，不能删除异常断言来消除编译错误。"
                 + "constructed() 只包含已实际构造的对象；不要在被测调用之前取 constructed().get(0)，"
                 + "应在 mockConstruction 的初始化回调中设置 doPost 等桩，业务调用之后再验证构造结果。"
@@ -364,11 +452,21 @@ public class S2TestCoordinator {
         }
     }
 
-    /** 在整份计划预演后的真实内容上检查，支持同文件多段局部补丁。 */
-    public void validatePreview(AgentContext context, File file, String before, String after) {
+    /** 同一计划的业务源码和测试统一使用最终预演内容，不受补丁或 Map 遍历顺序影响。 */
+    public void validatePreviews(AgentContext context, Map<File, String> originals, Map<File, String> previews) {
+        Map<String, String> sources = new LinkedHashMap<>();
+        previews.forEach((file, source) -> sources.put(workspaceService.relativePath(file), source));
+        previews.forEach((file, after) -> validatePreview(context, file, originals.get(file), after, sources));
+    }
+
+    private void validatePreview(AgentContext context, File file, String before, String after,
+                                 Map<String, String> previews) {
         State state = state(context);
         String path = workspaceService.relativePath(file);
         for (Entry entry : state.entries) {
+            if (entry.source.equals(path) && before != null && !before.isEmpty() && !before.equals(after)) {
+                validateProductionVisibility(before, after, entry.sourceClass);
+            }
             if (entry.source.equals(path) && "HttpClientUtil".equals(entry.sourceClass)
                     && context.getCompletedTemplates().stream()
                     .anyMatch(template -> template.contains("03-http-client-util"))) {
@@ -380,20 +478,15 @@ public class S2TestCoordinator {
                 }
             }
             if (entry.test.equals(path)) {
-                Map<String, Integer> previous = before.isEmpty() ? Collections.emptyMap() : inspector.assertions(before);
-                Map<String, Integer> next = inspector.assertions(after);
-                for (Map.Entry<String, Integer> method : previous.entrySet()) {
-                    if (!next.containsKey(method.getKey()) || next.get(method.getKey()) < method.getValue()) {
-                        throw new IllegalArgumentException("禁止删除既有测试方法或减少断言: " + path + " " + method.getKey());
-                    }
-                }
-                if (!before.isEmpty()) {
-                    inspector.preserveAssertions(before, after, inspector.read(workspaceService.resolve(entry.source)),
-                            entry.testClass, context.getVerifyErrors());
-                }
-                List<String> errors = validateSource(entry, after);
+                List<String> errors = validateSource(state, entry, after, previews);
+                errors.addAll(inspector.validateReportedApiUsage(after, context.getVerifyErrors()));
                 if (!errors.isEmpty()) {
                     throw new IllegalArgumentException("测试修改不满足门禁: " + errors);
+                }
+                if (!before.isEmpty()) {
+                    // 断言保护仍以修改前的业务语义为基线，避免同时修改生产代码来放宽断言。
+                    inspector.preserveAssertions(before, after, inspector.read(workspaceService.resolve(entry.source)),
+                            entry.testClass, context.getVerifyErrors(), requestJsonProperties(state));
                 }
             }
         }
@@ -417,8 +510,43 @@ public class S2TestCoordinator {
         }
     }
 
-    private List<String> validateSource(Entry entry, String source) {
-        return inspector.validate(source, entry.sourceClass, entry.testClass);
+    /** 测试跨包访问失败须修测试入口，不能通过改变生产方法可见性迁就测试。 */
+    private void validateProductionVisibility(String before, String after, String sourceClass) {
+        CompilationUnit original = inspector.parse(before);
+        CompilationUnit candidate = inspector.parse(after);
+        original.getTypes().stream().filter(type -> type.getNameAsString().equals(sourceClass)).forEach(type ->
+                candidate.getTypes().stream().filter(next -> next.getNameAsString().equals(sourceClass)).forEach(next ->
+                        type.getMethods().forEach(method -> next.getMethods().stream()
+                                .filter(updated -> updated.getSignature().asString().equals(method.getSignature().asString()))
+                                .filter(updated -> updated.getAccessSpecifier() != method.getAccessSpecifier())
+                                .findFirst().ifPresent(updated -> {
+                                    throw new IllegalArgumentException("S2 修复不得改变生产方法可见性: " + sourceClass + "."
+                                            + method.getSignature().asString() + "；protected 跨包测试使用测试侧子类同签名公开桥接并直接 super 转发，"
+                                            + "测试变量改用该子类，保留断言内原调用、参数及预期，不将生产 protected 改 public");
+                                }))));
+    }
+
+    private List<String> validateSource(State state, Entry entry, String source) {
+        return validateSource(state, entry, source, Collections.emptyMap());
+    }
+
+    private List<String> validateSource(State state, Entry entry, String source, Map<String, String> previews) {
+        Set<String> references = inspector.parse(source).findAll(com.github.javaparser.ast.expr.ClassExpr.class).stream()
+                .map(literal -> literal.getType().asString()).collect(java.util.stream.Collectors.toSet());
+        Map<String, String> relatedSources = new LinkedHashMap<>();
+        // 仅复用本任务清单中由 class 字面量明确引用的源码，不扫描目标工程。
+        for (Entry related : state.entries) {
+            if (!related.source.equals(entry.source) && references.stream().anyMatch(name ->
+                    name.equals(related.sourceClass) || name.endsWith("." + related.sourceClass))) {
+                relatedSources.put(related.sourceClass, previewSource(related.source, previews));
+            }
+        }
+        return inspector.validate(source, entry.sourceClass, entry.testClass,
+                previewSource(entry.source, previews), relatedSources);
+    }
+
+    private String previewSource(String path, Map<String, String> previews) {
+        return previews.containsKey(path) ? previews.get(path) : inspector.read(workspaceService.resolve(path));
     }
 
     public String fingerprint(AgentContext context) {
@@ -483,7 +611,7 @@ public class S2TestCoordinator {
         return paths;
     }
 
-    /** 只固定本次清单中 HTTP 创建链的最多三个支持类，不扫描工程或读取其它模板。 */
+    /** 固定 HTTP 创建链及其三个请求实体，不扫描工程或读取其它模板。 */
     private void addInitializationSources(State state, List<String> paths) {
         boolean http = false;
         for (Entry entry : state.entries) {
@@ -498,7 +626,8 @@ public class S2TestCoordinator {
             }
         }
         if (http) {
-            for (String name : Arrays.asList("ReadConfig", "HttpClientUtil", "AhiHttpInvokerHandler")) {
+            for (String name : Arrays.asList("ReadConfig", "HttpClientUtil", "AhiHttpInvokerHandler",
+                    "AhiHttpBodyEntity", "AhiHttpBodyHeaderEntity", "AhiHttpBodyDataEntity")) {
                 for (Entry entry : state.entries) {
                     if (name.equals(entry.sourceClass) && !paths.contains(entry.source)) {
                         paths.add(entry.source);
@@ -507,6 +636,41 @@ public class S2TestCoordinator {
                 }
             }
         }
+    }
+
+    /** 只采用本任务三个请求实体的真实 Jackson 注解，存在歧义的名称不参与等价修复。 */
+    private Map<String, String> requestJsonProperties(State state) {
+        Map<String, String> properties = new LinkedHashMap<>();
+        Set<String> ambiguous = new LinkedHashSet<>();
+        for (Entry entry : state.entries) {
+            if (!Arrays.asList("AhiHttpBodyEntity", "AhiHttpBodyHeaderEntity", "AhiHttpBodyDataEntity")
+                    .contains(entry.sourceClass)) {
+                continue;
+            }
+            CompilationUnit unit = inspector.parse(inspector.read(workspaceService.resolve(entry.source)));
+            unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class).stream()
+                    .filter(field -> !field.isStatic()).forEach(field -> field.getAnnotationByName("JsonProperty")
+                    .ifPresent(annotation -> {
+                        String value = "";
+                        if (annotation.isSingleMemberAnnotationExpr()
+                                && annotation.asSingleMemberAnnotationExpr().getMemberValue().isStringLiteralExpr()) {
+                            value = annotation.asSingleMemberAnnotationExpr().getMemberValue().asStringLiteralExpr().asString();
+                        } else if (annotation.isNormalAnnotationExpr()) {
+                            value = annotation.asNormalAnnotationExpr().getPairs().stream()
+                                    .filter(pair -> "value".equals(pair.getNameAsString()) && pair.getValue().isStringLiteralExpr())
+                                    .map(pair -> pair.getValue().asStringLiteralExpr().asString()).findFirst().orElse("");
+                        }
+                        if (!value.isEmpty()) {
+                            String key = value.replace("_", "").toLowerCase(java.util.Locale.ROOT);
+                            String previous = properties.putIfAbsent(key, value);
+                            if (previous != null && !previous.equals(value)) {
+                                ambiguous.add(key);
+                            }
+                        }
+                    }));
+        }
+        ambiguous.forEach(properties::remove);
+        return properties;
     }
 
     private Observation freshRead(AgentContext context, String path) {

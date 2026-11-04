@@ -351,6 +351,7 @@ public class QwenPlanner implements Planner {
                 }
                 String message = "第 " + index + " 步 patch_file 预检失败，原计划全部未执行。path="
                         + input.getPath() + "；原因=" + e.getMessage()
+                        + patchConflictHint(plan, patchSteps.getOrDefault(file, Collections.emptyList()), input, content)
                         + "\n这是整份计划的补丁顺序/片段冲突，不是落盘文件已部分修改。"
                         + "同一文件后续 oldText 必须匹配前序补丁之后的内存内容；前序已删除的 import 不能在后续 oldText 再出现。"
                         + "重新规划仍以 Observations 中的最新磁盘原文为起点，重做必要的完整局部补丁；"
@@ -368,7 +369,7 @@ public class QwenPlanner implements Planner {
             }
         }
         if (isS2(context)) {
-            previews.forEach((file, after) -> testCoordinator.validatePreview(context, file, originals.get(file), after));
+            testCoordinator.validatePreviews(context, originals, previews);
         } else {
             previews.forEach((file, after) -> skillTemplateCoordinator.validatePomPreview(
                     context, file, originals.get(file), after));
@@ -385,6 +386,53 @@ public class QwenPlanner implements Planner {
                 .contains(step.getTool())) {
             throw new IllegalArgumentException("模型不允许调用工具: " + step.getTool() + "；测试仅由服务端验证阶段执行");
         }
+    }
+
+    /** 将具体冲突放到反馈开头，避免被行动反馈的长度上限截掉。仅诊断，不修改补丁。 */
+    private String patchConflictHint(CodePlan plan, List<Integer> previousSteps, ToolInput input, String content) {
+        String oldText = normalizePatchFeedback(input.getOldText()).trim();
+        if (oldText.isEmpty()) {
+            return "";
+        }
+        for (int position = previousSteps.size() - 1; position >= 0; position--) {
+            int previousIndex = previousSteps.get(position);
+            ToolInput previous = (ToolInput) plan.getSteps().get(previousIndex - 1).getInput();
+            String previousOld = normalizePatchFeedback(previous.getOldText()).trim();
+            String previousNew = normalizePatchFeedback(previous.getNewText()).trim();
+            if (!previousOld.isEmpty() && !previousOld.equals(previousNew)
+                    && (oldText.contains(previousOld) || previousOld.contains(oldText))) {
+                return "\n冲突线索：当前 oldText 与本文件第 " + previousIndex + " 步的旧片段重叠。"
+                        + "第 " + previousIndex + " 步已在内存中替换该片段；请合并为同一方法/夹具的一处局部修复，"
+                        + "或让后一步基于前一步 newText，不要先删一行又用含该行的旧方法体替换。"
+                        + "\n前序 oldText: " + summarize(previousOld, 280)
+                        + "\n前序 newText: " + summarize(previousNew, 280);
+            }
+        }
+        String source = normalizePatchFeedback(content);
+        int first = source.indexOf(oldText);
+        if (first < 0 || source.indexOf(oldText, first + 1) < 0) {
+            return "";
+        }
+        StringBuilder matches = new StringBuilder("\n唯一性冲突：相同片段出现在以下位置，"
+                + "请加入所属测试方法签名或该用例特有上下文，不要只用公共 stub 行定位：");
+        int from = first;
+        int line = 1;
+        int scanned = 0;
+        for (int count = 0; count < 3 && from >= 0; count++) {
+            for (; scanned < from; scanned++) {
+                if (source.charAt(scanned) == '\n') {
+                    line++;
+                }
+            }
+            matches.append("\n第 ").append(line).append(" 行附近: ")
+                    .append(source.substring(Math.max(0, from - 140), Math.min(source.length(), from + 200)));
+            from = source.indexOf(oldText, from + 1);
+        }
+        return matches.toString();
+    }
+
+    private String normalizePatchFeedback(String source) {
+        return source == null ? "" : source.replace("\r\n", "\n").replace('\r', '\n');
     }
 
     private String patchSourceExcerpt(String content, String oldText) {
@@ -874,7 +922,7 @@ public class QwenPlanner implements Planner {
                 || plan == null || plan.getSteps() == null || plan.getSteps().isEmpty()) {
             return;
         }
-        List<Observation> current = testCoordinator.observations(context);
+        List<Observation> current = getPlannerObservations(context);
         List<String> covered = new ArrayList<>();
         for (PlanStep step : plan.getSteps()) {
             if (!"read_file".equals(step.getTool()) || !(step.getInput() instanceof ToolInput)) {
@@ -885,10 +933,8 @@ public class QwenPlanner implements Planner {
             long end = input.getEndLine() == null ? (long) start + 200 : input.getEndLine();
             boolean provided = current.stream().filter(observation -> observation.getResult() instanceof FileContent)
                     .map(observation -> (FileContent) observation.getResult()).anyMatch(content ->
-                            content.getStartLine() != null && content.getEndLine() != null
-                                    && start >= content.getStartLine() && end <= content.getEndLine()
-                                    && sameWorkspaceFile(input.getPath(), content.getPath())
-                                    && formatObservationResult(content).length() <= READ_RESULT_LIMIT);
+                            coversVisibleRead(content, start, end)
+                                    && sameWorkspaceFile(input.getPath(), content.getPath()));
             if (!provided) {
                 return;
             }
@@ -904,12 +950,13 @@ public class QwenPlanner implements Planner {
 
     private String buildS2ReadRules(AgentContext context) {
         StringBuilder rules = new StringBuilder("本轮已提供的最新磁盘原文（系统读取同样满足先读再改）:\n");
-        for (Observation observation : testCoordinator.observations(context)) {
+        for (Observation observation : getPlannerObservations(context)) {
             if (!(observation.getResult() instanceof FileContent)) {
                 continue;
             }
             FileContent content = (FileContent) observation.getResult();
-            rules.append(describeFileRead(content)).append(formatObservationResult(content).length() <= READ_RESULT_LIMIT
+            rules.append(describeFileRead(content)).append(" visibleEndLine=").append(visibleReadEndLine(content))
+                    .append(formatObservationResult(content).length() <= READ_RESULT_LIMIT
                     ? "；上述范围完整可见，不要再次准备读取，直接提取真实片段局部修改。\n"
                     : "；本条超过提示词限长，仅允许按明确行范围补读未呈现部分。\n");
         }
@@ -1137,9 +1184,51 @@ public class QwenPlanner implements Planner {
         if (!(observation.getResult() instanceof FileContent)) {
             return false;
         }
-        String path = ((FileContent) observation.getResult()).getPath();
+        FileContent requested = (FileContent) observation.getResult();
         return pinned.stream().filter(item -> item.getResult() instanceof FileContent)
-                .anyMatch(item -> sameWorkspaceFile(path, ((FileContent) item.getResult()).getPath()));
+                .map(item -> (FileContent) item.getResult()).anyMatch(available -> {
+                    if (!sameWorkspaceFile(requested.getPath(), available.getPath())) {
+                        return false;
+                    }
+                    int start = requested.getStartLine() == null ? 1 : requested.getStartLine();
+                    int availableStart = available.getStartLine() == null ? 1 : available.getStartLine();
+                    List<String> lines = requested.getLines();
+                    if (lines == null || lines.isEmpty() || available.getLines() == null) {
+                        return true;
+                    }
+                    int offset = start - availableStart;
+                    long end = (long) start + lines.size() - 1;
+                    // 固定原文是当前快照：丢弃旧内容，但保留被长原文截断遮住的准确范围补读。
+                    if (offset < 0 || (long) offset + lines.size() > available.getLines().size()
+                            || !available.getLines().subList(offset, offset + lines.size()).equals(lines)) {
+                        return true;
+                    }
+                    return coversVisibleRead(available, start, end);
+                });
+    }
+
+    private boolean coversVisibleRead(FileContent content, int start, long end) {
+        int availableStart = content.getStartLine() == null ? 1 : content.getStartLine();
+        return start >= availableStart && end >= start && end <= visibleReadEndLine(content);
+    }
+
+    /** 与 formatObservationResult 使用相同头部及去行号规则，只统计限长内完整可见的行。 */
+    private long visibleReadEndLine(FileContent content) {
+        int start = content.getStartLine() == null ? 1 : content.getStartLine();
+        int length = describeFileRead(content).length() + "\ncontent:\n".length();
+        int count = 0;
+        if (content.getLines() != null) {
+            for (String line : content.getLines()) {
+                String text = line.replaceFirst("^\\d+: ?", "");
+                int next = length + (count == 0 ? 0 : 1) + text.length();
+                if (next > READ_RESULT_LIMIT) {
+                    break;
+                }
+                length = next;
+                count++;
+            }
+        }
+        return (long) start + count - 1;
     }
 
     private String buildVerifyErrors(AgentContext context) {

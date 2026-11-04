@@ -44,6 +44,66 @@ final class TestLifecycleInspector {
             }
             validateConstructionReceivers(unit, type, errors);
             validateMockCleanup(unit, type, errors);
+            validateMockHandleLoss(unit, type, errors);
+        }
+    }
+
+    /** 只拦截测试/初始化中直接丢弃活动句柄的明确模式，保留关闭后置空及所有权转移。 */
+    private static void validateMockHandleLoss(CompilationUnit unit, ClassOrInterfaceDeclaration type,
+                                               List<String> errors) {
+        Set<String> handles = new LinkedHashSet<>();
+        type.getFields().forEach(field -> field.getVariables().stream().filter(variable ->
+                variable.getType().isClassOrInterfaceType()
+                        && java.util.Arrays.asList("MockedStatic", "MockedConstruction").contains(
+                        variable.getType().asClassOrInterfaceType().getNameAsString()))
+                .forEach(variable -> handles.add(variable.getNameAsString())));
+        for (MethodDeclaration method : type.getMethods()) {
+            boolean relevant = annotated(unit, method, "org.junit.jupiter.api.Test")
+                    || annotated(unit, method, "org.junit.Test")
+                    || annotated(unit, method, "org.junit.jupiter.api.BeforeEach")
+                    || annotated(unit, method, "org.junit.Before");
+            if (!relevant) {
+                continue;
+            }
+            for (AssignExpr assignment : method.findAll(AssignExpr.class)) {
+                String handle = fieldName(assignment.getTarget());
+                if (!handles.contains(handle) || !assignment.getValue().isNullLiteralExpr()
+                        || !belongsToMethod(assignment, method)
+                        || !assignment.getParentNode().filter(parent -> parent instanceof
+                        com.github.javaparser.ast.stmt.ExpressionStmt).isPresent()) {
+                    continue;
+                }
+                boolean shadowed = assignment.getTarget().isNameExpr()
+                        && (method.getParameters().stream().anyMatch(parameter -> parameter.getNameAsString().equals(handle))
+                        || method.findAll(VariableDeclarator.class).stream()
+                        .anyMatch(variable -> variable.getNameAsString().equals(handle)));
+                boolean created = type.findAll(AssignExpr.class).stream().anyMatch(previous ->
+                        fieldName(previous.getTarget()).equals(handle) && previous.getValue().isMethodCallExpr()
+                                && java.util.Arrays.asList("mockStatic", "mockConstruction")
+                                .contains(previous.getValue().asMethodCallExpr().getNameAsString()));
+                boolean closed = method.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                        belongsToMethod(call, method) && call.getScope().map(scope -> fieldName(scope).equals(handle)).orElse(false)
+                                && java.util.Arrays.asList("close", "closeOnDemand").contains(call.getNameAsString())
+                                && call.getBegin().isPresent() && assignment.getBegin().isPresent()
+                                && call.getBegin().get().isBefore(assignment.getBegin().get()));
+                boolean transferred = method.findAll(VariableDeclarator.class).stream().anyMatch(variable ->
+                        variable.getInitializer().map(value -> fieldName(value).equals(handle)).orElse(false)
+                                && variable.getBegin().isPresent() && assignment.getBegin().isPresent()
+                                && variable.getBegin().get().isBefore(assignment.getBegin().get()));
+                if (created && !shadowed && !closed && !transferred) {
+                    errors.add("Mock 句柄未关闭就被置空: " + method.getNameAsString() + " -> " + handle
+                            + "；置空不会注销 Mockito，AfterEach 将无法关闭句柄，后续用例会 already registered。"
+                            + "保留句柄；替换桩时先 close，再 mockConstruction，并在最终清理时独立关闭全部句柄。");
+                }
+            }
+        }
+        boolean imported = unit.getImports().stream().anyMatch(declaration -> declaration.isStatic()
+                && (declaration.getNameAsString().equals("org.mockito.Mockito.mockConstruction")
+                || declaration.isAsterisk() && declaration.getNameAsString().equals("org.mockito.Mockito")));
+        if (!imported && type.getMethodsByName("mockConstruction").isEmpty()
+                && type.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                call.getNameAsString().equals("mockConstruction") && !call.getScope().isPresent())) {
+            errors.add("mockConstruction 使用缺少 Mockito 静态 import；不能删除 import 后继续无作用域调用该方法");
         }
     }
 

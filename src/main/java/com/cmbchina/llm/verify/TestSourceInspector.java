@@ -5,8 +5,11 @@ import com.github.javaparser.ParseResult;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import org.springframework.stereotype.Component;
@@ -17,9 +20,11 @@ import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * S2 真实测试源码的有界读取及 JUnit 结构门禁，不替代实际测试执行。
@@ -56,7 +61,18 @@ public class TestSourceInspector {
                 .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_11));
         ParseResult<CompilationUnit> result = parser.parse(source);
         if (!result.isSuccessful() || !result.getResult().isPresent()) {
-            throw new IllegalArgumentException("Java 语法解析失败: " + result.getProblems());
+            String details = result.getProblems().stream().limit(3).map(problem -> {
+                String message = problem.getMessage();
+                String location = problem.getLocation().flatMap(range -> range.toRange()).map(range -> {
+                    String[] lines = source.split("\\R", -1);
+                    int line = range.begin.line;
+                    String excerpt = line > 0 && line <= lines.length ? lines[line - 1].trim() : "";
+                    return "第 " + line + " 行，第 " + range.begin.column + " 列，源码: "
+                            + excerpt.substring(0, Math.min(240, excerpt.length())) + "；";
+                }).orElse("");
+                return location + message.substring(0, Math.min(500, message.length()));
+            }).collect(java.util.stream.Collectors.joining("\n"));
+            throw new IllegalArgumentException("Java 语法解析失败（不是计划 JSON 转换失败，原计划未执行）: " + details);
         }
         return result.getResult().get();
     }
@@ -79,13 +95,48 @@ public class TestSourceInspector {
     }
 
     public List<String> validate(String source, String sourceClass, String expectedClass) {
+        return validate(source, sourceClass, expectedClass, null);
+    }
+
+    public List<String> validate(String source, String sourceClass, String expectedClass, String businessSource) {
+        return validate(source, sourceClass, expectedClass, businessSource, java.util.Collections.emptyMap());
+    }
+
+    public List<String> validate(String source, String sourceClass, String expectedClass, String businessSource,
+                                 Map<String, String> relatedSources) {
         List<String> errors = new ArrayList<>();
         CompilationUnit unit = parse(source);
+        validateReflectionResultTypes(unit, errors);
+        if (businessSource != null) {
+            CompilationUnit business = parse(businessSource);
+            validateReflectiveFieldWrites(unit, business, sourceClass, errors);
+            validateCachedHttpClientFixture(unit, business, sourceClass, errors);
+        }
+        relatedSources.forEach((owner, content) ->
+                validateReflectiveFieldWrites(unit, parse(content), owner, errors));
         validateHttpClientMocks(unit, errors);
         validateHttpClientReferences(unit, errors);
+        validateHttpExecuteMatchers(unit, errors);
         validateHttpMockLifetime(unit, errors);
         validateHttpPoolConfiguration(unit, errors);
+        validateReflectiveHttpInitialization(unit, errors);
         TestLifecycleInspector.validate(unit, errors);
+        unit.findAll(MethodCallExpr.class).stream().filter(call -> isImpossibleBooleanStringAssertion(unit, call))
+                .forEach(call -> errors.add("断言将布尔表达式转为字符串后与非布尔字符串比较，必然失败: " + call
+                        + "；应验证真实业务结果或 EventData 写回，不能用集合 size 比较凑断言"));
+        boolean removesFinal = unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                "getDeclaredField".equals(call.getNameAsString()) && call.getArguments().size() == 1
+                        && call.getArgument(0).isStringLiteralExpr()
+                        && "modifiers".equals(call.getArgument(0).asStringLiteralExpr().asString()))
+                && unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                "setInt".equals(call.getNameAsString()) && call.getArguments().stream().anyMatch(argument ->
+                        argument.findAll(com.github.javaparser.ast.expr.UnaryExpr.class).stream().anyMatch(unary ->
+                                unary.getOperator() == com.github.javaparser.ast.expr.UnaryExpr.Operator.BITWISE_COMPLEMENT
+                                        && unary.getExpression().toString().endsWith("Modifier.FINAL"))));
+        if (removesFinal) {
+            errors.add("禁止通过 Field.modifiers 去除 FINAL 后改写生产静态缓存；在首次初始化前 Mock 真实公开工厂，"
+                    + "只读访问缓存或保存/恢复可变依赖，不得反射写 final");
+        }
         String packageName = unit.getPackageDeclaration().map(value -> value.getNameAsString() + ".").orElse("");
         if (unit.getTypes().stream().noneMatch(type -> (packageName + type.getNameAsString()).equals(expectedClass))) {
             errors.add("测试包名/顶层类名必须与路径匹配: " + expectedClass);
@@ -118,6 +169,250 @@ public class TestSourceInspector {
             errors.add("缺少可执行的 JUnit4/5 测试方法，不支持用空壳或其他框架绕过");
         }
         return errors;
+    }
+
+    /** 仅在本次编译明确点名缺失 API 后检查，避免把当前依赖版本的缺口泛化到所有工程。 */
+    public List<String> validateReportedApiUsage(String source, List<String> verifyErrors) {
+        List<String> errors = new ArrayList<>();
+        String diagnostics = String.join("\n", verifyErrors);
+        if (!diagnostics.contains("com.cmbchina.rces.executor.common.EventData")
+                || !diagnostics.contains("setData")
+                || !(diagnostics.contains("找不到符号") || diagnostics.contains("cannot find symbol"))) {
+            return errors;
+        }
+        CompilationUnit unit = parse(source);
+        for (MethodCallExpr call : unit.findAll(MethodCallExpr.class)) {
+            if (!call.getNameAsString().equals("setData") || call.getArguments().size() != 1
+                    || !call.getScope().filter(Expression::isNameExpr).isPresent()) {
+                continue;
+            }
+            String name = call.getScope().get().asNameExpr().getNameAsString();
+            MethodDeclaration method = call.findAncestor(MethodDeclaration.class).orElse(null);
+            if (method == null) {
+                continue;
+            }
+            List<String> types = method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                    .filter(variable -> variable.getNameAsString().equals(name))
+                    .map(variable -> variable.getType().asString()).collect(java.util.stream.Collectors.toList());
+            if (types.isEmpty()) {
+                method.getParameters().stream().filter(parameter -> parameter.getNameAsString().equals(name))
+                        .forEach(parameter -> types.add(parameter.getType().asString()));
+            }
+            if (types.isEmpty()) {
+                method.findAncestor(ClassOrInterfaceDeclaration.class).flatMap(owner -> owner.getFieldByName(name))
+                        .ifPresent(field -> field.getVariables().stream()
+                                .filter(variable -> variable.getNameAsString().equals(name))
+                                .forEach(variable -> types.add(variable.getType().asString())));
+            }
+            if (types.size() == 1 && matchesType(unit, types.get(0), "com.cmbchina.rces.executor.common.EventData")) {
+                errors.add("本次编译已确认 EventData 没有 setData(Map)，候选源码仍残留 "
+                        + method.getNameAsString() + ": " + call + "；非空真实实例用 getData().putAll(原Map)，"
+                        + "null/特殊集合夹具用真实 getData API 的 Mock 桩，保留全部断言和 null 语义。请修复文件中所有同类调用");
+            }
+        }
+        return errors;
+    }
+
+    /** Spring getField 返回 Object，赋给具体类型前必须显式转换；不猜测未知辅助方法的返回类型。 */
+    private void validateReflectionResultTypes(CompilationUnit unit, List<String> errors) {
+        for (MethodCallExpr call : unit.findAll(MethodCallExpr.class)) {
+            if (!isReflectionTestCall(unit, call, "getField") || call.getArguments().size() < 2) {
+                continue;
+            }
+            com.github.javaparser.ast.Node parent = call.getParentNode().orElse(null);
+            String type = null;
+            if (parent instanceof com.github.javaparser.ast.body.VariableDeclarator) {
+                type = ((com.github.javaparser.ast.body.VariableDeclarator) parent).getType().asString();
+            } else if (parent instanceof com.github.javaparser.ast.expr.AssignExpr) {
+                com.github.javaparser.ast.expr.AssignExpr assignment = (com.github.javaparser.ast.expr.AssignExpr) parent;
+                if (assignment.getValue() != call || !assignment.getTarget().isNameExpr()) {
+                    continue;
+                }
+                String name = assignment.getTarget().asNameExpr().getNameAsString();
+                MethodDeclaration method = call.findAncestor(MethodDeclaration.class).orElse(null);
+                List<com.github.javaparser.ast.body.VariableDeclarator> locals = method == null ? new ArrayList<>()
+                        : method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                        .filter(variable -> variable.getNameAsString().equals(name))
+                        .collect(java.util.stream.Collectors.toList());
+                if (locals.size() == 1) {
+                    type = locals.get(0).getType().asString();
+                } else if (locals.isEmpty() && method != null && method.getParameters().stream()
+                        .noneMatch(parameter -> parameter.getNameAsString().equals(name))) {
+                    type = method.findAncestor(ClassOrInterfaceDeclaration.class)
+                            .flatMap(owner -> owner.getFieldByName(name))
+                            .flatMap(field -> field.getVariables().stream()
+                                    .filter(variable -> variable.getNameAsString().equals(name)).findFirst())
+                            .map(variable -> variable.getType().asString()).orElse(null);
+                }
+            }
+            if (type != null && !java.util.Arrays.asList("Object", "java.lang.Object", "var").contains(type)) {
+                errors.add("ReflectionTestUtils.getField 返回 Object，不能直接赋给 " + type + ": " + call
+                        + "；根据真实字段声明显式转换，例如 (" + type + ") " + call
+                        + "。此转换只读取缓存，不能随后 setField 写回生产 static final 缓存，即使写回同一个对象也不允许");
+            }
+        }
+    }
+
+    private boolean isReflectionTestCall(CompilationUnit unit, MethodCallExpr call, String name) {
+        return call.getNameAsString().equals(name) && (call.getScope().map(scope -> matchesType(unit,
+                scope.toString(), "org.springframework.test.util.ReflectionTestUtils")).orElse(false)
+                || !call.getScope().isPresent() && unit.getImports().stream().anyMatch(declaration ->
+                declaration.isStatic() && (declaration.getNameAsString().equals("org.springframework.test.util.ReflectionTestUtils." + name)
+                        || declaration.isAsterisk() && declaration.getNameAsString().equals("org.springframework.test.util.ReflectionTestUtils")))
+                && unit.findAll(MethodDeclaration.class).stream().noneMatch(method -> method.getNameAsString().equals(name)));
+    }
+
+    /** 每个用例新建工厂 Mock 不会更新生产 static final 中已缓存的客户端。 */
+    private void validateCachedHttpClientFixture(CompilationUnit unit, CompilationUnit business,
+                                                 String sourceClass, List<String> errors) {
+        TypeDeclaration<?> owner = business.getTypes().stream()
+                .filter(type -> type.getNameAsString().equals(sourceClass)).findFirst().orElse(null);
+        if (owner == null || unit.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .anyMatch(type -> !type.getExtendedTypes().isEmpty())) {
+            return;
+        }
+        FieldDeclaration cache = owner.getFieldByName("httpClientUtil").orElse(null);
+        if (cache == null || !cache.isStatic() || !cache.isFinal() || cache.getVariables().size() != 1
+                || !cache.getVariable(0).getInitializer().filter(value -> value.isObjectCreationExpr()
+                && value.asObjectCreationExpr().getType().getNameAsString().equals("HttpClientUtil")).isPresent()) {
+            return;
+        }
+        boolean invokes = unit.findAll(MethodDeclaration.class).stream().filter(method -> isTest(unit, method))
+                .anyMatch(method -> method.findAll(MethodCallExpr.class).stream()
+                        .anyMatch(call -> call.getNameAsString().equals("doPost"))
+                        && method.findAll(MethodCallExpr.class).stream()
+                        .anyMatch(call -> call.getNameAsString().equals("execute") && isHttpClientReceiver(unit, method, call)));
+        boolean perTestFactory = unit.findAll(MethodDeclaration.class).stream().filter(method ->
+                method.getAnnotations().stream().anyMatch(annotation -> java.util.Arrays.asList("BeforeEach", "Before")
+                        .contains(annotation.getName().getIdentifier())))
+                .anyMatch(method -> method.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                        isMockitoCall(unit, call, "mockStatic") && call.getArguments().size() == 1
+                                && call.getArgument(0).isClassExpr() && matchesType(unit,
+                                call.getArgument(0).asClassExpr().getType().asString(), "org.apache.http.impl.client.HttpClients"))
+                        && method.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                        isMockitoCall(unit, call, "mock") && call.getArguments().size() == 1
+                                && call.getArgument(0).isClassExpr() && matchesType(unit,
+                                call.getArgument(0).asClassExpr().getType().asString(), "org.apache.http.impl.client.CloseableHttpClient")));
+        boolean customFixture = unit.findAll(AnnotationExpr.class).stream().anyMatch(annotation ->
+                java.util.Arrays.asList("BeforeAll", "BeforeClass").contains(annotation.getName().getIdentifier()))
+                || unit.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                !isTest(unit, method) && method.getAnnotations().isEmpty() && method.getBody().isPresent());
+        boolean readsCache = unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                call.getNameAsString().equals("getDeclaredField") && call.getArguments().size() == 1
+                        && call.getArgument(0).isStringLiteralExpr()
+                        && call.getArgument(0).asStringLiteralExpr().asString().equals("httpClientUtil")
+                        || call.getNameAsString().equals("getField") && call.getArguments().size() == 2
+                        && call.getScope().map(scope -> matchesType(unit, scope.toString(),
+                        "org.springframework.test.util.ReflectionTestUtils")).orElse(false)
+                        && call.getArgument(1).isStringLiteralExpr()
+                        && call.getArgument(1).asStringLiteralExpr().asString().equals("httpClientUtil"));
+        if (invokes && perTestFactory && !customFixture && !readsCache) {
+            errors.add(sourceClass + ".httpClientUtil 是真实 static final 缓存，但共享 setup 每次创建新的 HTTP Mock，"
+                    + "doPost 使用的旧客户端不会自动替换，当前 execute 桩可能从未被调用。"
+                    + "首次初始化前准备 Bean/工厂；只读取得该缓存对象，保存并替换其非 final 实例 httpClient 为本轮 Mock，"
+                    + "结束后恢复；工具可变静态 Bean 同样保存/注入/恢复。不能对 Class 写实例字段、改 final、另 new 工具代替缓存或删除断言");
+        }
+    }
+
+    /** 只依据真实被测类声明及方法内直接绑定，预检已确认的反射写入错误。 */
+    private void validateReflectiveFieldWrites(CompilationUnit unit, CompilationUnit business,
+                                               String sourceClass, List<String> errors) {
+        TypeDeclaration<?> owner = business.getTypes().stream()
+                .filter(type -> type.getNameAsString().equals(sourceClass)).findFirst().orElse(null);
+        if (owner == null) {
+            return;
+        }
+        String qualified = business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("")
+                + sourceClass;
+        for (MethodCallExpr call : unit.findAll(MethodCallExpr.class)) {
+            if (isReflectionTestCall(unit, call, "setField") && call.getArguments().size() == 3
+                    && isBusinessClass(unit, call.getArgument(0), qualified, java.util.Collections.emptySet())
+                    && call.getArgument(1).isStringLiteralExpr()) {
+                owner.getFieldByName(call.getArgument(1).asStringLiteralExpr().asString()).ifPresent(field ->
+                        validateReflectiveWrite(field, true, qualified, call, errors));
+            }
+        }
+        for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
+            if (!method.getBody().isPresent()) {
+                continue;
+            }
+            Set<String> classAliases = new HashSet<>();
+            Map<String, FieldDeclaration> fields = new LinkedHashMap<>();
+            for (com.github.javaparser.ast.stmt.Statement statement : method.getBody().get().getStatements()) {
+                // 分支及辅助方法中的动态赋值不猜测；丢弃旧绑定，避免将过期别名当成确定证据。
+                if (!statement.isExpressionStmt()) {
+                    classAliases.clear();
+                    fields.clear();
+                    continue;
+                }
+                Expression expression = statement.asExpressionStmt().getExpression();
+                if (expression.isVariableDeclarationExpr()) {
+                    expression.asVariableDeclarationExpr().getVariables().forEach(variable ->
+                            bindReflectiveField(unit, owner, qualified, variable.getNameAsString(),
+                                    variable.getInitializer().orElse(null), classAliases, fields));
+                } else if (expression.isAssignExpr()) {
+                    com.github.javaparser.ast.expr.AssignExpr assignment = expression.asAssignExpr();
+                    String target = assignment.getTarget().isNameExpr()
+                            ? assignment.getTarget().asNameExpr().getNameAsString() : null;
+                    if (target != null) {
+                        bindReflectiveField(unit, owner, qualified, target,
+                                assignment.getOperator() == com.github.javaparser.ast.expr.AssignExpr.Operator.ASSIGN
+                                        ? assignment.getValue() : null, classAliases, fields);
+                    }
+                } else if (expression.isMethodCallExpr()) {
+                    MethodCallExpr call = expression.asMethodCallExpr();
+                    if (call.getNameAsString().equals("set") && call.getArguments().size() == 2
+                            && call.getScope().filter(Expression::isNameExpr).isPresent()) {
+                        FieldDeclaration field = fields.get(call.getScope().get().asNameExpr().getNameAsString());
+                        if (field != null) {
+                            validateReflectiveWrite(field, call.getArgument(0).isNullLiteralExpr(), qualified, call, errors);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void bindReflectiveField(CompilationUnit unit, TypeDeclaration<?> owner, String qualified,
+                                     String name, Expression value, Set<String> classAliases,
+                                     Map<String, FieldDeclaration> fields) {
+        boolean businessClass = isBusinessClass(unit, value, qualified, classAliases);
+        FieldDeclaration field = null;
+        if (value != null && value.isMethodCallExpr()) {
+            MethodCallExpr lookup = value.asMethodCallExpr();
+            if (lookup.getNameAsString().equals("getDeclaredField") && lookup.getArguments().size() == 1
+                    && lookup.getArgument(0).isStringLiteralExpr()
+                    && lookup.getScope().map(scope -> isBusinessClass(unit, scope, qualified, classAliases)).orElse(false)) {
+                field = owner.getFieldByName(lookup.getArgument(0).asStringLiteralExpr().asString()).orElse(null);
+            }
+        }
+        classAliases.remove(name);
+        fields.remove(name);
+        if (businessClass) {
+            classAliases.add(name);
+        }
+        if (field != null) {
+            fields.put(name, field);
+        }
+    }
+
+    private boolean isBusinessClass(CompilationUnit unit, Expression expression, String qualified, Set<String> aliases) {
+        return expression != null && (expression.isClassExpr()
+                && matchesType(unit, expression.asClassExpr().getType().asString(), qualified)
+                || expression.isNameExpr() && aliases.contains(expression.asNameExpr().getNameAsString()));
+    }
+
+    private void validateReflectiveWrite(FieldDeclaration field, boolean classTarget, String owner,
+                                         MethodCallExpr call, List<String> errors) {
+        if (field.isFinal()) {
+            errors.add("禁止反射写真实 final 字段 " + owner + "." + field.getVariable(0).getNameAsString()
+                    + ": " + call + "；setAccessible(true) 不能使 static final 可写。保留生产 final，"
+                    + "只读获取缓存对象，按真实创建链隔离依赖，保存/替换/恢复对象内部非 final 字段；保留全部有效断言和验证");
+        } else if (classTarget && !field.isStatic()) {
+            errors.add("不能把真实实例字段当静态字段写入 " + owner + "." + field.getVariable(0).getNameAsString()
+                    + ": " + call + "；Class/null 目标只适用于 static 字段。使用被测调用实际使用的实例，"
+                    + "不能另造无关 Mock；若构造器已通过公开工厂注入依赖，删除多余的静态重置，保留断言");
+        }
     }
 
     /** 针对已确认的 HttpClient 隔离错误预检，不将 AST 语法通过当作类型可访问性验证。 */
@@ -167,7 +462,8 @@ public class TestSourceInspector {
     private void validateHttpClientReferences(CompilationUnit unit, List<String> errors) {
         String[] types = {"org.apache.http.impl.client.HttpClients", "org.apache.http.impl.client.HttpClientBuilder",
                 "org.apache.http.impl.client.CloseableHttpClient", "org.apache.http.ProtocolVersion",
-                "org.apache.http.HttpVersion", "org.apache.http.impl.conn.PoolingHttpClientConnectionManager"};
+                "org.apache.http.HttpVersion", "org.apache.http.impl.conn.PoolingHttpClientConnectionManager",
+                "org.apache.http.client.methods.HttpUriRequest"};
         for (String qualified : types) {
             String name = qualified.substring(qualified.lastIndexOf('.') + 1);
             boolean used = unit.findAll(ClassOrInterfaceType.class).stream()
@@ -213,6 +509,68 @@ public class TestSourceInspector {
                     + "使用 org.apache.http.HttpVersion.HTTP_1_1 或 new org.apache.http.ProtocolVersion(\"HTTP\", 1, 1)，"
                     + "不要在两个不存在的常量间切换。HttpClient4 与 5 的类型不能混用。");
         }
+    }
+
+    /** HttpClient4 的 execute 接收 build 后的请求，不能把构建器当成请求传入。 */
+    private void validateHttpExecuteMatchers(CompilationUnit unit, List<String> errors) {
+        for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
+            for (MethodCallExpr call : method.findAll(MethodCallExpr.class)) {
+                if (call.getNameAsString().equals("execute") && call.getArguments().size() == 1
+                        && isHttpClientReceiver(unit, method, call)
+                        && isTypedAny(unit, call.getArgument(0), "org.apache.http.client.methods.RequestBuilder")) {
+                    errors.add("HttpClient4 execute 的单参数类型是 HttpUriRequest，不是 RequestBuilder: " + call
+                            + "；stub 与 verify 都使用 any(HttpUriRequest.class)，补 import org.apache.http.client.methods.HttpUriRequest。"
+                            + "保留接收者、次数及其它验证；不要改成无类型 any() 或强转来绕过匹配约束");
+                }
+            }
+        }
+    }
+
+    private boolean isTypedAny(CompilationUnit unit, com.github.javaparser.ast.expr.Expression expression, String type) {
+        if (!expression.isMethodCallExpr()) {
+            return false;
+        }
+        MethodCallExpr matcher = expression.asMethodCallExpr();
+        return matcher.getNameAsString().equals("any") && matcher.getArguments().size() == 1
+                && matcher.getArgument(0).isClassExpr()
+                && matchesType(unit, matcher.getArgument(0).asClassExpr().getType().asString(), type)
+                && unit.findAll(MethodDeclaration.class).stream().noneMatch(method -> method.getNameAsString().equals("any"))
+                && (isMockitoCall(unit, matcher, "any") || matcher.getScope().map(scope ->
+                matchesType(unit, scope.toString(), "org.mockito.ArgumentMatchers")).orElse(false)
+                || !matcher.getScope().isPresent() && unit.getImports().stream().anyMatch(declaration ->
+                declaration.isStatic() && (declaration.getNameAsString().equals("org.mockito.ArgumentMatchers.any")
+                        || declaration.isAsterisk() && declaration.getNameAsString().equals("org.mockito.ArgumentMatchers"))));
+    }
+
+    private boolean isHttpClientReceiver(CompilationUnit unit, MethodDeclaration method, MethodCallExpr call) {
+        com.github.javaparser.ast.expr.Expression receiver = call.getScope().orElse(null);
+        if (receiver != null && receiver.isMethodCallExpr()) {
+            MethodCallExpr verify = receiver.asMethodCallExpr();
+            if (!isMockitoCall(unit, verify, "verify") || verify.getArguments().isEmpty()) {
+                return false;
+            }
+            receiver = verify.getArgument(0);
+        }
+        if (receiver == null || !receiver.isNameExpr()) {
+            return false;
+        }
+        String name = receiver.asNameExpr().getNameAsString();
+        List<com.github.javaparser.ast.body.VariableDeclarator> locals = method.findAll(
+                com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                .filter(variable -> variable.getNameAsString().equals(name))
+                .collect(java.util.stream.Collectors.toList());
+        if (!locals.isEmpty()) {
+            return locals.size() == 1 && matchesType(unit, locals.get(0).getType().asString(),
+                    "org.apache.http.impl.client.CloseableHttpClient");
+        }
+        if (method.getParameters().stream().anyMatch(parameter -> parameter.getNameAsString().equals(name))) {
+            return method.getParameters().stream().anyMatch(parameter -> parameter.getNameAsString().equals(name)
+                    && matchesType(unit, parameter.getType().asString(), "org.apache.http.impl.client.CloseableHttpClient"));
+        }
+        return method.findAncestor(ClassOrInterfaceDeclaration.class).map(owner -> owner.getFields().stream()
+                .flatMap(field -> field.getVariables().stream()).anyMatch(variable -> variable.getNameAsString().equals(name)
+                        && matchesType(unit, variable.getType().asString(), "org.apache.http.impl.client.CloseableHttpClient")))
+                .orElse(false);
     }
 
     /** 只拦截 setup 内的 HTTP 工厂 Mock 在后续测试显式触发构造前已被关闭的已知模式。 */
@@ -397,8 +755,63 @@ public class TestSourceInspector {
                 && call.getArgument(0).asClassExpr().getType().asClassOrInterfaceType().getNameAsString().equals("ReadConfig");
     }
 
+    /** 反射写静态字段也会触发原静态初始化，不能用它绕过首次 Spring Bean 准备。 */
+    private void validateReflectiveHttpInitialization(CompilationUnit unit, List<String> errors) {
+        boolean customInitialization = unit.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .anyMatch(type -> !type.getExtendedTypes().isEmpty())
+                || unit.findAll(AnnotationExpr.class).stream().anyMatch(annotation ->
+                java.util.Arrays.asList("BeforeAll", "BeforeClass").contains(annotation.getName().getIdentifier()));
+        if (customInitialization) {
+            return;
+        }
+        for (MethodDeclaration setup : unit.findAll(MethodDeclaration.class)) {
+            if (setup.getAnnotations().stream().noneMatch(annotation -> java.util.Arrays.asList("BeforeEach", "Before")
+                    .contains(annotation.getName().getIdentifier()))) {
+                continue;
+            }
+            boolean helper = setup.findAll(MethodCallExpr.class).stream().anyMatch(call -> !call.getScope().isPresent()
+                    && unit.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                    method != setup && method.getNameAsString().equals(call.getNameAsString())));
+            boolean reflectiveWrite = setup.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                    call.getNameAsString().equals("setField") && call.getArguments().size() == 3
+                            && call.getScope().map(scope -> matchesType(unit, scope.toString(),
+                            "org.springframework.test.util.ReflectionTestUtils")).orElse(false)
+                            && call.getArgument(0).isClassExpr()
+                            && call.getArgument(0).asClassExpr().getType().isClassOrInterfaceType()
+                            && call.getArgument(0).asClassExpr().getType().asClassOrInterfaceType().getNameAsString().equals("HttpClientUtil"));
+            boolean contextMock = setup.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                    call.getNameAsString().equals("mock") && call.getArguments().size() == 1
+                            && call.getArgument(0).isClassExpr() && matchesType(unit,
+                            call.getArgument(0).asClassExpr().getType().asString(), "org.springframework.context.ApplicationContext"));
+            boolean springMock = setup.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                    isMockitoCall(unit, call, "mockStatic") && call.getArguments().size() == 1
+                            && call.getArgument(0).isClassExpr()
+                            && call.getArgument(0).asClassExpr().getType().isClassOrInterfaceType()
+                            && call.getArgument(0).asClassExpr().getType().asClassOrInterfaceType()
+                            .getNameAsString().equals("SpringContextBeanUtil"));
+            if (helper || !reflectiveWrite || !contextMock || !springMock) {
+                continue;
+            }
+            for (String bean : java.util.Arrays.asList("ReadConfig", "BeeTraceClientHelper")) {
+                boolean prepared = unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                        call.getNameAsString().equals("getBean") && call.getArguments().size() == 1
+                                && call.getArgument(0).isClassExpr()
+                                && call.getArgument(0).asClassExpr().getType().isClassOrInterfaceType()
+                                && call.getArgument(0).asClassExpr().getType().asClassOrInterfaceType().getNameAsString().equals(bean));
+                if (!prepared) {
+                    errors.add("HttpClientUtil 反射写静态字段之前仍会先执行原 static 初始化，但普通 ApplicationContext Mock 未准备 "
+                            + bean + " Bean；先在首次 setField/主动使用前 stub getBean(" + bean
+                            + ".class)，准备有效配置。类初始化后再保存、注入和恢复可变字段，不能靠反射赋值跳过 static 块");
+                }
+            }
+        }
+    }
+
     public Map<String, Integer> assertions(String source) {
-        CompilationUnit unit = parse(source);
+        return assertionCounts(parse(source));
+    }
+
+    private Map<String, Integer> assertionCounts(CompilationUnit unit) {
         Map<String, Integer> result = new LinkedHashMap<>();
         for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
             if (isTest(unit, method)) {
@@ -410,16 +823,415 @@ public class TestSourceInspector {
 
     public void preserveAssertions(String before, String after, String businessSource,
                                    String testClass, List<String> verifyErrors) {
+        preserveAssertions(before, after, businessSource, testClass, verifyErrors, java.util.Collections.emptyMap());
+    }
+
+    public void preserveAssertions(String before, String after, String businessSource,
+                                   String testClass, List<String> verifyErrors, Map<String, String> jsonProperties) {
         CompilationUnit previous = parse(before);
         CompilationUnit next = parse(after);
         normalizePrivateFieldAssertions(previous, next, businessSource, testClass, verifyErrors);
+        normalizeRequestJsonAssertions(previous, next, businessSource, jsonProperties);
+        normalizeDisabledConstructionAssertions(previous, next, parse(businessSource));
+        normalizeHttpExecuteMatchers(previous, next, parse(businessSource));
+        Map<String, Integer> previousCounts = assertionCounts(previous);
+        Map<String, Integer> nextCounts = assertionCounts(next);
+        for (Map.Entry<String, Integer> method : previousCounts.entrySet()) {
+            if (!nextCounts.containsKey(method.getKey()) || nextCounts.get(method.getKey()) < method.getValue()) {
+                throw new IllegalArgumentException("禁止删除既有测试方法或减少有效断言: " + testClass + " " + method.getKey());
+            }
+        }
         Map<String, Integer> calls = assertionCalls(next);
         Map<String, Integer> corrections = exceptionAssertionCorrections(
                 previous, next, businessSource, testClass, verifyErrors);
+        addImpossibleAssertionCorrections(previous, next, businessSource, corrections);
         for (Map.Entry<String, Integer> call : assertionCalls(previous).entrySet()) {
             if (calls.getOrDefault(call.getKey(), 0) + corrections.getOrDefault(call.getKey(), 0)
                     < call.getValue()) {
-                throw new IllegalArgumentException("禁止删除或放宽已有断言/交互验证: " + call.getKey());
+                String hint = call.getKey().contains(".execute(") && call.getKey().contains("RequestBuilder.class")
+                        ? "；已确认的 HttpClient4 参数修正须使用 any(HttpUriRequest.class)，保留原 verify 接收者及次数。"
+                        + "(HttpUriRequest) any() 是无类型匹配，不能用强转放宽该约束；stub 和 verify 一起修复并补真实 import。" : "";
+                throw new IllegalArgumentException("禁止删除或放宽已有断言/交互验证: " + call.getKey() + hint);
+            }
+        }
+    }
+
+    /** 只有真实业务调用 builder.build() 时，认可同一 verify 中的请求参数类型纠正。 */
+    private void normalizeHttpExecuteMatchers(CompilationUnit previous, CompilationUnit next, CompilationUnit business) {
+        boolean builtRequest = business.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                method.findAll(MethodCallExpr.class).stream().anyMatch(call -> {
+                    if (!call.getNameAsString().equals("execute") || call.getArguments().size() != 1
+                            || !isHttpClientReceiver(business, method, call) || !call.getArgument(0).isMethodCallExpr()) {
+                        return false;
+                    }
+                    MethodCallExpr build = call.getArgument(0).asMethodCallExpr();
+                    return build.getNameAsString().equals("build") && build.getArguments().isEmpty()
+                            && build.getScope().filter(scope -> scope.isNameExpr()).isPresent()
+                            && method.getParameters().stream().anyMatch(parameter ->
+                            parameter.getNameAsString().equals(build.getScope().get().asNameExpr().getNameAsString())
+                                    && matchesType(business, parameter.getType().asString(),
+                                    "org.apache.http.client.methods.RequestBuilder"));
+                }));
+        if (!builtRequest) {
+            return;
+        }
+        for (MethodDeclaration method : previous.findAll(MethodDeclaration.class)) {
+            if (!isTest(previous, method)) {
+                continue;
+            }
+            for (MethodCallExpr original : method.findAll(MethodCallExpr.class)) {
+                if (!original.getNameAsString().equals("execute") || original.getArguments().size() != 1
+                        || !original.getScope().filter(scope -> scope.isMethodCallExpr()
+                        && isMockitoCall(previous, scope.asMethodCallExpr(), "verify")).isPresent()
+                        || !isHttpClientReceiver(previous, method, original)
+                        || !isTypedAny(previous, original.getArgument(0), "org.apache.http.client.methods.RequestBuilder")) {
+                    continue;
+                }
+                for (MethodDeclaration candidate : next.findAll(MethodDeclaration.class)) {
+                    if (!candidate.getSignature().equals(method.getSignature()) || !isTest(next, candidate)) {
+                        continue;
+                    }
+                    for (MethodCallExpr replacement : candidate.findAll(MethodCallExpr.class)) {
+                        if (!replacement.getNameAsString().equals("execute") || replacement.getArguments().size() != 1
+                                || !isHttpClientReceiver(next, candidate, replacement)
+                                || !isTypedAny(next, replacement.getArgument(0), "org.apache.http.client.methods.HttpUriRequest")) {
+                            continue;
+                        }
+                        MethodCallExpr normalized = replacement.clone();
+                        normalized.setArgument(0, original.getArgument(0).clone());
+                        if (normalized.equals(original)) {
+                            replacement.setArgument(0, original.getArgument(0).clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** 仅在关闭分支确实先返回时，将零构造验证按原验证意图比较；不修改实际计划源码。 */
+    private void normalizeDisabledConstructionAssertions(CompilationUnit previous, CompilationUnit next,
+                                                           CompilationUnit business) {
+        MethodDeclaration invoke = business.findAll(MethodDeclaration.class).stream()
+                .filter(method -> method.getNameAsString().equals("ahiInvoke") && method.getBody().isPresent())
+                .findFirst().orElse(null);
+        boolean nullableSwitch = business.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                method.getNameAsString().equals("verifyInvokeCondition")
+                        && method.findAll(com.github.javaparser.ast.stmt.IfStmt.class).stream().anyMatch(branch ->
+                        branch.getCondition().toString().equals("!Boolean.TRUE.equals(readConfig.getAhiHttpInvokeEnable())")
+                                && branch.getThenStmt().isBlockStmt()
+                                && branch.getThenStmt().asBlockStmt().getStatements().size() == 1
+                                && branch.getThenStmt().asBlockStmt().getStatement(0).isReturnStmt()
+                                && branch.getThenStmt().asBlockStmt().getStatement(0).asReturnStmt().getExpression()
+                                .map(value -> value.toString().equals("false")).orElse(false)));
+        if (invoke == null || !nullableSwitch) {
+            return;
+        }
+        String businessType = business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("")
+                + business.getType(0).getNameAsString();
+        boolean realFixture = java.util.Arrays.asList(previous, next).stream().allMatch(unit ->
+                unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class).stream()
+                        .flatMap(field -> field.getVariables().stream()).anyMatch(variable ->
+                        variable.getNameAsString().equals("handler") && matchesType(unit, variable.getType().asString(), businessType))
+                        && unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class).stream()
+                        .flatMap(field -> field.getVariables().stream()).anyMatch(variable ->
+                        variable.getNameAsString().equals("readConfig") && variable.getType().asString().equals("ReadConfig")));
+        if (!realFixture) {
+            return;
+        }
+        List<com.github.javaparser.ast.stmt.Statement> statements = invoke.getBody().get().getStatements();
+        boolean earlyReturn = false;
+        boolean conditionDeclared = false;
+        for (com.github.javaparser.ast.stmt.Statement statement : statements) {
+            if (!statement.findAll(com.github.javaparser.ast.expr.ObjectCreationExpr.class).isEmpty()) {
+                break;
+            }
+            if (statement.isIfStmt() && statement.asIfStmt().getCondition().toString().equals("!isAhiInvoke")
+                    && statement.asIfStmt().getThenStmt().isBlockStmt()
+                    && statement.asIfStmt().getThenStmt().asBlockStmt().getStatements().size() == 2
+                    && statement.asIfStmt().getThenStmt().asBlockStmt().getStatement(0).isExpressionStmt()
+                    && statement.asIfStmt().getThenStmt().asBlockStmt().getStatement(0).asExpressionStmt()
+                    .getExpression().toString().equals("eventData.putDataAndOriginData(\"ahiResultAvailable\", \"2\")")
+                    && statement.asIfStmt().getThenStmt().asBlockStmt().getStatement(1).isReturnStmt()
+                    && !statement.asIfStmt().getThenStmt().asBlockStmt().getStatement(1).asReturnStmt().getExpression().isPresent()) {
+                earlyReturn = conditionDeclared;
+                break;
+            }
+            conditionDeclared |= statement.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                    .anyMatch(variable ->
+                        variable.getNameAsString().equals("isAhiInvoke") && variable.getInitializer()
+                                .map(value -> value.toString().equals("verifyInvokeCondition(eventFields)")).orElse(false));
+        }
+        if (!earlyReturn) {
+            return;
+        }
+        for (MethodDeclaration method : previous.findAll(MethodDeclaration.class)) {
+            if (!isTest(previous, method) || !hasDisabledInvocation(method)) {
+                continue;
+            }
+            for (MethodDeclaration candidate : next.findAll(MethodDeclaration.class)) {
+                if (!candidate.getSignature().equals(method.getSignature()) || !isTest(next, candidate)
+                        || !candidate.getBody().isPresent() || !hasDisabledInvocation(candidate)) {
+                    continue;
+                }
+                for (com.github.javaparser.ast.body.VariableDeclarator field : previous.findAll(
+                        com.github.javaparser.ast.body.VariableDeclarator.class)) {
+                    if (!(field.getParentNode().orElse(null) instanceof com.github.javaparser.ast.body.FieldDeclaration)
+                            || !field.getType().asString().equals("MockedConstruction<AhiHttpInvokerHandler>")) {
+                        continue;
+                    }
+                    String handle = field.getNameAsString();
+                    boolean sameField = next.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                            .filter(variable -> variable.getNameAsString().equals(handle))
+                            .collect(java.util.stream.Collectors.toList()).size() == 1
+                            && next.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                            .anyMatch(variable -> variable.getNameAsString().equals(handle)
+                                    && variable.getType().equals(field.getType())
+                                    && variable.getParentNode().orElse(null) instanceof
+                                    com.github.javaparser.ast.body.FieldDeclaration);
+                    if (!sameField || method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                            .anyMatch(variable -> variable.getNameAsString().equals(handle))) {
+                        continue;
+                    }
+                    boolean registered = java.util.Arrays.asList(previous, next).stream().allMatch(unit ->
+                            unit.findAll(com.github.javaparser.ast.expr.AssignExpr.class).stream().anyMatch(assignment ->
+                            assignment.getTarget().toString().equals(handle) && assignment.getValue().isMethodCallExpr()
+                                    && isMockitoCall(unit, assignment.getValue().asMethodCallExpr(), "mockConstruction")
+                                    && !assignment.getValue().asMethodCallExpr().getArguments().isEmpty()
+                                    && assignment.getValue().asMethodCallExpr().getArgument(0).toString()
+                                    .equals("AhiHttpInvokerHandler.class")));
+                    if (!registered) {
+                        continue;
+                    }
+                    List<MethodCallExpr> wrongCounts = method.findAll(MethodCallExpr.class).stream().filter(call ->
+                            isJupiterAssertion(previous, call, "assertEquals") && call.getArguments().size() == 2
+                                    && call.getArgument(0).toString().equals("1")
+                                    && call.getArgument(1).toString().equals(handle + ".constructed().size()"))
+                            .collect(java.util.stream.Collectors.toList());
+                    List<MethodCallExpr> zeroCalls = method.findAll(MethodCallExpr.class).stream().filter(call -> {
+                        if (!call.getNameAsString().equals("doPost") || !call.getScope().isPresent()
+                                || !call.getScope().get().isMethodCallExpr()) {
+                            return false;
+                        }
+                        MethodCallExpr verify = call.getScope().get().asMethodCallExpr();
+                        return isMockitoCall(previous, verify, "verify") && verify.getArguments().size() == 2
+                                && verify.getArgument(0).toString().equals(handle + ".constructed().get(0)")
+                                && verify.getArgument(1).isMethodCallExpr()
+                                && isMockitoCall(previous, verify.getArgument(1).asMethodCallExpr(), "times")
+                                && verify.getArgument(1).asMethodCallExpr().getArguments().size() == 1
+                                && verify.getArgument(1).asMethodCallExpr().getArgument(0).toString().equals("0");
+                    }).collect(java.util.stream.Collectors.toList());
+                    List<MethodCallExpr> emptyChecks = candidate.findAll(MethodCallExpr.class).stream().filter(call ->
+                            isJupiterAssertion(next, call, "assertTrue") && call.getArguments().size() == 1
+                                    && call.getArgument(0).toString().equals(handle + ".constructed().isEmpty()")
+                                    || isJupiterAssertion(next, call, "assertEquals") && call.getArguments().size() == 2
+                                    && call.getArgument(0).toString().equals("0")
+                                    && call.getArgument(1).toString().equals(handle + ".constructed().size()"))
+                            .collect(java.util.stream.Collectors.toList());
+                    if (wrongCounts.size() == 1 && zeroCalls.size() == 1 && emptyChecks.size() == 1
+                            && candidate.findAll(MethodCallExpr.class).stream().noneMatch(call ->
+                            call.equals(wrongCounts.get(0)) || call.equals(zeroCalls.get(0)))) {
+                        emptyChecks.get(0).replace(wrongCounts.get(0).clone());
+                        candidate.getBody().get().addStatement(new com.github.javaparser.ast.stmt.ExpressionStmt(zeroCalls.get(0).clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    private boolean hasDisabledInvocation(MethodDeclaration method) {
+        if (!method.getBody().isPresent() || !method.getParameters().isEmpty()
+                || method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                .anyMatch(variable -> java.util.Arrays.asList("handler", "readConfig", "ctx", "eventData")
+                        .contains(variable.getNameAsString()))
+                || method.findAll(com.github.javaparser.ast.expr.AssignExpr.class).stream()
+                .anyMatch(assignment -> java.util.Arrays.asList("handler", "readConfig", "ctx", "eventData")
+                        .contains(assignment.getTarget().toString()))) {
+            return false;
+        }
+        List<MethodCallExpr> calls = method.findAll(MethodCallExpr.class);
+        long setters = calls.stream().filter(call -> call.getNameAsString().equals("setAhiHttpInvokeEnable")).count();
+        return setters == 1 && calls.stream().anyMatch(setter -> java.util.Arrays.asList(
+                "readConfig.setAhiHttpInvokeEnable(false)", "readConfig.setAhiHttpInvokeEnable(Boolean.FALSE)",
+                "readConfig.setAhiHttpInvokeEnable(null)").contains(setter.toString())
+                && setter.getParentNode().flatMap(parent -> parent.getParentNode())
+                .filter(parent -> parent == method.getBody().get()).isPresent()
+                && calls.stream().anyMatch(invoke -> invoke.toString().equals("handler.ahiInvoke(ctx, eventData)")
+                && invoke.getParentNode().flatMap(parent -> parent.getParentNode())
+                .filter(parent -> parent == method.getBody().get()).isPresent()
+                && setter.getBegin().isPresent() && invoke.getBegin().isPresent()
+                && setter.getBegin().get().isBefore(invoke.getBegin().get())))
+                && method.findAll(com.github.javaparser.ast.expr.ObjectCreationExpr.class).stream()
+                .noneMatch(creation -> creation.getType().asString().equals("AhiHttpInvokerHandler"));
+    }
+
+    private boolean isMockitoCall(CompilationUnit unit, MethodCallExpr call, String name) {
+        return call.getNameAsString().equals(name) && (call.getScope()
+                .map(scope -> matchesType(unit, scope.toString(), "org.mockito.Mockito")).orElse(false)
+                || !call.getScope().isPresent() && unit.getImports().stream().anyMatch(declaration ->
+                declaration.isStatic() && (declaration.getNameAsString().equals("org.mockito.Mockito." + name)
+                        || declaration.isAsterisk() && declaration.getNameAsString().equals("org.mockito.Mockito"))));
+    }
+
+    /** 仅纠正由真实请求实体注解证明的键名，保留实际值路径、预期值及断言类型。 */
+    private void normalizeRequestJsonAssertions(CompilationUnit previous, CompilationUnit next, String businessSource,
+                                                 Map<String, String> properties) {
+        if (properties.isEmpty()) {
+            return;
+        }
+        CompilationUnit business = parse(businessSource);
+        boolean serializer = business.getTypes().stream().anyMatch(type ->
+                "AhiHttpInvokerHandler".equals(type.getNameAsString()))
+                && business.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                "buildRequestBody".equals(method.getNameAsString()) && method.findAll(MethodCallExpr.class).stream()
+                        .anyMatch(call -> "writeValueAsString".equals(call.getNameAsString())));
+        if (!serializer) {
+            return;
+        }
+        for (MethodDeclaration method : previous.findAll(MethodDeclaration.class)) {
+            if (!isTest(previous, method)) {
+                continue;
+            }
+            for (MethodCallExpr assertion : method.findAll(MethodCallExpr.class)) {
+                if (!isJupiterAssertion(previous, assertion, "assertEquals") || assertion.getArguments().size() != 2) {
+                    continue;
+                }
+                MethodCallExpr corrected = assertion.clone();
+                for (MethodCallExpr read : corrected.getArgument(1).findAll(MethodCallExpr.class)) {
+                    if (!java.util.Arrays.asList("get", "getAsJsonObject").contains(read.getNameAsString())
+                            || read.getArguments().size() != 1 || !read.getArgument(0).isStringLiteralExpr()
+                            || !read.getScope().isPresent()
+                            || !read.getParentNode().filter(parent -> parent instanceof MethodCallExpr
+                            && java.util.Arrays.asList("getAsString", "getAsBoolean", "getAsInt", "getAsFloat")
+                            .contains(((MethodCallExpr) parent).getNameAsString())
+                            && ((MethodCallExpr) parent).getScope().filter(scope -> scope == read).isPresent()).isPresent()
+                            || !isRequestJson(previous, method, read.getScope().get(), 0)) {
+                        continue;
+                    }
+                    String original = read.getArgument(0).asStringLiteralExpr().asString();
+                    String property = properties.get(original.replace("_", "").toLowerCase(java.util.Locale.ROOT));
+                    if (property != null) {
+                        read.setArgument(0, new com.github.javaparser.ast.expr.StringLiteralExpr(property));
+                    }
+                }
+                if (!corrected.equals(assertion)) {
+                    next.findAll(MethodDeclaration.class).stream()
+                            .filter(candidate -> candidate.getSignature().equals(method.getSignature()) && isTest(next, candidate))
+                            .flatMap(candidate -> candidate.findAll(MethodCallExpr.class).stream())
+                            .filter(candidate -> isJupiterAssertion(next, candidate, "assertEquals") && candidate.equals(corrected))
+                            .forEach(candidate -> candidate.setArgument(1, assertion.getArgument(1).clone()));
+                }
+            }
+        }
+    }
+
+    private boolean isRequestJson(CompilationUnit unit, MethodDeclaration method,
+                                  com.github.javaparser.ast.expr.Expression expression, int depth) {
+        if (depth > 10) {
+            return false;
+        }
+        if (expression.isNameExpr()) {
+            String name = expression.asNameExpr().getNameAsString();
+            List<com.github.javaparser.ast.body.VariableDeclarator> variables = method
+                    .findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                    .filter(variable -> name.equals(variable.getNameAsString()))
+                    .collect(java.util.stream.Collectors.toList());
+            boolean reassigned = method.findAll(com.github.javaparser.ast.expr.AssignExpr.class).stream()
+                    .anyMatch(assignment -> name.equals(assignment.getTarget().toString()));
+            return !reassigned && variables.size() == 1 && variables.get(0).getInitializer()
+                    .map(value -> isRequestJson(unit, method, value, depth + 1)).orElse(false);
+        }
+        if (!expression.isMethodCallExpr()) {
+            return false;
+        }
+        MethodCallExpr call = expression.asMethodCallExpr();
+        if ("buildRequestBody".equals(call.getNameAsString()) && call.getArguments().size() == 2
+                && call.getScope().filter(scope -> scope.isNameExpr()).isPresent()) {
+            String receiver = call.getScope().get().asNameExpr().getNameAsString();
+            return method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                    .anyMatch(variable -> receiver.equals(variable.getNameAsString())
+                            && variable.getType().asString().endsWith("AhiHttpInvokerHandler")
+                            && variable.getInitializer().filter(value -> value.isObjectCreationExpr()
+                            && !value.asObjectCreationExpr().getAnonymousClassBody().isPresent()).isPresent());
+        }
+        if ("parseString".equals(call.getNameAsString()) && call.getArguments().size() == 1
+                && call.getScope().map(scope -> matchesType(unit, scope.toString(), "com.google.gson.JsonParser"))
+                .orElse(false)) {
+            return isRequestJson(unit, method, call.getArgument(0), depth + 1);
+        }
+        return "getAsJsonObject".equals(call.getNameAsString()) && call.getArguments().size() <= 1
+                && call.getScope().map(scope -> isRequestJson(unit, method, scope, depth + 1)).orElse(false);
+    }
+
+    private boolean isImpossibleBooleanStringAssertion(CompilationUnit unit, MethodCallExpr call) {
+        if (!isJupiterAssertion(unit, call, "assertEquals") || call.getArguments().size() != 2
+                || !call.getArgument(0).isStringLiteralExpr() || !call.getArgument(1).isMethodCallExpr()) {
+            return false;
+        }
+        String expected = call.getArgument(0).asStringLiteralExpr().asString();
+        MethodCallExpr actual = call.getArgument(1).asMethodCallExpr();
+        if (expected.equals("true") || expected.equals("false") || !actual.getNameAsString().equals("valueOf")
+                || !actual.getScope().map(scope -> matchesType(unit, scope.toString(), "java.lang.String")
+                || scope.toString().equals("String")).orElse(false) || actual.getArguments().size() != 1
+                || !actual.getArgument(0).isBinaryExpr()) {
+            return false;
+        }
+        return java.util.Arrays.asList("==", "!=", ">=", "<=", ">", "<", "&&", "||")
+                .contains(actual.getArgument(0).asBinaryExpr().getOperator().asString());
+    }
+
+    /** 只允许将已证明必败的字符串/布尔比较改为真实 EventData 写回验证，不放宽正常断言。 */
+    private void addImpossibleAssertionCorrections(CompilationUnit previous, CompilationUnit next,
+                                                     String businessSource, Map<String, Integer> corrections) {
+        CompilationUnit business = parse(businessSource);
+        for (MethodDeclaration method : previous.findAll(MethodDeclaration.class)) {
+            if (!isTest(previous, method)) {
+                continue;
+            }
+            boolean replacement = next.findAll(MethodDeclaration.class).stream()
+                    .filter(candidate -> candidate.getSignature().equals(method.getSignature()) && isTest(next, candidate))
+                    .filter(candidate -> candidate.findAll(MethodDeclaration.class).stream()
+                            .noneMatch(nested -> "ahiInvoke".equals(nested.getNameAsString())))
+                    .filter(candidate -> candidate.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                            .anyMatch(variable -> variable.getInitializer().filter(value -> value.isObjectCreationExpr()
+                                    && !value.asObjectCreationExpr().getAnonymousClassBody().isPresent()
+                                    && business.getTypes().stream().anyMatch(type ->
+                                    matchesType(next, value.asObjectCreationExpr().getType().asString(),
+                                    business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("")
+                                            + type.getNameAsString()))).isPresent()
+                                    && candidate.findAll(MethodCallExpr.class).stream().anyMatch(invocation ->
+                                    java.util.Arrays.asList("handle", "ahiInvoke").contains(invocation.getNameAsString())
+                                            && invocation.getScope().map(scope -> scope.toString()
+                                            .equals(variable.getNameAsString())).orElse(false))))
+                    .flatMap(candidate -> candidate.findAll(MethodCallExpr.class).stream()).anyMatch(call -> {
+                        if (!call.getNameAsString().equals("putDataAndOriginData") || call.getArguments().size() != 2
+                                || !call.getArgument(0).isStringLiteralExpr() || !call.getScope().isPresent()
+                                || !"ahiResultAvailable".equals(call.getArgument(0).asStringLiteralExpr().asString())
+                                || !call.getArgument(1).isStringLiteralExpr()
+                                || !"1".equals(call.getArgument(1).asStringLiteralExpr().asString())
+                                || !call.getScope().get().isMethodCallExpr()) {
+                            return false;
+                        }
+                        MethodCallExpr verify = call.getScope().get().asMethodCallExpr();
+                        return verify.getNameAsString().equals("verify") && verify.getArguments().size() == 1
+                                && !verify.getScope().isPresent() && verify.getArgument(0).isNameExpr()
+                                && next.findAll(com.github.javaparser.ast.body.FieldDeclaration.class).stream()
+                                .flatMap(field -> field.getVariables().stream()).anyMatch(variable ->
+                                variable.getNameAsString().equals(verify.getArgument(0).asNameExpr().getNameAsString())
+                                        && matchesType(next, variable.getType().asString(),
+                                        "com.cmbchina.rces.executor.common.EventData"))
+                                && !method.findAll(MethodCallExpr.class).contains(call)
+                                && (next.getImports().stream().anyMatch(declaration -> declaration.isStatic()
+                                && (declaration.getNameAsString().equals("org.mockito.Mockito.verify")
+                                || declaration.isAsterisk() && declaration.getNameAsString().equals("org.mockito.Mockito"))))
+                                && business.findAll(MethodCallExpr.class).stream().anyMatch(write ->
+                                write.getNameAsString().equals(call.getNameAsString()) && write.getArguments().size() == 2
+                                        && write.getArgument(0).equals(call.getArgument(0)));
+                    });
+            List<MethodCallExpr> invalid = method.findAll(MethodCallExpr.class).stream()
+                    .filter(call -> isImpossibleBooleanStringAssertion(previous, call))
+                    .collect(java.util.stream.Collectors.toList());
+            if (replacement && invalid.size() == 1) {
+                corrections.put(method.getSignature().asString() + ":" + invalid.get(0), 1);
             }
         }
     }

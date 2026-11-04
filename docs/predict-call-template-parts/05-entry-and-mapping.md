@@ -22,6 +22,7 @@ try {
 - 需要在 `init(AbstractPipeline pipeline)` 中补充取 Bean 时，保留 `super.init(pipeline)` 和原有初始化逻辑，使用本项目已有的 `SpringContextBeanUtil.getApplicationContext().getBean(ReadConfig.class)`。该工具的真实包名以当前 03/04 模板产物的 import 和已有源码为准，并补齐入口 import。
 - 禁止猜测 `pipeline.getApplicationContext()` 或其它未确认的 Pipeline getter；本地编译依赖的 `AbstractPipeline` 不提供该方法，不能为了通过编译修改依赖桩或添加同名替身。
 - 配置获取失败不能靠吞掉异常后留下 null 继续推进；沿用目标工程已有的初始化错误处理方式，不修改无关初始化逻辑。
+- 调用开关是可空 `Boolean`，null 与 false 都表示关闭。必须直接使用 `Boolean.TRUE.equals(readConfig.getAhiHttpInvokeEnable())` 判断，禁止先赋给 primitive boolean，避免自动拆箱空指针。
 
 ---
 
@@ -123,8 +124,7 @@ try {
             return false;
         }
 
-        boolean flag = readConfig.getAhiHttpInvokeEnable();
-        if (!Boolean.TRUE.equals(flag)) {
+        if (!Boolean.TRUE.equals(readConfig.getAhiHttpInvokeEnable())) {
             // 调用开关是否打开
             return false;
         }

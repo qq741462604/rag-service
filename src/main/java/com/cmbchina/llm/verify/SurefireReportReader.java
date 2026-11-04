@@ -85,9 +85,15 @@ public class SurefireReportReader {
                         || test.getElementsByTagName("error").getLength() > 0) {
                     result.failedTests++;
                     result.failedTestClasses.add(owner);
-                    result.addError("测试失败: " + className + "#" + test.getAttribute("name"));
-                    addFailureDetails(test, "failure", result);
-                    addFailureDetails(test, "error", result);
+                    List<List<String>> failures = result.failureGroups.computeIfAbsent(owner, key -> new ArrayList<>());
+                    if (failures.size() < 8) {
+                        Evidence testcase = new Evidence();
+                        testcase.addError("测试失败: " + className + "#" + test.getAttribute("name"));
+                        addFailureDetails(test, "failure", testcase);
+                        addFailureDetails(test, "error", testcase);
+                        addExecutionExceptions(test, testcase);
+                        failures.add(testcase.errors);
+                    }
                 }
             }
             if (relevant) {
@@ -106,6 +112,7 @@ public class SurefireReportReader {
                 result.addError("缺少本次有效测试执行证据（未运行、全跳过或仅有旧报告）: " + name);
             }
         });
+        result.arrangeFailureErrors();
         return result;
     }
 
@@ -120,6 +127,11 @@ public class SurefireReportReader {
             }
             // Mockito 顶层消息可能先输出很长的环境说明，优先保留最后一个 Caused by 的真实原因。
             String trace = failure.getTextContent();
+            // 有 message 的异常也必须保留失败位置，不能只反馈断言文本后让模型猜初始化问题。
+            String frame = java.util.Arrays.stream(trace.split("\\R"))
+                    .map(String::trim).filter(line -> line.startsWith("at ")
+                            && line.contains(test.getAttribute("classname") + "."))
+                    .findFirst().orElse("");
             int cause = trace.lastIndexOf("Caused by:");
             if (cause >= 0) {
                 String rootCause = trace.substring(cause, Math.min(trace.length(), cause + 1024));
@@ -128,6 +140,47 @@ public class SurefireReportReader {
             String detail = failure.getAttribute("type") + ": "
                     + message.substring(0, Math.min(2048, message.length())).replaceAll("\\s+", " ").trim();
             addFailureDetail(detail, result);
+            if (!frame.isEmpty()) {
+                result.addError("失败位置: " + frame);
+            }
+        }
+    }
+
+    /** 只摘取失败用例自身输出中的异常和关键栈帧，不将日志异常当作测试判定依据。 */
+    private void addExecutionExceptions(Element test, Evidence result) {
+        Set<String> details = new LinkedHashSet<>();
+        int exceptions = 0;
+        for (String tag : java.util.Arrays.asList("system-out", "system-err")) {
+            NodeList outputs = test.getElementsByTagName(tag);
+            for (int index = 0; index < outputs.getLength() && exceptions < 2; index++) {
+                String output = outputs.item(index).getTextContent();
+                int frames = 0;
+                boolean inException = false;
+                for (String raw : output.split("\\R")) {
+                    String line = raw.trim();
+                    if (line.matches("^(?:Caused by: |Suppressed: )?(?:[\\w$]+\\.)+[\\w$]*(?:Exception|Error)(?::.*)?$")) {
+                        if (exceptions >= 2) {
+                            break;
+                        }
+                        if (details.add(line)) {
+                            result.addError("用例执行日志（辅助定位）: " + line);
+                            exceptions++;
+                        }
+                        inException = true;
+                        frames = 0;
+                    } else if (inException && line.startsWith("at ")) {
+                        if (frames < 3 && details.add(line)) {
+                            result.addError("执行日志位置: " + line);
+                        }
+                        frames++;
+                    } else if (!line.isEmpty()) {
+                        inException = false;
+                    }
+                    if (exceptions >= 2 && frames >= 3) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -194,6 +247,37 @@ public class SurefireReportReader {
         public final List<String> reports = new ArrayList<>();
         public final List<String> errors = new ArrayList<>();
         private final Set<String> failureDetails = new LinkedHashSet<>();
+        private final Map<String, List<List<String>>> failureGroups = new LinkedHashMap<>();
+
+        /** 保持 32 条上限，先按失败类轮流提供核心诊断，再补充用例执行日志。 */
+        private void arrangeFailureErrors() {
+            List<String> structural = new ArrayList<>(errors);
+            errors.clear();
+            for (String error : structural) {
+                if (error.startsWith("缺少本次有效测试执行证据")) {
+                    addError(error);
+                }
+            }
+            for (int round = 0; round < 8; round++) {
+                for (boolean includeExecutionLogs : new boolean[]{false, true}) {
+                    for (int detail = 0; detail < 32 && errors.size() < 32; detail++) {
+                        for (List<List<String>> groups : failureGroups.values()) {
+                            if (round < groups.size() && detail < groups.get(round).size()) {
+                                String message = groups.get(round).get(detail);
+                                if (isExecutionLog(message) == includeExecutionLogs) {
+                                    addError(message);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            structural.stream().filter(error -> !error.startsWith("缺少本次有效测试执行证据")).forEach(this::addError);
+        }
+
+        private boolean isExecutionLog(String message) {
+            return message.startsWith("用例执行日志（辅助定位）:") || message.startsWith("执行日志位置:");
+        }
 
         private void addError(String message) {
             if (errors.size() < 32) {
