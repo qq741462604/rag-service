@@ -30,7 +30,8 @@ public class SearchCodeTool extends BaseTool {
 
     @Override
     public String description() {
-        return "搜索项目代码内容，返回匹配文件、行号以及上下文";
+        return "按 workspace.ignore 搜索项目代码，返回匹配文件、行号及上下文；被排除目录未扫描不代表类或 API 不存在。"
+                + "已确认的 .ai/aitest 公共依赖源码优先按具体路径 read_file，不对参考目录反复搜索";
     }
 
     @Override

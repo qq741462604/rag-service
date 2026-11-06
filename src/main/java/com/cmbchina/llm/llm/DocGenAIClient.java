@@ -1,49 +1,25 @@
 package com.cmbchina.llm.llm;
 
 import com.alibaba.fastjson.JSONObject;
+import com.cmbchina.llm.config.ChatModelProperties;
 import com.cmbchina.llm.exception.MyException;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.RestTemplate;
 
-import javax.annotation.PostConstruct;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 调用极算平台
+ * 文档生成角色客户端，保留完整响应 JSON 供文档解析器处理。
  */
-@Slf4j
 @Component
+@RequiredArgsConstructor
 public class DocGenAIClient {
 
-    private HttpHeaders headers = new HttpHeaders();
-
-    @Value("${docllm.api.url}")
-    private String apiUrl;
-
-    @Value("${docllm.api.key:}")
-    private String apiKey;
-
-    @Value("${docllm.api.model:qwen-plus}")
-    private String modelName;
-
-    @Autowired
-    private RestTemplate restTemplate;
-
-    @PostConstruct
-    public void init() {
-        headers.setContentType(org.springframework.http.MediaType.parseMediaType("application/json;charset=utf-8"));
-        headers.set("Authorization", "Bearer " + apiKey);
-    }
+    private final ChatModelProperties properties;
+    private final LlmClient llmClient;
 
     public String chat(String prompt) {
         try {
@@ -60,37 +36,29 @@ public class DocGenAIClient {
             userMessage.put("content", prompt);
             messages.add(userMessage);
 
-            // 深度思考内容占token较多，关闭深度思考功能,参数设为false
             Map<String, Object> deepThinkType = new HashMap<>();
-            deepThinkType.put("enable_thinking", false);
+            deepThinkType.put("enable_thinking", properties.isEnableThinking());
 
             Map<String, Object> req = new HashMap<>();
-            req.put("model", modelName);
+            req.put("model", properties.getModel());
             req.put("chat_template_kwargs", deepThinkType);
             req.put("messages", messages);
 
             return queryLLM(req);
 
         } catch (Exception e) {
-            throw new MyException("调用 LLM 失败");
+            throw new MyException("调用 LLM 失败", e);
         }
     }
 
 
     public String queryLLM(Map<String, Object> req) {
-        HttpEntity<String> requestEntity = new HttpEntity<>(JSONObject.toJSONString(req), headers);
-        String res = "";
+        String requestJson = JSONObject.toJSONString(req);
         try {
-            ResponseEntity<JSONObject> response = restTemplate.exchange(apiUrl, HttpMethod.POST, requestEntity, JSONObject.class);
-            JSONObject responseBody = response.getBody();
-            if (responseBody != null) {
-                res = responseBody.toJSONString();
-            }
+            // 公开入口仍原样发送调用方请求，不补写或覆盖 model/messages 等参数。
+            return llmClient.chat(ChatRequest.forRawResponse("document-generation", requestJson)).getRawResponse();
         } catch (Exception e) {
-            log.error("文档大模型调用异常：{}", e);
-            throw new MyException("文档大模型调用异常");
+            throw new MyException("文档大模型调用异常", e);
         }
-
-        return res;
     }
 }

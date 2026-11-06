@@ -138,7 +138,7 @@ public class AgentLoop {
             } catch (Exception e) {
                 if (testGenerationEnabled && context.getPhase() == AgentPhase.REPAIR) {
                     log.warn("S2流程 flow={} round={} 修复计划被拒绝，本计划未执行 reason={}",
-                            context.getVariables().get("s2_flow_id"), repairRounds, concise(failureMessage(e), 1200));
+                            context.getVariables().get("s2_flow_id"), repairRounds, logDiagnostic(failureMessage(e), 1200));
                 }
                 // HTTP/额度/鉴权/网络错误不由外层重试，避免与客户端重试相乘。
                 if (isModelFailure(e) || ++planningFailures >= 3
@@ -151,7 +151,9 @@ public class AgentLoop {
                 }
                 context.getVerifyErrors().removeIf(error -> error.startsWith("上一计划被拒绝"));
                 context.getVerifyErrors().add("上一计划被拒绝，请修正后重试: " + e.getMessage());
-                log.warn("plan rejected attempt={} error={}", planningFailures, e.getMessage());
+                if (!testGenerationEnabled || context.getPhase() != AgentPhase.REPAIR) {
+                    log.warn("plan rejected attempt={} error={}", planningFailures, logDiagnostic(failureMessage(e), 800));
+                }
                 continue;
             }
             if (isEmptyPlan(plan)) {
@@ -263,7 +265,7 @@ public class AgentLoop {
                         + "。本轮已成功的修改保留，失败后的步骤未执行；先读取最新文件并修正失败步骤，不能重复套用已成功的补丁。");
                 log.warn("S2流程 flow={} round={} 修复执行未完成 changed={}，保留修改并继续修复，不进入复测 reason={}",
                         context.getVariables().get("s2_flow_id"), repairRounds, wrote,
-                        concise(failureSignature(results), 1200));
+                        logDiagnostic(failureSignature(results), 1200));
                 continue;
             }
             if (current == AgentPhase.CODING && context.getCodingTrack() == CodingTrack.S2_TEST) {
@@ -347,10 +349,10 @@ public class AgentLoop {
         if (testGenerationEnabled) {
             log.warn("S2流程 flow={} agentId={} round={} 停止，尚未通过验证 reason={}",
                     context.getVariables().get("s2_flow_id"), context.getAgentId(),
-                    context.getVariables().get("s2_repair_round"), concise(reason, 1600));
+                    context.getVariables().get("s2_repair_round"), logDiagnostic(reason, 1600));
         }
         log.warn("agent stopped agentId={} modelCalls={} reason={}",
-                context.getAgentId(), context.getModelCalls(), reason);
+                context.getAgentId(), context.getModelCalls(), logDiagnostic(reason, 1600));
     }
 
     /**
@@ -573,13 +575,22 @@ public class AgentLoop {
         }
         context.getVariables().put("verify_result", verifyResult);
         if (testGenerationEnabled) {
-            log.info("S2流程 flow={} round={} attempt={} {} stage={} blocked={} exit={} executed={} passed={} failed={} skipped={} reports={} diagnosis={}",
+            log.info("S2流程 flow={} round={} attempt={} {} stage={} blocked={} exit={} executed={} passed={} failed={} skipped={} reports={} problems={} failedFiles={}",
                     context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"), attempt,
                     verifyResult.isSuccess() ? "验证通过，S2流程完成" : "发现问题",
                     verifyResult.getStage(), verifyResult.isBlocked(), verifyResult.getTestExitCode(),
                     verifyResult.getTestsRun(), Math.max(0, verifyResult.getTestsRun() - verifyResult.getFailedTests()),
                     verifyResult.getFailedTests(), verifyResult.getSkipped(), verifyResult.getReports().size(),
-                    concise(String.join(" | ", verifyResult.getErrors()), 1600));
+                    verifyResult.getErrors().size(), verifyResult.getFailedFiles());
+            List<String> diagnostics = verifyResult.getErrors().stream()
+                    .flatMap(error -> java.util.Arrays.stream(error.split("\\R")))
+                    .filter(error -> !error.trim().isEmpty()).limit(32).collect(Collectors.toList());
+            for (int index = 0; index < diagnostics.size(); index++) {
+                log.warn("S2流程 flow={} round={} attempt={} 测试诊断 index={}/{} stage={} detail={}",
+                        context.getVariables().get("s2_flow_id"), context.getVariables().get("s2_repair_round"),
+                        attempt, index + 1, diagnostics.size(), verifyResult.getStage(),
+                        logDiagnostic(diagnostics.get(index), 800));
+            }
         }
         if (verifyResult.isSuccess()) {
             context.getVerifyErrors().clear();
@@ -618,8 +629,11 @@ public class AgentLoop {
             }
         }
 
-        log.warn("verify failed errors={} testExecuted={} testPassed={}",
-                verifyResult.getErrors(), verifyResult.isTestExecuted(), verifyResult.isTestPassed());
+        if (!testGenerationEnabled) {
+            log.warn("verify failed errors={} testExecuted={} testPassed={}",
+                    logDiagnostic(String.join(" | ", verifyResult.getErrors()), 1600),
+                    verifyResult.isTestExecuted(), verifyResult.isTestPassed());
+        }
         return false;
     }
 
@@ -632,10 +646,26 @@ public class AgentLoop {
         return line.length() > limit ? line.substring(0, limit) + "…" : line;
     }
 
+    private String logDiagnostic(String value, int limit) {
+        if (value == null) {
+            return "无";
+        }
+        String line = value;
+        // 补丁拒绝的完整源码仍交给模型，运行日志只保留原因和定位。
+        for (String marker : java.util.Arrays.asList("\n冲突线索：", "\n唯一性冲突：", "\n前序 oldText:",
+                "\n前序 newText:", "\n失败的 oldText:", "\n文件在本步骤之前", "源码: ", "oldText=")) {
+            int position = line.indexOf(marker);
+            if (position >= 0) {
+                line = line.substring(0, position);
+            }
+        }
+        return concise(line, limit);
+    }
+
     private String repairPlanSummary(CodePlan plan) {
         return plan.getSteps().stream().limit(12).map(step -> step.getTool()
-                + "(" + concise(extractPathFromInput(step.getInput()), 180) + ") "
-                + concise(step.getDescription(), 180)).collect(Collectors.joining("; "));
+                + "(" + concise(extractPathFromInput(step.getInput()), 180) + ")")
+                .collect(Collectors.joining("; "));
     }
 
     private boolean isEmptyPlan(CodePlan plan) {

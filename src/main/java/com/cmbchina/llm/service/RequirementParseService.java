@@ -1,21 +1,16 @@
 package com.cmbchina.llm.service;
 
 import com.alibaba.fastjson.JSONObject;
+import com.cmbchina.llm.config.ChatModelProperties;
 import com.cmbchina.llm.entity.model.RequirementDoc;
+import com.cmbchina.llm.llm.ChatRequest;
+import com.cmbchina.llm.llm.LlmClient;
 import com.cmbchina.llm.transformer.DocContentParser;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
 
-import javax.annotation.PostConstruct;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -33,26 +28,13 @@ import java.util.Map;
 public class RequirementParseService {
 
     @Autowired
-    private RestTemplate restTemplate;
+    private LlmClient llmClient;
 
-    @Value("${docllm.api.url}")
-    private String llmUrl;
+    @Autowired
+    private ChatModelProperties properties;
 
-    @Value("${docllm.api.key}")
-    private String llmApikey;
-
-    @Value("${docllm.api.model:qwen-plus}")
-    private String modelName;
-
-    private HttpHeaders headers = new HttpHeaders();
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final DocContentParser parser = new DocContentParser();
-
-    @PostConstruct
-    public void init() {
-        headers.setContentType(MediaType.parseMediaType("application/json;charset=utf-8"));
-        headers.set("Authorization", "Bearer " + llmApikey);
-    }
 
     /**
      * 解析MD需求文档
@@ -178,9 +160,8 @@ public class RequirementParseService {
         try {
             List<Map<String, Object>> messages = new ArrayList<>();
             String prompt = buildParsePrompt(mdContent);
-            // 深度思考内容占token较多，关闭深度思考功能,参数设为false
             Map<String, Object> deepThinkType = new HashMap<>();
-            deepThinkType.put("enable_thinking", false);
+            deepThinkType.put("enable_thinking", properties.isEnableThinking());
 
             Map<String, Object> userMessage = new HashMap<>();
             userMessage.put("role", "user");
@@ -188,14 +169,12 @@ public class RequirementParseService {
             messages.add(userMessage);
 
             Map<String, Object> req = new HashMap<>();
-            req.put("model", modelName);
+            req.put("model", properties.getModel());
             req.put("chat_template_kwargs", deepThinkType);
             req.put("messages", messages);
 
-            HttpEntity<String> requestEntity = new HttpEntity<>(JSONObject.toJSONString(req), headers);
-            ResponseEntity<JSONObject> response = restTemplate.exchange(llmUrl, HttpMethod.POST, requestEntity, JSONObject.class);
-
-            return response.getBody();
+            return llmClient.chat(ChatRequest.forRawResponse(
+                    "requirement-parsing", JSONObject.toJSONString(req))).getResponseBody();
 
         } catch (Exception e) {
             log.error("调用大模型异常：{}", e);

@@ -106,19 +106,27 @@ public class TestSourceInspector {
                                  Map<String, String> relatedSources) {
         List<String> errors = new ArrayList<>();
         CompilationUnit unit = parse(source);
+        Set<String> cachedConfigurationGetters = new HashSet<>();
         validateReflectionResultTypes(unit, errors);
         if (businessSource != null) {
             CompilationUnit business = parse(businessSource);
             validateReflectiveFieldWrites(unit, business, sourceClass, errors);
             validateCachedHttpClientFixture(unit, business, sourceClass, errors);
+            validateSpringInitializationOrder(unit, business, sourceClass, errors);
+            validateLombokToStringAssertions(unit, business, errors);
+            collectCachedConfigurationGetters(business, cachedConfigurationGetters);
         }
-        relatedSources.forEach((owner, content) ->
-                validateReflectiveFieldWrites(unit, parse(content), owner, errors));
+        relatedSources.forEach((owner, content) -> {
+            CompilationUnit related = parse(content);
+            validateReflectiveFieldWrites(unit, related, owner, errors);
+            validateSpringInitializationOrder(unit, related, owner, errors);
+            collectCachedConfigurationGetters(related, cachedConfigurationGetters);
+        });
         validateHttpClientMocks(unit, errors);
         validateHttpClientReferences(unit, errors);
         validateHttpExecuteMatchers(unit, errors);
         validateHttpMockLifetime(unit, errors);
-        validateHttpPoolConfiguration(unit, errors);
+        validateHttpPoolConfiguration(unit, cachedConfigurationGetters, errors);
         validateReflectiveHttpInitialization(unit, errors);
         TestLifecycleInspector.validate(unit, errors);
         unit.findAll(MethodCallExpr.class).stream().filter(call -> isImpossibleBooleanStringAssertion(unit, call))
@@ -163,12 +171,131 @@ public class TestSourceInspector {
                 errors.add("测试方法为空: " + method.getNameAsString());
             } else if (assertionCount(unit, method) == 0) {
                 errors.add("测试方法缺少有效断言或交互验证: " + method.getNameAsString());
+            } else if (method.findAll(MethodCallExpr.class).stream().filter(call -> isEffectiveAssertion(unit, call))
+                    .allMatch(call -> isConstructionNotNull(method, call))) {
+                errors.add("测试仅验证直接 new 的对象非空，未验证业务行为: " + method.getNameAsString()
+                        + "；保留已有断言，补充初始化后的状态、配置值或真实依赖交互验证，不删除测试。");
             }
+            validateScoreAssertion(unit, method, errors);
         }
         if (tests == 0) {
             errors.add("缺少可执行的 JUnit4/5 测试方法，不支持用空壳或其他框架绕过");
         }
         return errors;
+    }
+
+    /** 仅检查直接可见的共享初始化顺序，辅助夹具和类级初始化仍由实际执行验证。 */
+    private void validateSpringInitializationOrder(CompilationUnit unit, CompilationUnit business,
+                                                   String owner, List<String> errors) {
+        boolean springFields = business.findAll(FieldDeclaration.class).stream().filter(FieldDeclaration::isStatic)
+                .flatMap(field -> field.getVariables().stream()).anyMatch(variable -> variable.getInitializer()
+                        .map(value -> value.toString().contains("SpringContextBeanUtil.getApplicationContext()"))
+                        .orElse(false));
+        if (!springFields || unit.findAll(ClassOrInterfaceDeclaration.class).stream()
+                .anyMatch(type -> !type.getExtendedTypes().isEmpty())
+                || unit.findAll(AnnotationExpr.class).stream().anyMatch(annotation -> java.util.Arrays.asList(
+                "BeforeAll", "BeforeClass", "SpringBootTest", "ContextConfiguration")
+                .contains(annotation.getName().getIdentifier()))) {
+            return;
+        }
+        String qualified = business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("") + owner;
+        Set<String> mutableStatics = business.findAll(FieldDeclaration.class).stream()
+                .filter(field -> field.isStatic() && !field.isFinal()).flatMap(field -> field.getVariables().stream())
+                .map(variable -> variable.getNameAsString()).collect(java.util.stream.Collectors.toSet());
+        for (MethodDeclaration setup : unit.findAll(MethodDeclaration.class)) {
+            if (setup.getAnnotations().stream().noneMatch(annotation -> java.util.Arrays.asList("BeforeEach", "Before")
+                    .contains(annotation.getName().getIdentifier())) || !setup.getBody().isPresent()) {
+                continue;
+            }
+            boolean helper = setup.findAll(MethodCallExpr.class).stream().anyMatch(call -> !call.getScope().isPresent()
+                    && unit.findAll(MethodDeclaration.class).stream().anyMatch(method -> method != setup
+                    && method.getNameAsString().equals(call.getNameAsString())));
+            if (helper) {
+                continue;
+            }
+            int firstUse = Integer.MAX_VALUE;
+            int prepared = Integer.MAX_VALUE;
+            for (int index = 0; index < setup.getBody().get().getStatements().size(); index++) {
+                com.github.javaparser.ast.stmt.Statement statement = setup.getBody().get().getStatement(index);
+                if (!statement.isExpressionStmt()) {
+                    continue;
+                }
+                boolean use = statement.findAll(com.github.javaparser.ast.expr.FieldAccessExpr.class).stream()
+                        .anyMatch(field -> matchesType(unit, field.getScope().toString(), qualified)
+                                && mutableStatics.contains(field.getNameAsString()));
+                use |= statement.findAll(com.github.javaparser.ast.expr.ObjectCreationExpr.class).stream()
+                        .anyMatch(creation -> matchesType(unit, creation.getType().asString(), qualified));
+                use |= statement.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                        call.getScope().map(scope -> matchesType(unit, scope.toString(), qualified)).orElse(false));
+                if (use) {
+                    firstUse = Math.min(firstUse, index);
+                }
+                boolean contextReady = statement.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                        call.getNameAsString().equals("thenReturn") && call.getArguments().size() == 1
+                                && !call.getArgument(0).isNullLiteralExpr() && call.getScope().map(scope ->
+                                scope.findAll(com.github.javaparser.ast.expr.MethodReferenceExpr.class).stream()
+                                        .anyMatch(reference -> reference.getIdentifier().equals("getApplicationContext")
+                                                && reference.getScope().toString().endsWith("SpringContextBeanUtil"))
+                                || scope.findAll(MethodCallExpr.class).stream().anyMatch(getter ->
+                                getter.getNameAsString().equals("getApplicationContext") && getter.getScope()
+                                        .map(receiver -> receiver.toString().endsWith("SpringContextBeanUtil")).orElse(false)))
+                                .orElse(false));
+                if (contextReady) {
+                    prepared = Math.min(prepared, index);
+                }
+            }
+            if (firstUse != Integer.MAX_VALUE && prepared != Integer.MAX_VALUE && firstUse < prepared) {
+                errors.add("Spring 静态初始化顺序错误: " + owner + " 在 " + setup.getNameAsString()
+                        + " 中先被主动使用，之后才准备 getApplicationContext 桩；保存原静态字段也会触发类初始化。"
+                        + "先准备配置/追踪 Bean、注册 SpringContextBeanUtil 静态 Mock 并返回有效上下文，再读取或注入业务静态字段；"
+                        + "保留状态恢复与 Mock 清理，不改生产 static/final。");
+            }
+        }
+    }
+
+    public boolean requiresInlineMocking(String source) {
+        CompilationUnit unit = parse(source);
+        return unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                isMockitoCall(unit, call, "mockStatic") || isMockitoCall(unit, call, "mockConstruction")
+                        || isMockitoCall(unit, call, "mockConstructionWithAnswer"));
+    }
+
+    private boolean isConstructionNotNull(MethodDeclaration method, MethodCallExpr call) {
+        return call.getNameAsString().equals("assertNotNull") && call.getArguments().size() == 1
+                && call.getArgument(0).isNameExpr()
+                && method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream().anyMatch(variable ->
+                variable.getNameAsString().equals(call.getArgument(0).asNameExpr().getNameAsString())
+                        && variable.getInitializer().filter(Expression::isObjectCreationExpr).isPresent())
+                && method.findAll(com.github.javaparser.ast.expr.AssignExpr.class).stream().noneMatch(assignment ->
+                assignment.getTarget().equals(call.getArgument(0)));
+    }
+
+    /** 固定评分夹具不能仅验证写回类型；保留原验证，再增加精确值或捕获值断言。 */
+    private void validateScoreAssertion(CompilationUnit unit, MethodDeclaration method, List<String> errors) {
+        boolean fixedScore = method.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                call.getNameAsString().equals("addProperty") && call.getArguments().size() == 2
+                        && call.getArgument(0).isStringLiteralExpr()
+                        && call.getArgument(0).asStringLiteralExpr().asString().equals("predict_rescale_score")
+                        && (call.getArgument(1).isDoubleLiteralExpr() || call.getArgument(1).isIntegerLiteralExpr()));
+        if (!fixedScore) {
+            return;
+        }
+        List<MethodCallExpr> checks = method.findAll(MethodCallExpr.class).stream().filter(call ->
+                call.getNameAsString().equals("putDataAndOriginData") && call.getArguments().size() == 2
+                        && call.getArgument(0).toString().contains("\"predict_rescale_score\"")
+                        && call.getScope().filter(Expression::isMethodCallExpr)
+                        .map(scope -> isMockitoCall(unit, scope.asMethodCallExpr(), "verify")).orElse(false))
+                .collect(java.util.stream.Collectors.toList());
+        if (!checks.isEmpty() && checks.stream().allMatch(call -> call.getArgument(1).isMethodCallExpr()
+                && call.getArgument(1).asMethodCallExpr().getNameAsString().equals("any")
+                && call.getArgument(1).asMethodCallExpr().getArguments().size() == 1
+                && call.getArgument(1).asMethodCallExpr().getArgument(0).isClassExpr()
+                && matchesType(unit, call.getArgument(1).asMethodCallExpr().getArgument(0)
+                .asClassExpr().getType().asString(), "java.math.BigDecimal"))) {
+            errors.add("固定评分夹具仅验证 BigDecimal 类型: " + method.getNameAsString()
+                    + "；保留已有 verify，再补同一写回的 eq(按真实 Float/BigDecimal 转换构造的期望值)，"
+                    + "或增加 ArgumentCaptor 捕获及具体值断言；不得改生产转换或删除原断言。");
+        }
     }
 
     /** 仅在本次编译明确点名缺失 API 后检查，避免把当前依赖版本的缺口泛化到所有工程。 */
@@ -639,8 +766,24 @@ public class TestSourceInspector {
         }
     }
 
-    /** 检查共享 setup 的连接池夹具；方法内刻意验证非法值的测试不在此处拦截。 */
-    private void validateHttpPoolConfiguration(CompilationUnit unit, List<String> errors) {
+    /** 只收集真实源码中直接由 ReadConfig getter 初始化的已知 final 请求地址。 */
+    private void collectCachedConfigurationGetters(CompilationUnit business, Set<String> getters) {
+        Set<String> configurations = business.findAll(FieldDeclaration.class).stream()
+                .flatMap(field -> field.getVariables().stream())
+                .filter(variable -> variable.getType().isClassOrInterfaceType()
+                        && variable.getType().asClassOrInterfaceType().getNameAsString().equals("ReadConfig"))
+                .map(variable -> variable.getNameAsString()).collect(java.util.stream.Collectors.toSet());
+        business.findAll(FieldDeclaration.class).stream().filter(field -> field.isStatic() && field.isFinal())
+                .flatMap(field -> field.getVariables().stream()).forEach(variable -> variable.getInitializer()
+                .filter(Expression::isMethodCallExpr).map(Expression::asMethodCallExpr)
+                .filter(call -> call.getNameAsString().equals("getAhiHttpBusinessUrl") && call.getArguments().isEmpty()
+                        && call.getScope().map(scope -> configurations.contains(scope.toString())).orElse(false))
+                .ifPresent(call -> getters.add(call.getNameAsString())));
+    }
+
+    /** 检查共享 setup 的连接池及真实静态地址夹具，方法内的非法配置用例不在此处拦截。 */
+    private void validateHttpPoolConfiguration(CompilationUnit unit, Set<String> cachedConfigurationGetters,
+                                                List<String> errors) {
         java.util.Set<String> configurations = new java.util.HashSet<>();
         for (com.github.javaparser.ast.body.VariableDeclarator variable :
                 unit.findAll(com.github.javaparser.ast.body.VariableDeclarator.class)) {
@@ -655,7 +798,7 @@ public class TestSourceInspector {
                             || annotation.getName().getIdentifier().equals("Before"))) {
                 continue;
             }
-            validateUnconfiguredPoolMock(unit, method, configurations, errors);
+            validateUnconfiguredPoolMock(unit, method, configurations, cachedConfigurationGetters, errors);
             for (MethodCallExpr call : method.findAll(MethodCallExpr.class)) {
                 if (!call.getNameAsString().equals("thenReturn") || call.getArguments().isEmpty()
                         || !call.getScope().isPresent() || !call.getScope().get().isMethodCallExpr()) {
@@ -667,13 +810,24 @@ public class TestSourceInspector {
                     continue;
                 }
                 MethodCallExpr getter = stub.getArgument(0).asMethodCallExpr();
-                if (!(getter.getNameAsString().equals("getHttpMaxtotalConnections")
-                        || getter.getNameAsString().equals("getHttpMaxperrouteConnections"))
-                        || !getter.getScope().isPresent()
+                if (!getter.getScope().isPresent()
                         || !configurations.contains(getter.getScope().get().toString())) {
                     continue;
                 }
                 com.github.javaparser.ast.expr.Expression value = call.getArgument(0);
+                if (cachedConfigurationGetters.contains(getter.getNameAsString())) {
+                    if (value.isNullLiteralExpr() || value.isStringLiteralExpr()
+                            && value.asStringLiteralExpr().asString().trim().isEmpty()) {
+                        errors.add("共享初始化中的 " + getter.getNameAsString()
+                                + " 明确返回空地址，真实 Handler 的 static final REQUEST_URL 会永久缓存该值。"
+                                + "首次构造器 Mock 前配置有效测试地址，复用已有 Handler 测试的 URL，不反射写 final。");
+                    }
+                    continue;
+                }
+                if (!(getter.getNameAsString().equals("getHttpMaxtotalConnections")
+                        || getter.getNameAsString().equals("getHttpMaxperrouteConnections"))) {
+                    continue;
+                }
                 boolean negative = value.isUnaryExpr() && value.asUnaryExpr().getOperator()
                         == com.github.javaparser.ast.expr.UnaryExpr.Operator.MINUS
                         && value.asUnaryExpr().getExpression().isIntegerLiteralExpr();
@@ -689,7 +843,14 @@ public class TestSourceInspector {
 
     /** 对可直接证明的普通 Mock 默认0给出前置反馈；自定义 Answer、辅助夹具或连接池隔离留给运行验证。 */
     private void validateUnconfiguredPoolMock(CompilationUnit unit, MethodDeclaration setup,
-                                              java.util.Set<String> configurations, List<String> errors) {
+                                              java.util.Set<String> configurations, Set<String> cachedConfigurationGetters,
+                                              List<String> errors) {
+        if (unit.findAll(ClassOrInterfaceDeclaration.class).stream().anyMatch(type -> !type.getExtendedTypes().isEmpty())
+                || unit.findAll(AnnotationExpr.class).stream().anyMatch(annotation -> java.util.Arrays.asList(
+                "BeforeAll", "BeforeClass", "SpringBootTest", "ContextConfiguration")
+                .contains(annotation.getName().getIdentifier()))) {
+            return;
+        }
         boolean http = unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
                 call.getNameAsString().equals("mockConstruction") && !call.getArguments().isEmpty()
                         && call.getArgument(0).isClassExpr()
@@ -700,7 +861,10 @@ public class TestSourceInspector {
                 call.getNameAsString().startsWith("mockConstruction") && !call.getArguments().isEmpty()
                         && call.getArgument(0).isClassExpr()
                         && call.getArgument(0).asClassExpr().getType().asString().endsWith("PoolingHttpClientConnectionManager"));
-        boolean helper = setup.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+        // catch 中的 tearDown 只在失败路径清理资源，不代表正常路径已通过辅助方法准备容量。
+        boolean helper = setup.findAll(MethodCallExpr.class).stream()
+                .filter(call -> !call.findAncestor(com.github.javaparser.ast.stmt.CatchClause.class).isPresent())
+                .anyMatch(call ->
                 unit.getTypes().stream().flatMap(type -> type.getMethods().stream())
                         .anyMatch(method -> !method.equals(setup) && method.getNameAsString().equals(call.getNameAsString()))
                         || call.getScope().map(scope -> scope.isSuperExpr()).orElse(false)
@@ -725,17 +889,29 @@ public class TestSourceInspector {
                                     && getter.getArgument(0).asClassExpr().getType().isClassOrInterfaceType()
                                     && getter.getArgument(0).asClassExpr().getType().asClassOrInterfaceType()
                                     .getNameAsString().equals("ReadConfig"))).orElse(false));
-            boolean indirectSetup = setup.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+            boolean indirectSetup = setup.findAll(MethodCallExpr.class).stream()
+                    .filter(call -> !call.findAncestor(com.github.javaparser.ast.stmt.CatchClause.class).isPresent())
+                    .anyMatch(call ->
                     !call.getNameAsString().equals("thenReturn")
                             && call.getArguments().stream().anyMatch(argument -> argument.toString().equals(configuration)));
             if (!plainMock || !bean || indirectSetup) {
                 continue;
             }
-            for (String getter : java.util.Arrays.asList("getHttpMaxtotalConnections", "getHttpMaxperrouteConnections")) {
-                boolean configured = unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
-                        call.getNameAsString().equals(getter) && call.getScope()
-                                .map(scope -> scope.toString().equals(configuration)).orElse(false));
+            List<String> requiredGetters = new ArrayList<>(java.util.Arrays.asList(
+                    "getHttpMaxtotalConnections", "getHttpMaxperrouteConnections"));
+            requiredGetters.addAll(cachedConfigurationGetters);
+            for (String getter : requiredGetters) {
+                boolean configured = setup.findAll(MethodCallExpr.class).stream()
+                        .filter(call -> !call.findAncestor(com.github.javaparser.ast.stmt.CatchClause.class).isPresent())
+                        .anyMatch(call -> isPoolConfigurationStub(unit, call, configuration, getter));
                 if (!configured) {
+                    if (cachedConfigurationGetters.contains(getter)) {
+                        errors.add("普通 ReadConfig Mock " + configuration + " 未配置 " + getter
+                                + "，默认 null 会在首次 mockConstruction(AhiHttpInvokerHandler.class) 时固化到"
+                                + "真实源码的 static final REQUEST_URL。正常 setup 中先配置有效地址，"
+                                + "复用本任务已有 Handler 测试 URL 或完整配置夹具，不修改生产 final。");
+                        continue;
+                    }
                     errors.add("普通 ReadConfig Mock " + configuration + " 已作为 Spring Bean 返回，但未配置 "
                             + getter + "，其默认返回0；mockConstruction(AhiHttpInvokerHandler.class) 仍会触发"
                             + "静态 HttpClientUtil 的真实连接池初始化。首次使用前为两个连接池容量设置正数，"
@@ -743,6 +919,22 @@ public class TestSourceInspector {
                 }
             }
         }
+    }
+
+    private boolean isPoolConfigurationStub(CompilationUnit unit, MethodCallExpr call,
+                                              String configuration, String getter) {
+        if (!call.getNameAsString().equals("thenReturn") || call.getArguments().isEmpty()
+                || !call.getScope().filter(Expression::isMethodCallExpr).isPresent()) {
+            return false;
+        }
+        MethodCallExpr stub = call.getScope().get().asMethodCallExpr();
+        if (!isMockitoCall(unit, stub, "when") || stub.getArguments().size() != 1
+                || !stub.getArgument(0).isMethodCallExpr()) {
+            return false;
+        }
+        MethodCallExpr read = stub.getArgument(0).asMethodCallExpr();
+        return read.getNameAsString().equals(getter) && read.getArguments().isEmpty()
+                && read.getScope().map(scope -> scope.toString().equals(configuration)).orElse(false);
     }
 
     private boolean isPlainConfigMock(com.github.javaparser.ast.expr.Expression expression) {
@@ -832,6 +1024,7 @@ public class TestSourceInspector {
         CompilationUnit next = parse(after);
         normalizePrivateFieldAssertions(previous, next, businessSource, testClass, verifyErrors);
         normalizeRequestJsonAssertions(previous, next, businessSource, jsonProperties);
+        normalizeLombokToStringAssertions(previous, next, parse(businessSource));
         normalizeDisabledConstructionAssertions(previous, next, parse(businessSource));
         normalizeHttpExecuteMatchers(previous, next, parse(businessSource));
         Map<String, Integer> previousCounts = assertionCounts(previous);
@@ -1070,6 +1263,166 @@ public class TestSourceInspector {
                 || !call.getScope().isPresent() && unit.getImports().stream().anyMatch(declaration ->
                 declaration.isStatic() && (declaration.getNameAsString().equals("org.mockito.Mockito." + name)
                         || declaration.isAsterisk() && declaration.getNameAsString().equals("org.mockito.Mockito"))));
+    }
+
+    /** Jackson 协议键不决定 Lombok 的调试文本；只检查直接可证明的实体局部变量。 */
+    private void validateLombokToStringAssertions(CompilationUnit unit, CompilationUnit business, List<String> errors) {
+        Map<String, String> properties = lombokToStringProperties(business);
+        if (properties.isEmpty()) {
+            return;
+        }
+        for (MethodDeclaration method : unit.findAll(MethodDeclaration.class)) {
+            if (!isTest(unit, method)) {
+                continue;
+            }
+            for (MethodCallExpr assertion : method.findAll(MethodCallExpr.class)) {
+                String field = correctedLombokToStringField(unit, method, assertion, business, properties);
+                if (field != null) {
+                    errors.add("Lombok toString 字段名错误: " + method.getNameAsString()
+                            + "；@JsonProperty 只影响 JSON 序列化，默认 toString 使用 Java 字段名 " + field
+                            + "。保留该 assertTrue、原对象及 contains，仅将此处协议键改为真实 Java 字段名；"
+                            + "其它 JSON 断言仍使用协议键，不改生产注解或 toString。");
+                }
+            }
+        }
+    }
+
+    /** 只归一化完全相同断言中的字段名纠正，断言数量、接收者和其它表达式仍受原保护。 */
+    private void normalizeLombokToStringAssertions(CompilationUnit previous, CompilationUnit next,
+                                                   CompilationUnit business) {
+        Map<String, String> properties = lombokToStringProperties(business);
+        if (properties.isEmpty()) {
+            return;
+        }
+        for (MethodDeclaration method : previous.findAll(MethodDeclaration.class)) {
+            if (!isTest(previous, method)) {
+                continue;
+            }
+            for (MethodCallExpr assertion : method.findAll(MethodCallExpr.class)) {
+                String field = correctedLombokToStringField(previous, method, assertion, business, properties);
+                if (field == null) {
+                    continue;
+                }
+                MethodCallExpr corrected = assertion.clone();
+                corrected.getArgument(0).asMethodCallExpr().setArgument(0,
+                        new com.github.javaparser.ast.expr.StringLiteralExpr(field));
+                next.findAll(MethodDeclaration.class).stream()
+                        .filter(candidate -> candidate.getSignature().equals(method.getSignature()) && isTest(next, candidate))
+                        .flatMap(candidate -> candidate.findAll(MethodCallExpr.class).stream())
+                        .filter(candidate -> isJupiterAssertion(next, candidate, "assertTrue") && candidate.equals(corrected))
+                        .forEach(candidate -> candidate.setArgument(0, assertion.getArgument(0).clone()));
+            }
+        }
+    }
+
+    private Map<String, String> lombokToStringProperties(CompilationUnit business) {
+        Map<String, String> properties = new LinkedHashMap<>();
+        if (business.getTypes().size() != 1 || !business.getType(0).isClassOrInterfaceDeclaration()) {
+            return properties;
+        }
+        ClassOrInterfaceDeclaration type = business.getType(0).asClassOrInterfaceDeclaration();
+        boolean generated = type.getAnnotations().stream().anyMatch(annotation ->
+                matchesType(business, annotation.getNameAsString(), "lombok.Data")
+                        || matchesType(business, annotation.getNameAsString(), "lombok.ToString"));
+        boolean customized = type.findAll(AnnotationExpr.class).stream().anyMatch(annotation ->
+                matchesType(business, annotation.getNameAsString(), "lombok.ToString") && !annotation.isMarkerAnnotationExpr()
+                        || annotation.getNameAsString().contains("ToString.")
+                        || matchesType(business, annotation.getNameAsString(), "lombok.ToString.Include")
+                        || matchesType(business, annotation.getNameAsString(), "lombok.ToString.Exclude"));
+        if (!generated || customized || !type.getExtendedTypes().isEmpty()
+                || type.getMethods().stream().anyMatch(method -> method.getNameAsString().equals("toString")
+                && method.getParameters().isEmpty())) {
+            return properties;
+        }
+        for (FieldDeclaration field : type.getFields()) {
+            if (field.isStatic() || field.isTransient() || field.getVariables().size() != 1) {
+                continue;
+            }
+            for (AnnotationExpr annotation : field.getAnnotations()) {
+                if (!matchesType(business, annotation.getNameAsString(), "com.fasterxml.jackson.annotation.JsonProperty")) {
+                    continue;
+                }
+                Expression value = annotation.isSingleMemberAnnotationExpr()
+                        ? annotation.asSingleMemberAnnotationExpr().getMemberValue()
+                        : annotation.isNormalAnnotationExpr() ? annotation.asNormalAnnotationExpr().getPairs().stream()
+                        .filter(pair -> pair.getNameAsString().equals("value")).map(pair -> pair.getValue())
+                        .findFirst().orElse(null) : null;
+                if (value == null || !value.isStringLiteralExpr()) {
+                    continue;
+                }
+                String property = value.asStringLiteralExpr().asString();
+                String name = field.getVariable(0).getNameAsString();
+                if (!property.isEmpty() && !property.equals(name) && !name.startsWith("$")) {
+                    if (properties.containsKey(property)) {
+                        return java.util.Collections.emptyMap();
+                    }
+                    properties.put(property, name);
+                }
+            }
+        }
+        return properties;
+    }
+
+    private String correctedLombokToStringField(CompilationUnit unit, MethodDeclaration method,
+                                                MethodCallExpr assertion, CompilationUnit business,
+                                                Map<String, String> properties) {
+        if (!isJupiterAssertion(unit, assertion, "assertTrue") || assertion.getArguments().size() != 1
+                || !assertion.getArgument(0).isMethodCallExpr()) {
+            return null;
+        }
+        MethodCallExpr contains = assertion.getArgument(0).asMethodCallExpr();
+        if (!contains.getNameAsString().equals("contains") || contains.getArguments().size() != 1
+                || !contains.getArgument(0).isStringLiteralExpr()
+                || !contains.getScope().filter(Expression::isMethodCallExpr).isPresent()) {
+            return null;
+        }
+        String field = properties.get(contains.getArgument(0).asStringLiteralExpr().asString());
+        MethodCallExpr text = contains.getScope().get().asMethodCallExpr();
+        if (field == null || !text.getNameAsString().equals("toString") || !text.getArguments().isEmpty()
+                || !text.getScope().filter(Expression::isNameExpr).isPresent()) {
+            return null;
+        }
+        String receiver = text.getScope().get().asNameExpr().getNameAsString();
+        String owner = business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("")
+                + business.getType(0).getNameAsString();
+        List<com.github.javaparser.ast.body.VariableDeclarator> variables = method
+                .findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                .filter(variable -> variable.getNameAsString().equals(receiver))
+                .collect(java.util.stream.Collectors.toList());
+        if (variables.size() != 1 || !matchesType(unit, variables.get(0).getType().asString(), owner)
+                || method.findAll(com.github.javaparser.ast.expr.AssignExpr.class).stream()
+                .anyMatch(assignment -> assignment.getTarget().toString().equals(receiver))) {
+            return null;
+        }
+        boolean knownInstance = variables.get(0).getInitializer().map(initializer -> {
+            if (initializer.isObjectCreationExpr()) {
+                return matchesType(unit, initializer.asObjectCreationExpr().getType().asString(), owner)
+                        && !initializer.asObjectCreationExpr().getAnonymousClassBody().isPresent();
+            }
+            if (!initializer.isMethodCallExpr()) {
+                return false;
+            }
+            MethodCallExpr read = initializer.asMethodCallExpr();
+            if (!read.getNameAsString().equals("readValue") || read.getArguments().size() != 2
+                    || !read.getArgument(1).isClassExpr()
+                    || !matchesType(unit, read.getArgument(1).asClassExpr().getType().asString(), owner)
+                    || !read.getScope().filter(Expression::isNameExpr).isPresent()) {
+                return false;
+            }
+            String mapper = read.getScope().get().asNameExpr().getNameAsString();
+            List<String> mapperTypes = method.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                    .filter(variable -> variable.getNameAsString().equals(mapper))
+                    .map(variable -> variable.getType().asString()).collect(java.util.stream.Collectors.toList());
+            if (mapperTypes.isEmpty()) {
+                method.findAncestor(ClassOrInterfaceDeclaration.class).flatMap(type -> type.getFieldByName(mapper))
+                        .ifPresent(declaration -> declaration.getVariables().stream()
+                                .filter(variable -> variable.getNameAsString().equals(mapper))
+                                .forEach(variable -> mapperTypes.add(variable.getType().asString())));
+            }
+            return mapperTypes.size() == 1 && matchesType(unit, mapperTypes.get(0),
+                    "com.fasterxml.jackson.databind.ObjectMapper");
+        }).orElse(false);
+        return knownInstance ? field : null;
     }
 
     /** 仅纠正由真实请求实体注解证明的键名，保留实际值路径、预期值及断言类型。 */

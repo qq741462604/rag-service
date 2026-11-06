@@ -4,7 +4,7 @@ import com.cmbchina.llm.agent.AgentContext;
 import com.cmbchina.llm.agent.AgentPhase;
 import com.cmbchina.llm.agent.CodingTrack;
 import com.cmbchina.llm.agent.observation.Observation;
-import com.cmbchina.llm.llm.LlmClient;
+import com.cmbchina.llm.llm.QwenClient;
 import com.cmbchina.llm.project.ProjectContextService;
 import com.cmbchina.llm.project.ProjectFile;
 import com.cmbchina.llm.project.ProjectIndex;
@@ -47,7 +47,7 @@ public class QwenPlanner implements Planner {
     private final PromptTemplateService templateService;
     private final SkillManager skillManager;
     private final ProjectContextService projectContextService;
-    private final LlmClient llmClient;
+    private final QwenClient qwenClient;
     private final ObjectMapper objectMapper;
     private final WorkspaceService workspaceService;
     private final SkillTemplateCoordinator skillTemplateCoordinator;
@@ -58,7 +58,8 @@ public class QwenPlanner implements Planner {
     @Override
     public CodePlan createPlan(AgentContext context) {
         long start = System.currentTimeMillis();
-        log.info("planner start phase={} task={}", context.getPhase(), summarize(context.getTask(), 120));
+        log.info("planner start agentId={} phase={} track={}",
+                context.getAgentId(), context.getPhase(), context.getCodingTrack());
 
         Object refreshPath = context.getVariables().remove("patch_preflight_refresh_path");
         if (refreshPath instanceof String) {
@@ -153,27 +154,15 @@ public class QwenPlanner implements Planner {
         String template = promptLoader.load("planner");
         String prompt = templateService.render(template, vars);
 
-        log.info(
-                "========== PROMPT TAIL ==========\n{}",
-                prompt.substring(
-                        Math.max(0, prompt.length() - 2000)
-                )
-        );
         if (context.getModelCalls() >= maxModelCalls) {
             throw new IllegalStateException("规划模型调用已达到任务预算 " + maxModelCalls);
         }
-        String feedback = vars.get("VERIFY_ERRORS");
-        log.info("planner feedback agentId={} phase={} track={} repairRound={} feedback={}",
-                context.getAgentId(), context.getPhase(), context.getCodingTrack(),
-                context.getVariables().get("s2_repair_round"),
-                feedback == null || feedback.trim().isEmpty() ? "无" : summarize(feedback, 1800));
         context.setModelCalls(context.getModelCalls() + 1);
-        log.info("planner model call agentId={} call={}/{}", context.getAgentId(), context.getModelCalls(), maxModelCalls);
-        String response = llmClient.chat(prompt);
-        log.info(
-                "========== PLAN RESPONSE ==========\n{}",
-                response
-        );
+        log.info("planner model call flow={} agentId={} phase={} track={} round={} call={}/{}",
+                context.getVariables().get("s2_flow_id"), context.getAgentId(), context.getPhase(),
+                context.getCodingTrack(), context.getVariables().get("s2_repair_round"),
+                context.getModelCalls(), maxModelCalls);
+        String response = qwenClient.chat(prompt);
         return parse(context.getTask(), response);
     }
 
@@ -364,7 +353,8 @@ public class QwenPlanner implements Planner {
                         + "前序步骤未落盘，纠正后需重新提交完整计划；禁止降级整文件覆盖。"
                         + "若只是新增 Maven 依赖，请选择真实唯一的 dependencies 结束标签作为插入锚点，"
                         + "保留已有依赖及其格式，不要为了插入依赖顺便重排 artifactId 等 XML。";
-                log.warn("patch preflight rejected step={} path={} error={}", index, input.getPath(), e.getMessage());
+                log.warn("patch preflight rejected step={} path={} type={}",
+                        index, input.getPath(), e.getClass().getSimpleName());
                 throw new IllegalArgumentException(message, e);
             }
         }
@@ -909,8 +899,8 @@ public class QwenPlanner implements Planner {
             }
             covered.add(input.getPath() + " [" + start + "-" + end + "]");
         }
-        log.warn("S1 redundant read rejected template={} reads={} pending={}",
-                skillTemplateCoordinator.currentTemplate(context), covered, context.getTemplateErrors());
+        log.warn("S1 redundant read rejected template={} reads={} problems={}",
+                skillTemplateCoordinator.currentTemplate(context), covered, context.getTemplateErrors().size());
         throw new IllegalArgumentException("这些文件范围已完整放入本轮 Observations，且此后未被本任务修改: " + covered
                 + "。不要再次准备读取；直接从对应文件内容提取唯一 oldText，提交局部 patch_file。当前尚缺: "
                 + context.getTemplateErrors() + "。如确实缺少其它上下文，仅读取未提供的文件或明确行范围。");

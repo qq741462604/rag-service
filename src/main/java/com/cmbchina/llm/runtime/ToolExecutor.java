@@ -123,6 +123,11 @@ public class ToolExecutor {
                         .build());
             }
             ToolCallResult callResult = buildToolResult(step.getTool(), result);
+            if (!callResult.isSuccess()) {
+                log.warn("tool execute failed tool={} path={} type=ToolResult reason={}", step.getTool(),
+                        step.getInput() instanceof ToolInput ? ((ToolInput) step.getInput()).getPath() : null,
+                        failureLogSummary(callResult.getError()));
+            }
             results.add(callResult);
             context.getObservations().add(Observation.builder()
                     .tool(step.getTool())
@@ -132,7 +137,9 @@ public class ToolExecutor {
                     .error(callResult.isSuccess() ? null : "tool execute failed")
                     .build());
         } catch (Exception e) {
-            log.warn("tool execute failed tool={} error={}", step.getTool(), e.getMessage());
+            log.warn("tool execute failed tool={} path={} type={} reason={}", step.getTool(),
+                    step.getInput() instanceof ToolInput ? ((ToolInput) step.getInput()).getPath() : null,
+                    e.getClass().getSimpleName(), failureLogSummary(e.getMessage()));
             ToolCallResult failed = ToolCallResult.failed(step.getTool(), e.getMessage());
             results.add(failed);
             context.getObservations().add(Observation.builder()
@@ -143,6 +150,32 @@ public class ToolExecutor {
                     .build());
         }
     }
+    /** 仅裁剪日志副本，保留完整工具错误供后续规划修复。 */
+    private String failureLogSummary(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return "无错误详情";
+        }
+        String summary = message.split("\\R", 2)[0];
+        for (String marker : java.util.Arrays.asList("源码:", "源码：", "oldText=", "newText=", "content=",
+                "冲突线索：", "唯一性冲突：")) {
+            int position = summary.indexOf(marker);
+            if (position >= 0) {
+                summary = summary.substring(0, position);
+            }
+        }
+        summary = summary.replaceAll("\\u001B\\[[;\\d]*m", "")
+                .replaceAll("(?i)(https?://)[^\\s/@]+:[^\\s/@]+@", "$1[REDACTED]@")
+                .replaceAll("(?i)(authorization[\"']?\\s*[=:]\\s*).*", "$1[REDACTED]")
+                .replaceAll("(?i)\\bBearer\\s+[^\\s,;]+", "Bearer [REDACTED]")
+                .replaceAll("(?i)((?:password|passwd|token|api[-_]?key|secret)[\"']?\\s*[=:]\\s*)"
+                        + "(?:\"[^\"]*\"|'[^']*'|[^\\s,;]+)", "$1[REDACTED]")
+                .replaceAll("\\p{Cntrl}", " ").trim();
+        if (summary.isEmpty()) {
+            return "错误详情含源码或补丁正文，已省略；完整错误保留给规划";
+        }
+        return summary.length() > 600 ? summary.substring(0, 600) + "…" : summary;
+    }
+
     private String validateFileProtection(PlanStep step, AgentContext context) {
         if (!(step.getInput() instanceof ToolInput)) {
             return null;

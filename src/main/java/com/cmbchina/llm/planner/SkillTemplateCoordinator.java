@@ -278,7 +278,7 @@ public class SkillTemplateCoordinator {
         List<String> errors = contractValidator.validate(current, context);
         if (!errors.isEmpty()) {
             context.getTemplateErrors().addAll(errors);
-            log.info("S1 template pending path={} errors={}", current, errors);
+            log.info("S1 template pending path={} problems={}", current, errors.size());
             return;
         }
         // 只推进当前模板，下一个模板的读取在下一轮由系统直接构造。

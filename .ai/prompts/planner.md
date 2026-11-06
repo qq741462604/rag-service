@@ -104,6 +104,10 @@ list_files：仅在当前阶段允许且确有必要时使用。
 
 # Output Format
 
+- S2 断言必须检验业务结果：初始化用例保留非空断言并补配置/状态或依赖交互；固定评分输入验证具体 BigDecimal 写回，不能只用 any(BigDecimal.class)。HTTP 请求头、URL、Content-Length 分支用 ArgumentCaptor 捕获真实 HttpUriRequest 校验参数，不以响应桩返回常量代替请求验证。新增更精确断言时保留所有已有有效断言。
+- 实体的 JSON 协议键来自 @JsonProperty，默认 Lombok @Data/@ToString 的调试文本使用 Java 字段名，两者不能混用。验证协议键使用真实 ObjectMapper 序列化结果；系统确认同一实体局部变量的 assertTrue(receiver.toString().contains("协议键")) 有误时，只将该字符串纠正为真实 Java 字段名，保留原对象、assertTrue、contains 及其它断言，不改生产 toString/注解，不删除断言或改成常量。此精确纠正由门禁支持，自定义 toString 不适用。
+- 首次保存 HttpClientUtil/AhiHttpInvokerHandler 的静态字段也会触发类初始化；先配置 ReadConfig/BeeTraceClientHelper Bean，注册 SpringContextBeanUtil 的静态 Mock 并 stub getApplicationContext，再读取、保存、注入业务静态字段。静态/构造器 Mock 的依赖与当前测试可放在同一计划，先按系统真实版本依据补齐 inline 能力，再执行测试，不等待首轮 Maven 失败才猜测依赖。
+
 只能返回 JSON，不输出 Markdown 或解释文字：
 
 - 根节点必须是对象，steps 必须是数组，每一步必须包含非空 tool 字符串和 input 对象。
@@ -120,12 +124,13 @@ list_files：仅在当前阶段允许且确有必要时使用。
 - 请求 JSON 的键名和大小写取当前实体 @JsonProperty，不能猜 request_header/request_data 或将所有键变为小写。NPE 先读失败行，JSON get 返回空应核对实体键名；没有类初始化栈证据时不要靠补 Bean 或 Class.forName 猜修复。null Boolean 开关应使用 Boolean.TRUE.equals，禁止自动拆箱。
 - 测试必须验证真实业务；禁止 assertEquals("0", String.valueOf(size >= 0)) 等必败断言，也禁止覆写被测 ahiInvoke 后自行写入结果再验证自己。静态门禁证明此类断言必败时，可保留方法并替换为新增的真实 EventData 写回验证（Mockito.verify，无次数放宽，真实字段、具体预期值）；其它断言保护继续生效。请求体 assertEquals 的实际值 get(...).getAsString/Boolean/Int/Float 中，大小写或下划线猜错的键名仅能改成真实注解证明的同名协议键，不能修改预期值。
 - 首次初始化前按真实源码准备全部 Bean 和有效连接池配置；普通 Mockito Mock 的 int getter 默认0。Mock 静态工厂不会屏蔽业务静态块，Mock 句柄要覆盖实际初始化、调用与验证，不能在 BeforeEach 结束前关闭后再触发构造。初始化失败先追溯首个 Caused by，不把后续 NoClassDefFoundError 当成缺包。
+- 连接池 maxTotal/maxPerRoute 的正数 stub 必须在正常 setUp/BeforeEach 中、首次主动使用 Handler/HttpClientUtil 或 mockConstruction 之前就绪；catch 中 tearDown 只负责失败清理，不能代替容量准备。某个测试方法里调用过 getter 不等于共享夹具已完成 when(...).thenReturn(...)。真实源码若读取 getAhiHttpBusinessUrl 初始化 static final REQUEST_URL，首次构造器 Mock 前还必须配置有效地址，复用本任务已有 Handler 测试的 URL，避免将默认 null 固化；后续更换 Bean 不会更新 final 缓存。
 - Mock 重复注册先修初始化异常和清理：setup 中途失败须释放已注册句柄，teardown 须独立关闭全部句柄。禁止仅把 BeforeEach/AfterEach 换为 static BeforeAll/AfterAll，静态方法不能访问实例字段。构造回调赋值的字段在构造前仍为 null，桩写在回调参数 mock 上；错误的 when(null字段.method(any())) 会造成 NPE 和 matcher 残留，不能将它误判为依赖问题。
 - MockedConstruction/MockedStatic 句柄不能未 close 就赋 null；这会使 AfterEach 无法清理，导致后续整个套件被构造拦截或重复注册。成功/失败响应在各自用例中注册实际回调桩，默认返回 null 的用例保持默认行为。删除静态 import 后不能继续无作用域调用 mockConstruction。
 - 对真实关闭开关且在构造前提前返回的分支，应验证 constructed().isEmpty()。系统只允许将该分支错误的“构造1个 + 对第0个对象验证调用0次”合并为“零构造”，保留结果写回=2及其它全部断言；不允许用此规则放宽正常调用分支。
 - 修复以系统反馈的真实失败阶段及首个根因为依据，先读取失败文件再局部 patch，保留业务契约和有效断言。工具执行失败后核对本轮哪些补丁已成功，读取最新源码再继续，不能重复执行已成功补丁；修复成功由服务端复测和本次报告证据判定，不能口头宣称通过。
 - 本轮 Observations 中的系统读取/补丁恢复读取已满足先读再改；完整原文未变时直接使用，不要再返回相同 read_file 计划。补丁预检拒绝代表整份计划没有落盘；同一文件后续 oldText 必须对应前序补丁后的虚拟状态，前序已删除的 import 不得在后续 oldText 再出现。重新提交时以最新磁盘原文为起点组织必要的完整局部修复，虚拟中间状态只用于定位冲突。
-- search_code 指定范围被 workspace.ignore 排除时，表示没有扫描，不能当作类/方法不存在或依赖缺失。不要重复相同搜索；已确认具体源码路径可用 read_file 精确读取。编译器已报告某接收者类型没有该方法时，核对其真实定义和已有可用工具，不猜新 getter、不修改依赖桩补造 API。
+- search_code 遵守目标工程的 .ai/ignore/workspace.ignore。公共依赖参考位于 .ai/aitest 时，优先复用 Project Index/Observations 已确认的具体源码路径并用 read_file 精确读取，不对 .ai 或 .ai/aitest 发起目录搜索；不得根据包名臆造路径。指定范围被忽略表示没有扫描，不能当作类/方法不存在或依赖缺失，也不能通过放开忽略规则扩大扫描。收到范围被排除反馈后不要重复相同搜索。编译器已报告某接收者类型没有该方法时，核对其真实定义和已有可用工具，不猜新 getter、不修改依赖桩补造 API。
 - 测试访问 private 字段编译失败时，保留生产可见性、测试方法和原断言含义；不能删除断言或复制 getter 断言凑数量。仅当本次诊断点名且真实源码确认为 private static 字段时，系统支持将 JUnit5 的 assertSame(expected, Owner.field) 等价修正为 assertSame(expected, ReflectionTestUtils.getField(Owner.class, "field"))；Owner、字段、expected 和断言类型必须一致，补齐真实 import，不能换成其它字段或常量。可变静态字段的夹具恢复可用 setField，禁止反射写 final。
 - 反射操作先核对真实字段修饰符：Field.setAccessible(true) 不允许改写 static final，Class 字面量/Field.set(null, ...) 不能用于实例字段。HttpClientUtil.httpClient 是实例字段；构造器已通过公开 Builder 工厂注入时不要再用 HttpClientUtil.class 重置。Handler 的 httpClientUtil 为 static final，不能替换成另一个 Mock；按真实缓存及创建链隔离依赖，保留有效断言，不能将完整响应 assertEquals(expectedResponse, result) 降为只验证一个响应码。
 - Handler 的 static final httpClientUtil 可能已由前一个测试类初始化；每个 BeforeEach 新建 HttpClientUtil/HTTP 工厂 Mock 不会替换缓存。只读取得缓存工具，保存/注入/恢复其非 final 实例 httpClient 及真实可变静态 Bean，让当前 execute 桩作用于业务实际使用的客户端；不能把 Class 当实例，也不能改生产 final。成功响应为 null 时先查失败用例执行日志和缓存对象身份，保留全部有效断言，用实际业务调用的 verify 验证隔离是否生效。
@@ -134,6 +139,7 @@ list_files：仅在当前阶段允许且确有必要时使用。
 - ReflectionTestUtils.getField 返回 Object，没有按左值推断类型的泛型重载。读取缓存必须写成 HttpClientUtil cached = (HttpClientUtil) ReflectionTestUtils.getField(AhiHttpInvokerHandler.class, "httpClientUtil")；读取实例 httpClient 同样显式转 CloseableHttpClient。只读取得缓存后仅保存/替换/恢复内部非 final 字段，禁止 setField(AhiHttpInvokerHandler.class, "httpClientUtil", cached)，即使写回相同对象仍违反 final。入口测试反射其它业务类时，同样依据该类真实字段声明检查。
 - 入口关闭或 eventFields 为 null 时，先读真实提前 return 分支；若只写 ahiResultAvailable=2 就返回，新测试不能要求该分支再写 time/rst_code/评分，更不能修改生产分支迁就测试。评分期望依据真实 Float 到 BigDecimal 的转换构造，不能假定 0.95F 转 double 后仍精确等于十进制 0.95；基础成功用例可选择能精确表示的 0.5/0.75，专门的精度用例按真实契约验证。已有有效断言保护保持不变。
 - EventData 的数据夹具只使用已确认 API，不猜 setData(Map)。依赖仅有 getData/putDataAndOriginData 时，非空真实实例使用 getData().putAll(原Map)；必须返回 null/特殊集合的用例使用 getData 的 Mock 桩，不能把 null 换成空集合。编译已明确缺失 setter 后修当前文件全部同类调用，保留测试及断言；被截断原文的准确范围补读以最新 Observations 为准，不重复读取已经完整可见的范围。
+- EventData 为普通 Mock 时，单独创建/填充 eventFields 不会绑定 getData()；在 ahiInvoke 前用 when(eventData.getData()).thenReturn(eventFields) 或真实 Answer 连接本用例的输入 Map。doPost 实参出现空 Map/空 IP 时，先核对该输入绑定，保留原 Map、具体 IP、成功/异常/空响应分支及全部验证，不用 anyMap/anyString 放宽断言。预期异常测试中的 connection refused 等日志仅作辅助定位，真实失败以本次 Surefire failure/error 及系统判定阶段为准。
 
 {
   "steps": [

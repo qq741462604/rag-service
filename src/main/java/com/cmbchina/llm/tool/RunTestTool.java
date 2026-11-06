@@ -75,7 +75,8 @@ public class RunTestTool extends BaseTool {
         long started = System.nanoTime();
         Process process = null;
         ExecutorService reader = null;
-        OutputBuffer output = new OutputBuffer();
+        OutputBuffer output = new OutputBuffer(String.valueOf(context.getVariables().get("s2_flow_id")),
+                String.valueOf(context.getVariables().get("s2_repair_round")));
         try {
             ToolInput request = (ToolInput) input;
             String classes = request.getKeyword();
@@ -146,11 +147,12 @@ public class RunTestTool extends BaseTool {
                 // POM 解析失败发生在测试启动之前，不再为每个测试类追加缺少报告的次生错误。
                 String details = String.join("\n", output.errors());
                 return failure("Maven POM 校验失败，测试尚未执行；先修复模块 POM 后重新验证。\n"
-                        + details.substring(0, Math.min(7000, details.length())), output, exitCode, output.blocked, "POM");
+                        + details.substring(0, Math.min(7000, details.length())), output, exitCode,
+                        output.blocked || output.transportFailure, "POM");
             }
             if (exitCode != 0 && output.dependencyResolutionFailed) {
                 // 依赖阶段失败没有测试报告；找不到制品可核对声明，传输/认证故障仍停止。
-                boolean blocked = output.blocked || !output.artifactNotFound
+                boolean blocked = output.blocked || output.transportFailure || !output.artifactNotFound
                         || !dependencySupport.canRepairDependencyFailure(context, output.errors());
                 return failure("Maven 依赖解析失败，测试尚未执行。"
                         + (blocked ? "存在环境故障或缺少本任务可安全撤回的错误声明，停止自动修复；请核对仓库与坐标依据。"
@@ -342,11 +344,14 @@ public class RunTestTool extends BaseTool {
     }
 
     private static class OutputBuffer {
+        private final String flow;
+        private final String round;
         private final String marker = "__S2_" + UUID.randomUUID().toString().replace("-", "") + "__";
         private final StringBuilder tail = new StringBuilder();
         private final StringBuilder failures = new StringBuilder();
         private final StringBuilder compilerDiagnostics = new StringBuilder();
         private volatile boolean blocked;
+        private volatile boolean transportFailure;
         private volatile String readError;
         private volatile String commandLineError;
         private String mockitoCapabilityError;
@@ -360,6 +365,11 @@ public class RunTestTool extends BaseTool {
         private int rootCauseFrames;
         private volatile Long supervisorPid;
         private volatile Integer exitCode;
+
+        private OutputBuffer(String flow, String round) {
+            this.flow = flow;
+            this.round = round;
+        }
 
         private void consume(Process process) {
             try (InputStreamReader input = new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8)) {
@@ -407,7 +417,9 @@ public class RunTestTool extends BaseTool {
                 }
             }
             String line = redact(raw);
-            log.info("[S2 Maven] {}", line);
+            if (!line.equals("#< CLIXML")) {
+                log.info("[S2 Maven] flow={} round={} {}", flow, round, line);
+            }
             append(tail, line, 65536);
             String lower = line.toLowerCase(Locale.ROOT);
             if (lower.contains("compilation error") || lower.contains(".java:[")) {
@@ -470,13 +482,21 @@ public class RunTestTool extends BaseTool {
             if (lower.contains("could not find artifact") || lower.contains("failure to find ")) {
                 artifactNotFound = true;
             }
+            // 网络关键词也可能来自预期异常测试，只在 POM/依赖失败分支用作环境证据。
             if (lower.contains("could not transfer artifact") || lower.contains("non-resolvable parent")
                     || lower.contains("pkix") || lower.contains("unauthorized") || lower.contains("status code: 401")
                     || lower.contains("status code: 403")
                     || lower.contains("unknown host") || lower.contains("unknownhostexception")
-                    || lower.contains("connection timed out") || lower.contains("connection refused")
-                    || lower.contains("no plugin found for prefix") || lower.contains("not recognized as")
-                    || lower.contains("不是内部或外部命令")) {
+                    || lower.contains("connection timed out") || lower.contains("connection refused")) {
+                transportFailure = true;
+            }
+            // 全局阻塞必须有 Maven 构建诊断，不能把测试输出的异常当作构建环境故障。
+            String diagnostic = lower.trim();
+            boolean mavenDiagnostic = diagnostic.startsWith("[error]") || diagnostic.startsWith("[fatal]");
+            if (mavenDiagnostic && (lower.contains("could not transfer artifact")
+                    || lower.contains("non-resolvable parent") || lower.contains("non-resolvable import pom")
+                    || lower.contains("no plugin found for prefix")
+                    || lower.contains("plugin") && lower.contains("could not be resolved"))) {
                 blocked = true;
             }
         }

@@ -346,7 +346,24 @@ public class MavenDependencySupport {
                 + "若当前 Surefire 使用 JUnit Platform，JUnit4 还需兼容的 junit-vintage-engine 才能执行，"
                 + "不能只补编译包或凭空升级插件；确认当前执行器和版本依据后局部补测试依赖。"
                 + "已有依赖未显式写 version 可能由父 POM/BOM 管理；进入编译阶段并不表示依赖缺版本。\n"
+                + mockitoPlanningRules(context)
                 + observedDependencyRules(context);
+    }
+
+    /** 将已有能力检查前置为条件式提示，实际写入仍由原候选计划门禁确认。 */
+    private String mockitoPlanningRules(AgentContext context) {
+        try {
+            List<String> gaps = validateMockitoCapability(context, Collections.emptyMap());
+            if (gaps.isEmpty()) {
+                return "";
+            }
+            return "生成前 Mockito 能力依据（不是本轮测试执行失败）：仅在当前测试需要 mockStatic/mockConstruction 时核对以下缺口。"
+                    + "普通实例 Mock 或实体测试无需因此新增依赖；需要补齐能力时，将必要的 POM 局部补丁与测试放在同一计划中。\n"
+                    + String.join("\n", gaps) + "\n";
+        } catch (RuntimeException exception) {
+            return "生成前 Mockito 能力暂未确认；先核对真实 POM、MockMaker 配置和已有版本依据，"
+                    + "不能据此添加或升级依赖；后续仍由原测试预检与 Maven 验证。\n";
+        }
     }
 
     private String observedDependencyRules(AgentContext context) {
@@ -389,12 +406,18 @@ public class MavenDependencySupport {
     }
 
     private Map<String, Element> availableDeclarations(AgentContext context, boolean includeTest) {
+        return availableDeclarations(context, includeTest, Collections.emptyMap());
+    }
+
+    private Map<String, Element> availableDeclarations(AgentContext context, boolean includeTest,
+                                                        Map<String, String> previews) {
         List<File> files = new ArrayList<>(pomFiles(context));
         Collections.reverse(files);
         List<Element> projects = new ArrayList<>();
         Map<String, String> properties = new LinkedHashMap<>();
         for (File file : files) {
-            Element project = parse(file);
+            String path = workspaceService.relativePath(file);
+            Element project = previews.containsKey(path) ? parseXml(previews.get(path)) : parse(file);
             projects.add(project);
             Element declaredProperties = child(project, "properties");
             if (declaredProperties != null) {
@@ -439,6 +462,67 @@ public class MavenDependencySupport {
             }
         });
         return result;
+    }
+
+    /** 只依据明确版本或本地 starter 元数据拦截已知不支持的能力，未知传递依赖交给 Maven。 */
+    public List<String> validateMockitoCapability(AgentContext context, Map<String, String> previews) {
+        Map<String, Element> declared = availableDeclarations(context, true, previews);
+        List<String> errors = new ArrayList<>();
+        File module = modulePom(context).getParentFile();
+        for (String root : Arrays.asList("src/test/resources", "src/main/resources")) {
+            File config = workspaceService.resolve(new File(module,
+                    root + "/mockito-extensions/org.mockito.plugins.MockMaker").getPath());
+            if (config.isFile()) {
+                String setting = Arrays.stream(read(config).split("\\R"))
+                        .map(String::trim).filter(line -> !line.isEmpty() && !line.startsWith("#"))
+                        .findFirst().orElse("");
+                if (Arrays.asList("mock-maker-subclass", "mock-maker-proxy",
+                        "org.mockito.internal.creation.bytebuddy.SubclassByteBuddyMockMaker",
+                        "org.mockito.internal.creation.proxy.ProxyMockMaker").contains(setting)) {
+                    errors.add("Mockito 能力不匹配: " + workspaceService.relativePath(config)
+                            + " 强制使用 " + setting + "，不支持静态/构造器 Mock；不能仅添加 inline 依赖绕过配置。"
+                            + "当前 S2 修改范围不含该配置，请报告需要人工核对，或选用现有框架支持的测试夹具。");
+                }
+                if (!setting.isEmpty()) {
+                    return errors;
+                }
+            }
+        }
+        if (declared.containsKey("org.mockito:mockito-inline")) {
+            return errors;
+        }
+        String version = text(declared.get("org.mockito:mockito-core"), "version");
+        if (version.isEmpty()) {
+            version = localProperties(context).getOrDefault("mockito.version", "");
+        }
+        if (version.isEmpty() && !declared.containsKey("org.mockito:mockito-core")
+                && declared.containsKey("org.springframework.boot:spring-boot-starter-test")) {
+            String starterVersion = text(declared.get("org.springframework.boot:spring-boot-starter-test"), "version");
+            if (starterVersion.isEmpty()) {
+                for (File pom : pomFiles(context)) {
+                    Element parent = child(parse(pom), "parent");
+                    if ("org.springframework.boot".equals(text(parent, "groupId"))
+                            && "spring-boot-starter-parent".equals(text(parent, "artifactId"))) {
+                        starterVersion = expand(text(parent, "version"), localProperties(context));
+                        break;
+                    }
+                }
+            }
+            File metadata = localArtifacts.artifact(localArtifacts.repository(),
+                    "org.springframework.boot:spring-boot-starter-test", starterVersion, "pom");
+            if (metadata != null && metadata.isFile()) {
+                Map<String, Element> starterDependencies = new LinkedHashMap<>();
+                collectDependencies(child(parse(metadata), "dependencies"), Collections.emptyMap(), starterDependencies);
+                version = text(starterDependencies.get("org.mockito:mockito-core"), "version");
+            }
+        }
+        if (version.matches("[1-4]\\..*")) {
+            errors.add("Mockito 静态/构造器 Mock 预检: 已确认 mockito-core=" + version
+                    + "，当前本地声明与配置未提供 inline MockMaker。先核对完整测试类路径，"
+                    + "若无其它提供方，在模块 POM 局部补同版本 mockito-inline test 依赖，复用已确认版本管理；"
+                    + "可与当前测试放在同一计划，禁止升级 core、删断言或改生产初始化来绕过。");
+        }
+        return errors;
     }
 
     private void collectDependencies(Element dependencies, Map<String, String> properties,

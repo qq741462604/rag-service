@@ -30,12 +30,16 @@ dashscope:
     key: ${LLM_API_KEY}
     model: bge-m3-flash
 
-#日志分析模型
-docllm:
-  api:
-    url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions # <- 替换为真实 dashscope embedding URL
+# 大语言模型统一配置，供代码规划、文档生成和需求解析共用
+ai:
+  chat:
+    url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
     key: ${LLM_API_KEY}
     model: qwen3.5-plus-2026-02-15
+    enable-thinking: false
+    connect-timeout-millis: 1800000 # 保持原有30分钟连接超时
+    read-timeout-millis: 1800000 # 保持原有30分钟读取超时
+
 kb:
   raw-path: "data/canonical_field_dirt.xlsx"
   emb-path: "data/kb_with_embedding.csv"
@@ -68,11 +72,11 @@ llm:
   url: http://xxx/${llm.appKey}/tag/dev/workflow/run/${llm.actionKey}
   async-url: https://xxx/${llm.appKey}/tag/dev/run/single/action
   async-query-url: https://xxx/${llm.appKey}/tag/dev/result/query/{}
-  #  代码生成模型
+  # 旧代码生成模型配置读取别名，以上工作流配置仍独立保留
   api:
-    url: ${docllm.api.url}  #统一调用地址，仅更换模型即可
-    key: ${LLM_API_KEY}
-  model: ${docllm.api.model}
+    url: ${ai.chat.url}
+    key: ${ai.chat.key}
+  model: ${ai.chat.model}
 
 a: http://xxx8
 bee:

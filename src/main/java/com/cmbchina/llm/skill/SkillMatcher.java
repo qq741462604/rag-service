@@ -63,7 +63,9 @@ public class SkillMatcher {
         if (skills.stream().anyMatch(skill -> "predict-api".equals(skill.getName()))) {
             skills.removeIf(skill -> "external-api".equals(skill.getName()));
         }
-        log.info("effective skills={}", buildSkillNames(skills));
+        for (Skill skill : skills) {
+            log.info("skill hit name={} path={}", skill.getName(), skill.getSourcePath());
+        }
         return skills;
     }
 
@@ -89,11 +91,4 @@ public class SkillMatcher {
         return false;
     }
 
-    private String buildSkillNames(List<Skill> skills) {
-        List<String> names = new ArrayList<>();
-        for (Skill skill : skills) {
-            names.add(skill.getName());
-        }
-        return names.toString();
-    }
 }

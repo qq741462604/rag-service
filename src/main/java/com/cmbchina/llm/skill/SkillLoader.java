@@ -51,6 +51,7 @@ public class SkillLoader {
             }
 
             Skill skill = new Skill();
+            skill.setSourcePath(file.getAbsolutePath());
             skill.setName(file.getParentFile().getName());
             skill.setContent(builder.toString());
             parseSections(skill);

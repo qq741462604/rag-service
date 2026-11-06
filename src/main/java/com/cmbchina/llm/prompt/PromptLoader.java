@@ -3,6 +3,7 @@ package com.cmbchina.llm.prompt;
 
 import com.cmbchina.llm.config.AgentHomeService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 
@@ -13,6 +14,7 @@ import java.nio.file.Files;
 
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class PromptLoader {
 
@@ -48,8 +50,7 @@ public class PromptLoader {
 
 
         try{
-
-
+            log.info("planner prompt loaded name={} path={}", name, file.getAbsolutePath());
             return new String(
                     Files.readAllBytes(
                             file.toPath()

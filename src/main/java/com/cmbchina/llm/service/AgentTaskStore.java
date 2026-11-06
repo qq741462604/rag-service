@@ -125,7 +125,17 @@ public class AgentTaskStore {
      */
     public void markFailed(String taskId, String error) {
         store.put(taskId, new TaskRecord(TaskStatus.FAILED, null, error));
-        log.warn("agent async task failed taskId={} error={}", taskId, error);
+        String summary = error == null ? "无" : error;
+        for (String marker : java.util.Arrays.asList("\n冲突线索：", "\n唯一性冲突：", "\n失败的 oldText:",
+                "\n文件在本步骤之前", "源码: ")) {
+            int position = summary.indexOf(marker);
+            if (position >= 0) {
+                summary = summary.substring(0, position);
+            }
+        }
+        summary = summary.replace('\r', ' ').replace('\n', ' ');
+        log.warn("agent async task failed taskId={} error={}", taskId,
+                summary.substring(0, Math.min(1200, summary.length())));
     }
 
 /**

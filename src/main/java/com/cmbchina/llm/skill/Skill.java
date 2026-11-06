@@ -16,6 +16,11 @@ public class Skill {
      */
     private String name;
 
+    /**
+     * 实际加载的 Skill 文件路径，仅用于命中日志。
+     */
+    private String sourcePath;
+
 
     /**
      * 原始内容

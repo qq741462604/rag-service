@@ -99,7 +99,8 @@ public class S2TestCoordinator {
             throw new IllegalArgumentException("S2 没有可执行测试条目；跳过原因=" + state.skipped);
         }
         context.getVariables().put(STATE, state);
-        log.info("S2 initialized module={} entries={} skipped={}", state.pom, state.entries.size(), state.skipped);
+        log.info("S2流程 flow={} 建立测试清单 module={} entries={} skipped={}",
+                context.getVariables().get("s2_flow_id"), state.pom, state.entries.size(), state.skipped);
     }
 
     public CodePlan ensureCurrentRead(AgentContext context) {
@@ -111,6 +112,11 @@ public class S2TestCoordinator {
                         .input(ToolInput.builder().path(path).startLine(1).endLine(10000).build())
                         .description("S2 读取当前真实源码、已有测试和模块 POM").build());
             }
+        }
+        if (!steps.isEmpty()) {
+            log.info("S2流程 flow={} round={} 读取最新文件 paths={}", context.getVariables().get("s2_flow_id"),
+                    context.getVariables().get("s2_repair_round"), steps.stream()
+                            .map(step -> ((ToolInput) step.getInput()).getPath()).collect(java.util.stream.Collectors.toList()));
         }
         return steps.isEmpty() ? null : CodePlan.builder().task(context.getTask()).steps(steps).build();
     }
@@ -130,7 +136,8 @@ public class S2TestCoordinator {
             return false;
         }
         entry.complete = true;
-        log.info("S2 item completed source={} test={} progress={}/{}", entry.source, entry.test,
+        log.info("S2流程 flow={} 测试源码通过预检 source={} test={} progress={}/{}，尚未执行 Maven",
+                context.getVariables().get("s2_flow_id"), entry.source, entry.test,
                 state.entries.stream().filter(value -> value.complete).count(), state.entries.size());
         return current(state) == null;
     }
@@ -140,6 +147,10 @@ public class S2TestCoordinator {
         List<String> errors = new ArrayList<>();
         for (Entry entry : state.entries) {
             errors.addAll(validate(state, entry));
+        }
+        if (errors.isEmpty() && state.entries.stream().anyMatch(entry -> inspector.requiresInlineMocking(
+                inspector.read(workspaceService.resolve(entry.test))))) {
+            errors.addAll(dependencySupport.validateMockitoCapability(context, Collections.emptyMap()));
         }
         return errors;
     }
@@ -193,6 +204,9 @@ public class S2TestCoordinator {
                 + testDependencyRules(context)
                 + testIsolationRules()
                 + "使用真实业务签名和已有 JUnit4/5、断言/Mockito；测试须有实际业务断言。"
+                + "初始化测试保留对象非空断言，并补初始化后的状态或依赖交互，不能只断言 new 的对象非空。"
+                + "固定评分输入用具体 BigDecimal 期望验证写回，不仅使用 any(BigDecimal.class)；"
+                + "HTTP 头和参数测试捕获实际 HttpUriRequest 验证，不仅断言响应桩的返回常量。"
                 + "覆盖正常、异常、空值及本需求分支；HTTP/DB/私有服务使用 mock，不启动 Spring 全上下文或真实网络。"
                 + "已有测试先读后局部 patch；禁止重写业务、空壳、恒定值断言、禁用、assume 或删除既有测试/断言。"
                 + "缺测试依赖只局部补模块 POM test scope，版本复用已有管理；不能猜私有依赖坐标或版本。"
@@ -212,6 +226,10 @@ public class S2TestCoordinator {
         return initializationFeedback(context) + dependencySupport.testDependencyRules(context)
                 + "请求 JSON 必须逐字使用当前实体 @JsonProperty 的键名及大小写，不能将 requestHeader/requestData "
                 + "猜成 response_header 风格；当前真实映射（规范化名称=协议键）: " + requestJsonProperties(state(context)) + "。\n"
+                + "默认 Lombok @Data/@ToString 的 toString 使用 Java 字段名，@JsonProperty 不会把它改成协议键。"
+                + "验证 JSON 键必须使用真实 ObjectMapper 序列化结果；toString 的 contains 检查只使用真实 Java 字段名。"
+                + "系统明确识别此类错误时，只允许保留原对象/assertTrue/contains 并纠正对应字段名，"
+                + "不能删除断言、修改其它预期或新增生产 toString 来迎合测试。\n"
                 + (context.getPhase() == AgentPhase.REPAIR ? dependencySupport.repairDependencyRules(context) : "");
     }
 
@@ -219,6 +237,14 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        if (errors.contains("toString") && (errors.contains("request_header") || errors.contains("Lombok"))) {
+            rules.append("本轮实体断言把 JSON 协议键与 Lombok 调试文本混用。先核对实体字段及 @JsonProperty；")
+                    .append("默认 @Data 的 requestHeader 在 toString 中仍名为 requestHeader，不是 request_header。")
+                    .append("对于系统确认的同一实体局部变量，仅把原 assertTrue(receiver.toString().contains(...)) ")
+                    .append("的协议键字符串纠正为实际 Java 字段名，其余接收者、断言形式及验证保持原样，")
+                    .append("门禁支持这一精确纠正；不要改实体、删除断言或用常量代替实际值。")
+                    .append("JSON 序列化断言仍保留 request_header 等协议键。\n");
+        }
         if (errors.contains("EventData") && errors.contains("setData")) {
             rules.append("本次编译已确认 EventData 没有 setData(Map)，不能继续调用或搜索该缺失 setter。")
                     .append("真实 EventData 实例的非空数据夹具使用 eventData.getData().putAll(eventFields)，保留原 Map 内容及全部断言；")
@@ -227,6 +253,16 @@ public class S2TestCoordinator {
                     .append("或保留真实实例并用已确认的测试隔离方法，不凭空补 setter，不改公共包源码。")
                     .append("一次检查当前文件全部 setData 调用，包括后半文件；每个补丁使用所属方法的唯一上下文，")
                     .append("成功补读的准确范围已加入 Observations，不要重复相同 read_file。\n");
+        }
+        if (errors.contains("DataPrepEventHandler") && errors.contains("doPost")
+                && (errors.contains("ArgumentsAreDifferent") || errors.contains("Argument(s) are different"))) {
+            rules.append("入口 doPost 参数不一致时，先核对真实 ahiInvoke 从 eventData.getData() 读取数据的路径。")
+                    .append("仅创建并填充 eventFields 不会改变 mock(EventData.class) 的 getData 返回值；")
+                    .append("在被测调用前用 when(eventData.getData()).thenReturn(eventFields) 绑定本用例的原 Map，")
+                    .append("或核对当前已有 Answer/夹具的实际返回对象；逐个检查当前文件的成功、异常和空响应分支。")
+                    .append("保留原 Map、IP、doPost 参数及写回验证，不把具体值换成 anyMap/anyString/空 Map，")
+                    .append("不修改生产默认值或异常处理来迁就测试。用例预期异常的日志仅作辅助定位，")
+                    .append("测试是否失败以本次报告中的 failure/error 为准。\n");
         }
         if (errors.contains("无法转换") || errors.contains("incompatible types") || errors.contains("ReflectionTestUtils")) {
             rules.append("Spring ReflectionTestUtils.getField 的返回类型固定是 Object，不支持按左值自动推断泛型。")
@@ -316,6 +352,10 @@ public class S2TestCoordinator {
                     .append("未 stub 的 int getter 默认返回0；先在首次初始化 HttpClientUtil/Handler 前设置真实源码所需的")
                     .append("getHttpMaxtotalConnections/getHttpMaxperrouteConnections 为正数，或使用完整配置夹具。")
                     .append("HttpClients.custom 的 Mock 只替换 Builder，不屏蔽静态块中的真实连接池。")
+                    .append("容量 stub 必须在正常 setup、首次 mockConstruction 之前生效；catch 中 tearDown 只是失败清理，")
+                    .append("不能代替夹具准备，测试方法内读取 getter 也不等于共享 setup 已完成 stub。")
+                    .append("同时检查 Handler 首次初始化的 static final REQUEST_URL；若真实源码读取 getAhiHttpBusinessUrl，")
+                    .append("须在首次构造器 Mock 前配置有效地址，复用已有 Handler 测试 URL，避免将默认 null 固化。")
                     .append("后续 NoClassDefFoundError 是首次初始化失败的连锁结果，不是缺 JAR，不能删除生产初始化。\n");
         }
         if (errors.contains("Could not initialize class") || errors.contains("Cannot instrument class")) {
@@ -356,6 +396,8 @@ public class S2TestCoordinator {
                 + "普通 Mock 的 int/boolean getter 默认0/false，真实连接池需要正数的 maxTotal/maxPerRoute；"
                 + "在首次初始化前明确 stub getHttpMaxtotalConnections/getHttpMaxperrouteConnections，"
                 + "或用完整 ReadConfig 夹具配置 URL、超时、重试、连接池容量与空闲时间。"
+                + "真实源码若通过 getAhiHttpBusinessUrl 初始化 static final REQUEST_URL，必须在首次构造器 Mock 前"
+                + "准备有效地址，复用同任务已有 Handler 测试 URL；后续更换 Bean 不会更新该 final 缓存。"
                 + "只 Mock HttpClients.custom 不会阻止静态块创建连接池，不能用默认0配置。"
                 + "MockedStatic 工厂句柄应在字段保存到 AfterEach/After 关闭，或在同一测试 try 内覆盖初始化、"
                 + "调用、验证；不能在 BeforeEach 的 finally 或局部 try 结束时提前关闭后再在测试中触发构造。"
@@ -400,6 +442,9 @@ public class S2TestCoordinator {
                 + "避免把 ReadConfig 返回值登记到返回 Boolean 的 getAhiHttpInvokeEnable 上。"
                 + "EventData 等公共业务类型按已读真实 API 使用，不能猜测 setData；"
                 + "缺 setter 时使用真实可变集合 API 或 stub getData()，不为测试篡改公共类型。"
+                + "EventData 是普通 Mock 时，单独填充 eventFields 不会绑定 getData；被测调用前必须按该用例"
+                + "用 when(eventData.getData()).thenReturn(eventFields) 或真实 Answer 返回预期 Map。"
+                + "成功、异常及空响应分支分别核对输入绑定，null 分支保留 null；不能放宽具体 Map/IP 的交互验证。"
                 + "空值分支按真实异常契约断言，不要仅凭测试名猜测 assertDoesNotThrow。"
                 + "仅当本次用例报告 Unexpected exception thrown、源码明确声明并抛出同一异常时，"
                 + "可将同一被测调用的 assertDoesNotThrow 更正为该具体类型的 assertThrows；"
@@ -480,6 +525,9 @@ public class S2TestCoordinator {
             if (entry.test.equals(path)) {
                 List<String> errors = validateSource(state, entry, after, previews);
                 errors.addAll(inspector.validateReportedApiUsage(after, context.getVerifyErrors()));
+                if (inspector.requiresInlineMocking(after)) {
+                    errors.addAll(dependencySupport.validateMockitoCapability(context, previews));
+                }
                 if (!errors.isEmpty()) {
                     throw new IllegalArgumentException("测试修改不满足门禁: " + errors);
                 }
@@ -531,10 +579,15 @@ public class S2TestCoordinator {
     }
 
     private List<String> validateSource(State state, Entry entry, String source, Map<String, String> previews) {
-        Set<String> references = inspector.parse(source).findAll(com.github.javaparser.ast.expr.ClassExpr.class).stream()
+        CompilationUnit unit = inspector.parse(source);
+        Set<String> references = unit.findAll(com.github.javaparser.ast.expr.ClassExpr.class).stream()
                 .map(literal -> literal.getType().asString()).collect(java.util.stream.Collectors.toSet());
+        unit.findAll(com.github.javaparser.ast.expr.FieldAccessExpr.class)
+                .forEach(field -> references.add(field.getScope().toString()));
+        unit.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class)
+                .forEach(call -> call.getScope().ifPresent(scope -> references.add(scope.toString())));
         Map<String, String> relatedSources = new LinkedHashMap<>();
-        // 仅复用本任务清单中由 class 字面量明确引用的源码，不扫描目标工程。
+        // 仅复用本任务清单中显式类型/静态访问引用的源码，不扫描目标工程。
         for (Entry related : state.entries) {
             if (!related.source.equals(entry.source) && references.stream().anyMatch(name ->
                     name.equals(related.sourceClass) || name.endsWith("." + related.sourceClass))) {
