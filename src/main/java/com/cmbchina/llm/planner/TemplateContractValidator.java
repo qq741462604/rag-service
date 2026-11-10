@@ -103,6 +103,9 @@ public class TemplateContractValidator {
         } else if (template.contains("04-invoke-handler")) {
             CompilationUnit handler = javaFile(files, "AhiHttpInvokerHandler.java", errors);
             requireMethods(handler, errors, "doPost", "buildRequestBody", "getUUID", "getDdApdatestr");
+            if (handler != null && method(handler, "buildRequestBody") != null) {
+                requireText(method(handler, "buildRequestBody"), errors, "String bsrDate = requestTime.substring(0, 8)");
+            }
             requireCalls(handler, errors, "getAhiHttpBusinessUrl", "invoke", "buildRequestBody",
                     "writeValueAsString", "getStatusCode", "getAsJsonObject");
             requireText(handler, errors, "AhiHttpBodyEntity", "AhiHttpBodyHeaderEntity",
@@ -132,6 +135,17 @@ public class TemplateContractValidator {
                             "response_header", "response_data", "rst_code", "predict_rescale_score",
                             "verifyInvokeCondition");
                     validateInvokerReference(entry, invoke, files, errors);
+                    requireText(invoke, errors, "BigDecimal predictScore = null", "getAsBigDecimal()",
+                            "BigDecimal responseScore =", "int responseTime =", "predictScore = responseScore",
+                            "ahiTime = responseTime", "modelScore = predictScore");
+                    if (invoke.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                            Arrays.asList("getAsFloat", "getAsDouble", "floatValue", "doubleValue")
+                                    .contains(call.getNameAsString()))) {
+                        errors.add("ahiInvoke 评分必须直接按 BigDecimal 解析，禁止先转 Float/Double 丢失十进制精度");
+                    }
+                    if (code.indexOf("predictScore = responseScore") < code.indexOf("int responseTime =")) {
+                        errors.add("ahiInvoke 必须先完整解析评分和耗时再提交，缺字段时不能留下部分成功评分");
+                    }
                     if (invoke.getParameters().size() != 2
                             || !"void".equals(invoke.getType().asString())
                             || !"PipelineContext ctx".equals(invoke.getParameter(0).toString())

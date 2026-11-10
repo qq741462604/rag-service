@@ -45,6 +45,16 @@ public class ChatModelProperties {
     private boolean enableThinking;
 
     /**
+     * thinking.type 参数，可选 enabled/disabled，默认 disabled。
+     */
+    private String thinkingType = "disabled";
+
+    /**
+     * reasoning_effort 参数，可选 low/high/max，默认 high。
+     */
+    private String reasoningEffort = "high";
+
+    /**
      * 连接超时毫秒数，默认保持原来的30分钟。
      */
     private int connectTimeoutMillis = 30 * 60 * 1000;

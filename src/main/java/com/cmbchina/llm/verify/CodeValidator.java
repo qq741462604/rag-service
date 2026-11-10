@@ -1488,12 +1488,12 @@ public class CodeValidator {
     ){
 
 
-        if(!content.contains("@Component")){
+        if(!Pattern.compile("@(?:[\\w]+\\.)*(?:Component|Configuration)\\b").matcher(content).find()){
 
             errors.add(
                     path
                             +
-                            " ApiConfig缺少@Component"
+                            " ApiConfig缺少@Component或@Configuration"
             );
 
         }
@@ -1636,37 +1636,7 @@ public class CodeValidator {
         }
 
 
-        if(content.contains("@Component")){
-
-            errors.add(
-                    path
-                            +
-                            " Target禁止新增@Component改变组件模型"
-            );
-
-        }
-
-
-        if(content.contains("@RequiredArgsConstructor")){
-
-            errors.add(
-                    path
-                            +
-                            " Target禁止新增@RequiredArgsConstructor改变生命周期"
-            );
-
-        }
-
-
-        if(content.contains("@Autowired")){
-
-            errors.add(
-                    path
-                            +
-                            " Target禁止使用@Autowired注入Client"
-            );
-
-        }
+        // 组件模型与构造器是否被改变由普通 Skill 的修改前后检查判定，保留原有注解合法。
 
 
         validateTargetApiClientInitialization(
@@ -1734,6 +1704,15 @@ public class CodeValidator {
                 pattern.matcher(content);
 
 
+        Set<String> injectedFields = new java.util.HashSet<>();
+        new com.github.javaparser.JavaParser(new ParserConfiguration()
+                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_11)).parse(content).getResult()
+                .ifPresent(unit -> unit.findAll(com.github.javaparser.ast.body.FieldDeclaration.class).stream()
+                        .filter(field -> field.getAnnotations().stream().anyMatch(annotation ->
+                                "Autowired".equals(annotation.getName().getIdentifier())))
+                        .forEach(field -> field.getVariables().forEach(variable ->
+                                injectedFields.add(variable.getNameAsString()))));
+
         while(matcher.find()){
 
 
@@ -1741,9 +1720,9 @@ public class CodeValidator {
                     matcher.group(1);
 
 
-            if(!content.contains(
-                    fieldName + " ="
-            )){
+            // 原有合法字段注入由生命周期快照约束保留；赋值不依赖等号前后的空格风格。
+            if(!injectedFields.contains(fieldName) && !Pattern.compile("\\b" + Pattern.quote(fieldName)
+                    + "\\s*=(?!=)").matcher(content).find()){
 
                 errors.add(
                         path

@@ -27,6 +27,8 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 
 @Slf4j
@@ -100,8 +102,8 @@ public class QwenPlanner implements Planner {
 
         Map<String, String> vars = new HashMap<>();
         vars.put("PROJECT", buildProjectSummary());
-        vars.put("SKILLS", isS2(context) ? "S1 模板已完成；只执行当前 S2 清单与修复规则。"
-                : skillManager.buildContext(context.getTask()));
+        vars.put("SKILLS", isS2(context) ? "S1 产物已完成；按当前 S2 清单、命中 Skill 的业务验收和真实源码补齐测试。"
+                : skillManager.buildContext(context.getSkills()));
         vars.put("TASK", context.getTask());
         vars.put("MEMORIES", "");
         vars.put("TARGET_RULE", buildTargetRule(context));
@@ -162,6 +164,12 @@ public class QwenPlanner implements Planner {
                 context.getVariables().get("s2_flow_id"), context.getAgentId(), context.getPhase(),
                 context.getCodingTrack(), context.getVariables().get("s2_repair_round"),
                 context.getModelCalls(), maxModelCalls);
+        // 只记录各段字符数，方便定位重复输入；不打印模板/源码，也不将字符数当作 Token。
+        Map<String, Integer> sectionChars = new TreeMap<>();
+        vars.forEach((name, value) -> sectionChars.put(name, value == null ? 0 : value.length()));
+        log.info("planner input size flow={} agentId={} call={} promptChars={} sectionChars={} (characters, not tokens)",
+                context.getVariables().get("s2_flow_id"), context.getAgentId(), context.getModelCalls(),
+                prompt.length(), sectionChars);
         String response = qwenClient.chat(prompt);
         return parse(context.getTask(), response);
     }
@@ -491,14 +499,23 @@ public class QwenPlanner implements Planner {
         if (context == null || context.getSkills() == null || context.getSkills().isEmpty()) {
             return null;
         }
+        String first = null;
         for (Skill skill : context.getSkills()) {
             if (skill.getTarget() != null
                     && skill.getTarget().getClassName() != null
                     && !skill.getTarget().getClassName().trim().isEmpty()) {
-                return skill.getTarget().getClassName().trim();
+                String target = skill.getTarget().getClassName().trim();
+                if (first == null) {
+                    first = target;
+                }
+                if (context.getPhase() == AgentPhase.ANALYSIS && context.getObservations().stream()
+                        .noneMatch(observation -> observation.isSuccess() && "read_file".equals(observation.getTool())
+                                && isTargetRead(observation, target))) {
+                    return target;
+                }
             }
         }
-        return null;
+        return first;
     }
 
     /**
@@ -839,27 +856,30 @@ public class QwenPlanner implements Planner {
      */
     private String buildCodingPhaseRules(AgentContext context) {
         if (context.getCodingTrack() == CodingTrack.S2_TEST && testGenerationEnabled) {
-            return testCoordinator.buildRules(context);
+            return testCoordinator.buildRules(context) + buildS2ReadRules(context);
         }
         StringBuilder sb = new StringBuilder();
         sb.append("当前阶段 CODING（S1 业务代码）。本阶段不生成测试、不运行 Maven。\n");
-        sb.append("本轮只处理当前模板产物，按模板固定结构、协议字段和调用链生成。\n");
+        sb.append(skillTemplateCoordinator.hasTemplates(context)
+                ? "本轮只处理当前模板产物，按模板固定结构、协议字段和调用链生成。\n"
+                : "按全部命中 Skill 的产物和验收逐项补齐，可分多轮；一次文件写入不代表 S1 完成。\n");
         sb.append("新文件必须确认不存在后 write_file；已有文件必须先 read_file，再 patch_file。\n");
         sb.append("patch_file 的 oldText 是已读真实片段，newText 是该片段的替换内容，不能用整文件替换局部片段。\n");
         sb.append("允许读取当前模板对应的已有类、配置、pom 和依赖以补齐真实信息。\n");
-        sb.append("目标入口在最后一份入口模板才修改，禁止先引用尚未实现的依赖类。\n");
+        sb.append("有固定模板时按模板顺序修改入口；普通 Skill 先完成依赖类，再接入真实入口。\n");
         sb.append(skillTemplateCoordinator.buildCurrentRules(context));
         sb.append("\n当前模板已读文件（均已放入 Observations；系统读取同样满足先读再改）:\n");
         for (Observation observation : skillTemplateCoordinator.currentArtifactObservations(context)) {
             FileContent content = (FileContent) observation.getResult();
-            sb.append(describeFileRead(content));
+            sb.append(describeFileRead(content)).append(" visibleEndLine=").append(visibleReadEndLine(content));
             if (formatObservationResult(content).length() > READ_RESULT_LIMIT) {
-                sb.append("\n本条观察被提示词限长截断，需要时指定 startLine/endLine 补读缺少的片段。\n");
+                sb.append("；本条被提示词限长截断，需要时指定 startLine/endLine 补读缺少的片段。\n");
             } else {
-                sb.append("\n上述读取范围已完整提供且此后未被本任务修改；需要修改且在当前允许范围内时，"
-                        + "直接取本文件真实片段生成局部 patch_file；只读依赖仅供核对。不要为准备修改再次读取相同范围。\n");
+                sb.append("；上述范围完整可见。\n");
             }
         }
+        sb.append("以上文件此后未被本任务修改；完整可见且在当前允许修改范围内时，直接取真实片段局部 patch_file；"
+                + "只读依赖仅供核对，不要为准备修改再次读取相同范围。\n");
         sb.append("最近一次读取按同一文件判断：读取 pom、模板或其它支持类不会使入口文件的读取失效。"
                 + "先按尚缺结构补齐当前产物；只有缺少其它文件或尚未提供的行范围时才继续读取。\n");
         return sb.toString();
@@ -947,10 +967,11 @@ public class QwenPlanner implements Planner {
             FileContent content = (FileContent) observation.getResult();
             rules.append(describeFileRead(content)).append(" visibleEndLine=").append(visibleReadEndLine(content))
                     .append(formatObservationResult(content).length() <= READ_RESULT_LIMIT
-                    ? "；上述范围完整可见，不要再次准备读取，直接提取真实片段局部修改。\n"
+                    ? "；上述范围完整可见。\n"
                     : "；本条超过提示词限长，仅允许按明确行范围补读未呈现部分。\n");
         }
-        return rules.toString();
+        return rules.append("完整可见且在当前允许修改范围内时，直接提取真实片段局部修改，不要再次准备读取相同范围；"
+                + "只读依赖仅供核对。确实缺少其它文件或行范围时仍可补读，不能猜测未提供的实现。\n").toString();
     }
 
     private boolean hasSuccessfulReadOfTarget(List<Observation> observations, AgentContext context) {
@@ -1023,8 +1044,13 @@ public class QwenPlanner implements Planner {
         if (!matchesSkillTarget(new File(path).getName(), targetClassName)) {
             return false;
         }
-        // 文件名匹配 Skill 目标类名，视为目标文件已读取
-        return true;
+        if (targetClassName == null) {
+            return true;
+        }
+        String source = stripReadLineNumbers(content.getLines());
+        return Pattern.compile("(?m)^\\s*package\\s+[\\w.]+\\s*;").matcher(source).find()
+                && Pattern.compile("\\b(class|interface|enum)\\s+" + Pattern.quote(targetClassName) + "\\b")
+                .matcher(source).find();
     }
 
     private String buildObservations(AgentContext context) {
@@ -1110,6 +1136,7 @@ public class QwenPlanner implements Planner {
     private String buildTargetRule(AgentContext context) {
         String target = extractRealTargetPath(context.getObservations(), context);
         StringBuilder rule = new StringBuilder("已定位入口真实路径: ").append(target).append("\n");
+        Set<String> packages = new LinkedHashSet<>();
         for (Observation observation : context.getObservations()) {
             if (observation.isSuccess() && observation.getResult() instanceof FileContent) {
                 FileContent file = (FileContent) observation.getResult();
@@ -1118,9 +1145,36 @@ public class QwenPlanner implements Planner {
                             "(?m)^\\s*package\\s+([\\w.]+)\\s*;").matcher(stripReadLineNumbers(file.getLines()));
                     if (matcher.find()) {
                         String pkg = matcher.group(1);
-                        rule.append("入口真实 package: ").append(pkg)
-                                .append("；辅助类根包: ").append(pkg.replaceAll("\\.extension$", ""))
-                                .append("。禁止照抄模板示例包名。\n");
+                        if (packages.add(pkg)) {
+                            rule.append("入口真实 package: ").append(pkg)
+                                    .append("；辅助类根包: ").append(pkg.replaceAll("\\.extension$", ""))
+                                    .append("。禁止照抄模板示例包名。\n");
+                        }
+                    }
+                }
+            }
+        }
+        Set<String> targets = context.getSkills().stream().filter(skill -> skill.getTarget() != null)
+                .map(skill -> skill.getTarget().getClassName()).filter(java.util.Objects::nonNull)
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        Set<String> shown = new LinkedHashSet<>();
+        for (Observation observation : context.getObservations()) {
+            if (!observation.isSuccess() || !"read_file".equals(observation.getTool())
+                    || !(observation.getResult() instanceof FileContent)) {
+                continue;
+            }
+            FileContent file = (FileContent) observation.getResult();
+            if (file.getPath() == null || !isRealJavaSource(file.getPath())) {
+                continue;
+            }
+            for (String name : targets) {
+                if (matchesSkillTarget(new File(file.getPath()).getName(), name) && isTargetRead(observation, name)
+                        && shown.add(file.getPath())) {
+                    Matcher declaration = Pattern.compile("(?m)^\\s*package\\s+([\\w.]+)\\s*;")
+                            .matcher(stripReadLineNumbers(file.getLines()));
+                    if (declaration.find()) {
+                        rule.append("命中入口 ").append(name).append(" path=").append(file.getPath())
+                                .append(" package=").append(declaration.group(1)).append("\n");
                     }
                 }
             }

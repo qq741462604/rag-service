@@ -31,6 +31,7 @@ try {
 > **以下两个方法是固定写法，必须原样复制到入口 Handler 类中**，只按实际业务字段裁剪，禁止改变调用链、方法名、参数或返回字段。
 > 调用成功后再取值赋值。**返回结构解析（`response_header` / `response_data`）是固定写法**，取值后必须通过 `eventData.putDataAndOriginData` 写回，禁止 `eventFields.put`、`eventData.set` 或直接改 `eventData.getData()`。
 > **调用链固定为**：`new AhiHttpInvokerHandler().doPost(ctx, eventFields, slfEqpAdr)` → 返回 `JsonObject responseBody` → 解析 `response_header.rst_code` 判断成功 → 从 `response_data` 取 `predict_rescale_score` 和 `time` → 通过 `eventData.putDataAndOriginData` 写回 `ahiResultAvailable`、`time`、`rst_code`、`predict_rescale_score`、`ahiCostTime` 五个字段。
+> 评分直接使用 `getAsBigDecimal()`，禁止经过 Float/Double，避免十进制精度损失。评分与耗时全部解析成功后再赋值；非法 JSON、缺响应头/数据/评分/耗时或数值无法解析时沿用失败写回：可用性 `0`、评分 `2`、耗时 `0`，状态码保留已经解析到的值，尚未解析到时为 `10000`。缺字段不得留下部分成功评分。S2 必须覆盖 `0.1`、`0.123456` 及上述异常响应，不能只选 `0.5`、`0.75`。
 
 
 ```java
@@ -61,7 +62,7 @@ try {
         long beginTime = System.currentTimeMillis();
 
         // 评估分值，得分范围：[0 - 1]
-        Float predictScore = null;
+        BigDecimal predictScore = null;
         String rstCode = "10000";
         //      模型预测耗时
         int ahiTime = 0;
@@ -78,8 +79,11 @@ try {
                         JsonObject responseBodyData = responseBody
                                 .getAsJsonObject("response_data");
                         if (responseBodyData != null) {
-                            predictScore = responseBodyData.get("predict_rescale_score").getAsFloat();
-                            ahiTime = responseBodyData.get("time").getAsInt();
+                            // 两个字段完整解析后再提交，防止缺耗时却留下成功评分。
+                            BigDecimal responseScore = responseBodyData.get("predict_rescale_score").getAsBigDecimal();
+                            int responseTime = responseBodyData.get("time").getAsInt();
+                            predictScore = responseScore;
+                            ahiTime = responseTime;
                         }
                     }
                 }
@@ -102,7 +106,7 @@ try {
         // 结果不为空，保存结果用于规则引擎使用,为空时设为2
         BigDecimal modelScore = null;
         if (predictScore != null) {
-            modelScore = BigDecimal.valueOf(predictScore);
+            modelScore = predictScore;
         } else {
             modelScore = BigDecimal.valueOf(2);
         }

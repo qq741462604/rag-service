@@ -66,6 +66,11 @@ public class Skill {
             new ArrayList<>();
 
     /**
+     * 业务验收条件，S1 与 S2 共享，不包含业务代码生成步骤。
+     */
+    private List<String> acceptance = new ArrayList<>();
+
+    /**
      * 是否每次请求都生效
      */
     private boolean alwaysApply;

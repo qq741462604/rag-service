@@ -36,7 +36,9 @@ ai:
     url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
     key: ${LLM_API_KEY}
     model: qwen3.5-plus-2026-02-15
-    enable-thinking: false
+    enable-thinking: false  #qwen的配置
+    thinking-type: disabled # deepseek的配置 thinking.type，可选 enabled/disabled
+    reasoning-effort: high #  deepseek的配置 reasoning_effort，可选 low/high/max
     connect-timeout-millis: 1800000 # 保持原有30分钟连接超时
     read-timeout-millis: 1800000 # 保持原有30分钟读取超时
 

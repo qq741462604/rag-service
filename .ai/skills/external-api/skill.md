@@ -37,6 +37,10 @@ Rules:
 17. 如果 Target 已知且已存在，必须先 search_code/read_file 读取 Target 真实路径和 package，再生成新类；新类 package 必须从 Target 真实 package 推导，禁止使用 com.example、demo、example 之类的兜底包名。
 18. 如果 Target package 以 .extension 结尾，新类必须落在去掉 .extension 后的业务根包下的 config、client、dto 包中。
 19. 所有模板示例仅作结构参考，禁止直接照抄示例中的 package 名、类名或路径名。
+20. ApiConfig 使用 @ConfigurationProperties 绑定真实前缀，配合 @Component 或 @Configuration 注册，字段包含 url、method、timeout；保留已有等价组件注册方式。
+21. S1 必须完整读取复用的 Config、Client、DTO、业务 RestTemplate 工厂和实际生效的 application.yml/yaml，不把必要支持类、URL/method/timeout 配置或入口写回留到 S2。
+22. 禁止在 Client 和 Target 中 new RestTemplate；业务 @Configuration 的 @Bean 工厂可创建 RestTemplate，并将真实 ApiConfig.timeout 同时用于连接和读取超时。Client 使用 @Qualifier 对应同一个业务 Bean。
+23. Client 方法须完成实际 HTTP 请求和 DTO 返回处理，构造器或返回 null/常量的占位方法不算完成；异常/空响应按本需求与已有项目约定处理。
 
 Implementation:
 
@@ -95,7 +99,7 @@ public class UserApiRestTemplateConfig {
 Client 必需模板，生成时必须补齐实际 package 和 import:
 
 ```java
-import com.study.plugin.config.UserApiConfig;
+// UserApiConfig 的 import 使用 Target 真实业务根包，生成文件时补齐。
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
@@ -116,6 +120,14 @@ public class UserApiClient {
 }
 ```
 
+Acceptance:
+
+- 从真实 handle 调用 Mock Client，核对需求字段传参、返回 DTO 对应的业务写回及 data/originData；保留入口生命周期和已有业务。
+- Client 单测用 Mock RestTemplate，捕获并验证来自 ApiConfig 的 URL/method、实际请求体/请求头及 DTO 结果，不访问真实网络；覆盖正常、空响应和异常分支。
+- 业务 RestTemplate 工厂使用真实测试配置，验证连接/读取超时都来自 timeout；Client 的 @Qualifier 对应正确 Bean，禁止只检查 Config getter 或 Bean 非空代替真实超时验证。
+- application.yml/yaml 的真实绑定前缀、url、method、timeout 完整；配置只按需求局部补齐，不覆盖其它配置。
+- 所有命中业务条目、Client、DTO、Config、工厂和入口齐全后才进入 S2；使用系统指定的 SourceClassTest 路径补齐测试。
+
 Forbidden:
 
 - create Target
@@ -126,7 +138,7 @@ Forbidden:
 - HTTP code in handle
 - hardcode URL
 - hardcode timeout
-- new RestTemplate
+- Client 或 Target 中 new RestTemplate（业务 @Bean 工厂允许）
 - HttpURLConnection
 - JSON 解析放 Target
 - Client 直接 put EventData

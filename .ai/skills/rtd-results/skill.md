@@ -6,7 +6,6 @@ keywords:
 - rtdResults
 - procVars
 - rtqVars
-- eventFields
 - externalVars
 - predict_rescale_score
 - ScoreAnalysisEventHandler
@@ -30,7 +29,7 @@ handle
 Rules:
 
 1. 所有返回数据加工逻辑必须在 ScoreAnalysisEventHandler.handle 中完成。
-2. Target 固定为 package com.study.plugin.extension 下的 ScoreAnalysisEventHandler，必须先 search_code/read_file 读取真实路径和完整文件后再修改。
+2. Target 类名固定为 ScoreAnalysisEventHandler，package 和路径以目标工程实际源码为准；先 search_code/read_file 确认并读取完整文件，禁止硬编码示例包名。
 3. 只能围绕已有 rtdResults 增量追加返回字段，禁止重写 rtdResults 创建、赋值、返回或已有 put 逻辑。
 4. 禁止删除、替换、移动原本逻辑，禁止修改已有方法签名、继承关系、构造器和生命周期。
 5. 禁止新增 Service、Controller、DTO、Config 或辅助类。
@@ -39,11 +38,13 @@ Rules:
 8. patch_file 必须使用小片段增量替换，禁止把整个类或整个文件作为 oldText/newText。
 9. patch_file 的 oldText 禁止包含日志字符串 CustomerEventHandler start... 或任何 ... 字符。
 10. rtdResults.put 追加返回字段必须放到 handle 方法已有 try 代码块内部，和原有 scoreResult 写回逻辑保持同一异常处理边界。
+11. EventData 的 getProcVars/getEventVars/getRtqVars 等签名必须先从已有调用或真实 API 确认；示例注释不保证当前版本存在该方法，禁止凭空打开无效调用。
+12. 返回已有模型评分不要求新增模型调用；只把已存在的评分转换为 String。来源 Map 缺失、评分缺失或显式 null 时按空字符串返回，禁止 String.valueOf(null) 生成字符串 "null"。
 
 Implementation:
 
 Step1:
-search_code 定位 ScoreAnalysisEventHandler，确认 package 为 com.study.plugin.extension。
+search_code 定位 ScoreAnalysisEventHandler，read_file 确认真正的 package 和完整源码，不按示例包名猜路径。
 
 Step2:
 read_file 读取完整 ScoreAnalysisEventHandler，确认 handle 方法中已有 rtdResults、eventData、eventFields 等上下文。
@@ -97,9 +98,8 @@ Map<String, Object> eventFields = eventData.getEventVars();
 推荐增量代码:
 
 ```java
-String predictRescaleScore = String.valueOf(
-        eventFields.getOrDefault("predict_rescale_score", "")
-);
+Object scoreValue = eventFields == null ? null : eventFields.get("predict_rescale_score");
+String predictRescaleScore = scoreValue == null ? "" : String.valueOf(scoreValue);
 rtdResults.put("predict_rescale_score", predictRescaleScore);
 ```
 
@@ -140,6 +140,13 @@ patch_file 生成要求:
 3. 禁止整文件替换。
 4. 禁止 oldText 包含 CustomerEventHandler start...。
 5. 禁止 oldText 包含 ...。
+
+Acceptance:
+
+- 调用真实 handle，原有 scoreResult 和其它返回项保持正确；逐一验证用户要求的 procVars/rtqVars/externalVars/自定义 key，不仅检查返回 Map 非空。
+- 已有模型评分按真实来源返回字符串；缺失、显式 null、空来源 Map 返回空字符串；数值评分验证实际字符串值，不触发模型/HTTP 调用。
+- 新增写回与已有 scoreResult 处于同一 try 异常边界；不重复 put 同名 key、不覆盖已有无关返回值。
+- 使用真实 EventData API，Mock 外部依赖；保留原有测试及断言，不为测试改变入口生命周期。
 
 Forbidden:
 

@@ -171,6 +171,8 @@ public class RequirementParseService {
             Map<String, Object> req = new HashMap<>();
             req.put("model", properties.getModel());
             req.put("chat_template_kwargs", deepThinkType);
+            req.put("thinking", java.util.Collections.singletonMap("type", properties.getThinkingType()));
+            req.put("reasoning_effort", properties.getReasoningEffort());
             req.put("messages", messages);
 
             return llmClient.chat(ChatRequest.forRawResponse(

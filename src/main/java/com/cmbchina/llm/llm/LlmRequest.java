@@ -20,6 +20,17 @@ public class LlmRequest {
     @JsonProperty("chat_template_kwargs")
     private Map<String, Object> chatTemplateKwargs;
 
+    /**
+     * 模型思考模式，序列化为 thinking.type。
+     */
+    private Map<String, String> thinking;
+
+    /**
+     * 模型推理强度，使用接口要求的下划线参数名。
+     */
+    @JsonProperty("reasoning_effort")
+    private String reasoningEffort;
+
 
     private List<Message> messages;
 

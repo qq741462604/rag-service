@@ -171,14 +171,16 @@ public class MavenDependencySupport {
             rules.append("只允许局部补充入口所属模块 POM: ")
                     .append(workspaceService.relativePath(files.get(0))).append("；本地父 POM 只读。\n");
             Map<String, String> mappings = mappings();
-            Set<String> hints = new LinkedHashSet<>();
+            Map<String, String> hints = new LinkedHashMap<>();
             Set<String> importsUsed = new LinkedHashSet<>();
             for (Observation observation : context.getObservations()) {
                 if (!observation.isSuccess() || !(observation.getResult() instanceof FileContent)) {
                     continue;
                 }
                 FileContent content = (FileContent) observation.getResult();
-                if (content.getPath() == null || !content.getPath().replace('\\', '/').endsWith(template)) {
+                if (content.getPath() == null || content.getLines() == null
+                        || (template != null && !content.getPath().replace('\\', '/').endsWith(template))
+                        || (template == null && !content.getPath().replace('\\', '/').contains("src/main/"))) {
                     continue;
                 }
                 String text = String.join("\n", content.getLines()).replaceAll("(?m)^\\d+: ?", "");
@@ -187,15 +189,15 @@ public class MavenDependencySupport {
                     importsUsed.add(imports.group(1));
                     String providers = providers(imports.group(1), mappings);
                     if (providers != null) {
-                        hints.add(imports.group(1) + " -> " + providers);
+                        hints.put(imports.group(1), providers);
                     }
                 }
             }
-            rules.append("当前模板已知候选坐标（按实际生成代码使用情况补充，不要求照单全加）: ")
-                    .append(hints).append("\n当前模块及可访问本地父链的编译依赖声明: ")
+            rules.append("当前模板已知候选（候选坐标组合 -> 完整类型列表；按需选用，不是全加清单）: ")
+                    .append(groupProviderTypes(hints)).append("\n当前模块及可访问本地父链的编译依赖声明: ")
                     .append(compileDependencies(context)).append('\n');
-            rules.append("已声明依赖本地 JAR 的精确类型证据（优先复用，无需再加提供同一类型的依赖）: ")
-                    .append(jarProviders(context, importsUsed)).append('\n');
+            rules.append("已声明依赖本地 JAR 的精确类型证据（坐标 -> 完整类型列表；优先复用）: ")
+                    .append(groupProviderTypes(jarProviders(context, importsUsed))).append('\n');
             rules.append(versionRules(importsUsed, mappings));
         } catch (Exception exception) {
             rules.append("依赖环境待确认: ").append(exception.getMessage()).append('\n');
@@ -382,9 +384,17 @@ public class MavenDependencySupport {
         } catch (Exception exception) {
             throw new IllegalArgumentException("依赖映射读取失败: " + exception.getMessage(), exception);
         }
-        return "已读源码依赖候选（按需选用，不是全加清单）: " + hints
-                + "\n已有编译依赖 JAR 精确类型证据（优先复用）: "
-                + jarProviders(context, imports) + "\n" + versions;
+        return "已读源码依赖候选（候选坐标组合 -> 完整类型列表；按需选用，不是全加清单）: " + groupProviderTypes(hints)
+                + "\n已有编译依赖 JAR 精确类型证据（坐标 -> 完整类型列表；优先复用）: "
+                + groupProviderTypes(jarProviders(context, imports)) + "\n" + versions;
+    }
+
+    /** 仅合并展示中重复的坐标，保留全部类型、完整候选组合和优先顺序，不用于依赖门禁。 */
+    private Map<String, List<String>> groupProviderTypes(Map<String, String> providers) {
+        Map<String, List<String>> groups = new LinkedHashMap<>();
+        providers.forEach((type, coordinates) ->
+                groups.computeIfAbsent(coordinates, key -> new ArrayList<>()).add(type));
+        return groups;
     }
 
     private Set<String> observedImports(AgentContext context) {

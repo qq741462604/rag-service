@@ -39,16 +39,19 @@ public class SkillTemplateCoordinator {
     private final TemplateContractValidator contractValidator;
     private final WorkspaceService workspaceService;
     private final MavenDependencySupport dependencySupport;
+    private final BusinessSkillContractValidator businessContracts;
 
     @Value("${codex.agent.test-generation-enabled:false}")
     private boolean testGenerationEnabled;
 
     public SkillTemplateCoordinator(SkillMatcher skillMatcher, TemplateContractValidator contractValidator,
-                                    WorkspaceService workspaceService, MavenDependencySupport dependencySupport) {
+                                    WorkspaceService workspaceService, MavenDependencySupport dependencySupport,
+                                    BusinessSkillContractValidator businessContracts) {
         this.skillMatcher = skillMatcher;
         this.contractValidator = contractValidator;
         this.workspaceService = workspaceService;
         this.dependencySupport = dependencySupport;
+        this.businessContracts = businessContracts;
     }
 
     public CodePlan ensureTemplatesRead(AgentContext context, CodePlan plan) {
@@ -196,6 +199,12 @@ public class SkillTemplateCoordinator {
         List<String> paths = new ArrayList<>();
         String current = currentTemplate(context);
         if (!contractValidator.isImplementationTemplate(current)) {
+            if (current == null && businessContracts.supports(context)) {
+                paths.addAll(businessContracts.artifactPaths(context));
+                for (File pom : dependencySupport.pomFiles(context)) {
+                    paths.add(workspaceService.relativePath(pom));
+                }
+            }
             return paths;
         }
         for (File pom : dependencySupport.pomFiles(context)) {
@@ -250,7 +259,7 @@ public class SkillTemplateCoordinator {
     }
 
     public String currentTemplate(AgentContext context) {
-        List<String> paths = new ArrayList<>(templatePaths(context.getTask()));
+        List<String> paths = new ArrayList<>(extractTemplatePaths(context.getSkills()));
         // 总览优先，其余分块按编号顺序执行，不依赖 Skill 文本路径的出现顺序。
         paths.sort(Comparator.comparing(path -> path.contains("predict-call-template-parts/") ? "1" + path : "0" + path));
         for (String path : paths) {
@@ -262,7 +271,7 @@ public class SkillTemplateCoordinator {
     }
 
     public boolean hasTemplates(AgentContext context) {
-        return !templatePaths(context.getTask()).isEmpty();
+        return !extractTemplatePaths(context.getSkills()).isEmpty();
     }
 
     public void advanceAfterExecution(AgentContext context) {
@@ -288,14 +297,24 @@ public class SkillTemplateCoordinator {
 
     public List<String> validateAll(AgentContext context) {
         List<String> errors = new ArrayList<>();
-        for (String path : templatePaths(context.getTask())) {
+        for (String path : extractTemplatePaths(context.getSkills())) {
             errors.addAll(contractValidator.validate(path, context));
         }
+        errors.addAll(businessContracts.validate(context));
         return errors;
     }
 
+    public boolean hasBusinessContracts(AgentContext context) {
+        return businessContracts.supports(context);
+    }
+
+    public List<String> validateBusiness(AgentContext context) {
+        return businessContracts.validate(context);
+    }
+
     public void validatePomPreview(AgentContext context, File file, String before, String after) {
-        if (hasTemplates(context) && "pom.xml".equals(file.getName())) {
+        businessContracts.validatePreview(context, file, before, after);
+        if ((hasTemplates(context) || hasBusinessContracts(context)) && "pom.xml".equals(file.getName())) {
             dependencySupport.validatePomAdditions(context, before, after);
         }
     }
@@ -303,7 +322,10 @@ public class SkillTemplateCoordinator {
     public String buildCurrentRules(AgentContext context) {
         String current = currentTemplate(context);
         if (current == null) {
-            return "所有模板已通过产物结构检查。\n";
+            return "固定模板已完成或当前 Skill 无独立模板；继续完成全部命中 Skill 的入口、支持类和验收要求。\n"
+                    + "复用的支持类、DTO、配置工厂和生效配置同样需要成功读取确认；一次写入或空计划不能替代完成。\n"
+                    + (businessContracts.supports(context) ? dependencySupport.buildRules(context, null) : "")
+                    + "普通 Skill 尚缺产物: " + context.getTemplateErrors() + "\n";
         }
         return "当前唯一实施模板: " + current + "\n已完成模板: " + context.getCompletedTemplates()
                 + "\n先按当前模板完成全部产物（可分多轮写入），服务端检查通过后才切换下一模板。"
@@ -336,7 +358,8 @@ public class SkillTemplateCoordinator {
         if (mutation && isTemplatePath(path)) {
             throw new IllegalArgumentException("参考模板只读: " + path);
         }
-        if (mutation && "pom.xml".equals(new File(path).getName()) && hasTemplates(context)) {
+        if (mutation && "pom.xml".equals(new File(path).getName())
+                && (hasTemplates(context) || hasBusinessContracts(context))) {
             File modulePom = dependencySupport.modulePom(context);
             if (modulePom == null || !modulePom.equals(workspaceService.resolve(path))) {
                 throw new IllegalArgumentException("只能修改入口所属模块 POM，本地父 POM 与其它模块只读: " + path);

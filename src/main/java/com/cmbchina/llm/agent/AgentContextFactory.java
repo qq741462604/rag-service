@@ -4,7 +4,7 @@ package com.cmbchina.llm.agent;
 import com.cmbchina.llm.memory.Memory;
 import com.cmbchina.llm.memory.MemoryStore;
 import com.cmbchina.llm.skill.Skill;
-import com.cmbchina.llm.skill.SkillLoader;
+import com.cmbchina.llm.skill.SkillMatcher;
 import com.cmbchina.llm.trace.AgentTrace;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
@@ -23,7 +23,7 @@ import java.util.List;
 public class AgentContextFactory {
 
     private final MemoryStore memoryStore;
-    private final SkillLoader skillLoader;
+    private final SkillMatcher skillMatcher;
 
     public AgentContext create(String agentId, String task, AgentTrace trace) {
         return AgentContext.builder()
@@ -33,7 +33,7 @@ public class AgentContextFactory {
                 .phase(AgentPhase.ANALYSIS)
                 .memories(safeMemoryQuery(task))
                 .observations(new ArrayList<>())
-                .skills(loadSkills())
+                .skills(loadSkills(task))
                 .build();
     }
 
@@ -42,8 +42,8 @@ public class AgentContextFactory {
         return memories == null ? new ArrayList<>() : memories;
     }
 
-    private List<Skill> loadSkills() {
-        List<Skill> skills = skillLoader.load();
+    private List<Skill> loadSkills(String task) {
+        List<Skill> skills = skillMatcher.match(task);
         return skills == null ? new ArrayList<>() : skills;
     }
 }

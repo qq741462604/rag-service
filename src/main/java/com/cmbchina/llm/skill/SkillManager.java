@@ -12,7 +12,10 @@ public class SkillManager {
     private final SkillMatcher matcher;
 
     public String buildContext(String task) {
-        List<Skill> skills = matcher.match(task);
+        return buildContext(matcher.match(task));
+    }
+
+    public String buildContext(List<Skill> skills) {
         StringBuilder sb = new StringBuilder();
         for (Skill skill : skills) {
             sb.append("\n## Skill:")
@@ -40,6 +43,8 @@ public class SkillManager {
             String implementation = String.join("\n", skill.getImplementation());
             sb.append(limit(implementation, 8000));
 
+            sb.append("\nAcceptance:\n").append(String.join("\n", skill.getAcceptance()));
+
 
             sb.append("\n\nForbidden:\n");
             for (String forbidden : skill.getForbidden()) {
@@ -49,6 +54,29 @@ public class SkillManager {
             }
         }
         return sb.toString();
+    }
+
+    /** 只传业务契约及验收，不在测试阶段重复注入生产代码生成步骤。 */
+    public String buildAcceptanceContext(List<Skill> skills, String sourceClass) {
+        StringBuilder result = new StringBuilder();
+        for (Skill skill : skills) {
+            if (skill.isAlwaysApply() || skill.getTarget() == null || sourceClass != null
+                    && !sourceClass.equals(skill.getTarget().getClassName())
+                    && !"external-api".equals(skill.getName())) {
+                continue;
+            }
+            result.append("\nSkill 验收: ").append(skill.getName()).append(" target=")
+                    .append(skill.getTarget().getClassName()).append("#")
+                    .append(skill.getTarget().getMethodName()).append("\nRules:\n")
+                    .append(String.join("\n", skill.getRules())).append("\nAcceptance:\n")
+                    .append(String.join("\n", skill.getAcceptance())).append("\nForbidden:\n")
+                    .append(String.join("\n", skill.getForbidden())).append("\n");
+            if (sourceClass != null) {
+                result.append("当前测试职责按 ").append(sourceClass)
+                        .append(" 的真实实现确定；支持类覆盖自身契约，入口覆盖整体调用和写回，不重复生成业务代码。\n");
+            }
+        }
+        return result.toString();
     }
 
     private String limit(String text, int max) {

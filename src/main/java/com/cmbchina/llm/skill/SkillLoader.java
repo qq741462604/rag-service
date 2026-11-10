@@ -31,6 +31,7 @@ public class SkillLoader {
         if (file.isDirectory()) {
             File[] files = file.listFiles();
             if (files != null) {
+                java.util.Arrays.sort(files, java.util.Comparator.comparing(File::getName));
                 for (File child : files) {
                     scan(child, result);
                 }
@@ -104,6 +105,10 @@ public class SkillLoader {
                 mode = "implementation";
                 continue;
             }
+            if (lower.startsWith("acceptance")) {
+                mode = "acceptance";
+                continue;
+            }
             if (lower.startsWith("target")) {
                 mode = "target";
                 continue;
@@ -135,6 +140,10 @@ public class SkillLoader {
             }
             if ("implementation".equals(mode)) {
                 skill.getImplementation().add(rawLine);
+                continue;
+            }
+            if ("acceptance".equals(mode)) {
+                skill.getAcceptance().add(cleanLine(line));
                 continue;
             }
             if ("target".equals(mode)) {
@@ -201,6 +210,6 @@ public class SkillLoader {
     }
 
     private String cleanLine(String line) {
-        return line.replace("-", "").trim();
+        return line.replaceFirst("^[-*]\\s+", "").trim();
     }
 }

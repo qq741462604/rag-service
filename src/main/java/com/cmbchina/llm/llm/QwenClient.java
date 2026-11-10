@@ -25,6 +25,8 @@ public class QwenClient {
             Map<String, Object> deepThinkType = new HashMap<>();
             deepThinkType.put("enable_thinking", properties.isEnableThinking());
             request.setChatTemplateKwargs(deepThinkType);
+            request.setThinking(Collections.singletonMap("type", properties.getThinkingType()));
+            request.setReasoningEffort(properties.getReasoningEffort());
             request.setMessages(Collections.singletonList(new LlmRequest.Message("user", prompt)));
 
             // 继续使用 Jackson 序列化规划请求，不加入文档角色的 system 消息。

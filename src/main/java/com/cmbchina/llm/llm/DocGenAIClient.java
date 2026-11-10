@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +43,8 @@ public class DocGenAIClient {
             Map<String, Object> req = new HashMap<>();
             req.put("model", properties.getModel());
             req.put("chat_template_kwargs", deepThinkType);
+            req.put("thinking", Collections.singletonMap("type", properties.getThinkingType()));
+            req.put("reasoning_effort", properties.getReasoningEffort());
             req.put("messages", messages);
 
             return queryLLM(req);

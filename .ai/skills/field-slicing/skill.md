@@ -34,7 +34,7 @@ Rules:
 5. 源字段为空、N 或 M 非正数、起始位置超过长度、请求长度超过可用长度时，不抛出下标异常，不覆盖原字段，也不写入目标字段。
 6. 只在源字段非 null 时转换为 String；禁止把 null 转换为字符串 "null"。
 7. 所有字段写回都使用 eventData.putDataAndOriginData()；禁止直接修改 eventData.getData() 返回的 Map。
-8. 截取后日期转换必须先完成截取，再按用户指定的源格式解析，并按用户指定的目标格式写入新的日期字段；格式或值不合法时不写入目标字段。
+8. 截取后日期转换必须先完成截取，再按用户指定的源格式严格解析并消费完整输入；日期不允许自动滚动纠正，java.time 用 STRICT 与 uuuu 年份，SimpleDateFormat 用 setLenient(false) 并核对 ParsePosition。按指定格式写回新日期字段，非法值不写回；时间用 24 小时制 HH，仅有日期且输出含时间时明确补 00:00:00。
 9. 必须保留 handle 中已有字段加工调用、异常处理和报文结构；新增调用放在已有 eventFields 获取之后，不替换或删除既有逻辑。
 10. 不创建 Service、Controller、DTO、Config 或无关辅助类；需要辅助逻辑时只在目标类新增职责明确的 private 方法。
 
@@ -59,6 +59,13 @@ Example:
 “截取 orderNo 前 10 位保存为 orderPrefix”表示从 orderNo 的第 1 位开始取 10 位，写入 orderPrefix。
 
 “截取 eventTime 从第 9 位开始取 8 位，按 yyyyMMdd 转为 yyyy-MM-dd 保存为 eventDate”表示先截取，再转换日期，最后写入 eventDate。
+
+Acceptance:
+
+- 从真实 handle 执行前 N、后 N、从第 M 位取 N 位的本需求分支，验证准确边界、目标字段和 data/originData，不能仅断言非空或长度。
+- 长度恰好为 N / M+N-1 时成功；不足长度、越界、N/M 非正数、null/空值时不新增或覆盖目标，原字段保持不变。
+- 用户指定新目标时不覆盖源字段；未指定目标或明确保留/覆盖时只按约定写回原字段。
+- 截取后日期转换覆盖正常、闰日、非闰年非法日期、非法时间；失败不写回。同项加工只调用一次，已有其它加工继续执行。
 
 Forbidden:
 

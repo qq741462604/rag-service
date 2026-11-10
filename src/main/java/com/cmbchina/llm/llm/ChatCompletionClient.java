@@ -123,6 +123,14 @@ public class ChatCompletionClient implements LlmClient {
                         inputTokens >= 0 && outputTokens >= 0 ? inputTokens + outputTokens : -1);
                 log.info("llm usage role={} model={} inputTokens={} outputTokens={} totalTokens={}",
                         role, model, inputTokens, outputTokens, totalTokens);
+                // 缓存统计完全采用服务商返回值；缺失时不推算，不影响响应解析或请求参数。
+                long cachedInputTokens = usage.path("prompt_cache_hit_tokens").asLong(
+                        usage.path("prompt_tokens_details").path("cached_tokens").asLong(-1));
+                long uncachedInputTokens = usage.path("prompt_cache_miss_tokens").asLong(-1);
+                if (cachedInputTokens >= 0 || uncachedInputTokens >= 0) {
+                    log.info("llm input cache role={} model={} cachedInputTokens={} uncachedInputTokens={} (-1=unavailable)",
+                            role, model, cachedInputTokens, uncachedInputTokens);
+                }
                 usageAvailable = true;
             }
         } catch (Exception exception) {

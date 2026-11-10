@@ -7,9 +7,12 @@ import com.cmbchina.llm.tool.FileContent;
 import com.cmbchina.llm.tool.FileOperationResult;
 import com.cmbchina.llm.tool.ToolInput;
 import com.cmbchina.llm.verify.TestSourceInspector;
+import com.cmbchina.llm.skill.SkillManager;
 import com.cmbchina.llm.verify.VerifyResult;
 import com.cmbchina.llm.workspace.WorkspaceService;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.MethodCallExpr;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -45,6 +48,8 @@ public class S2TestCoordinator {
     private final MavenDependencySupport dependencySupport;
     private final TestSourceInspector inspector;
     private final TemplateContractValidator contractValidator;
+    private final SkillManager skillManager;
+    private final BusinessSkillContractValidator businessContracts;
 
     public void initialize(AgentContext context) {
         if (context.getVariables().containsKey(STATE)) {
@@ -94,6 +99,26 @@ public class S2TestCoordinator {
                     new File(module, "src/test/java/" + relative).getPath()));
             entry.testClass = (pkg.isEmpty() ? "" : pkg + ".") + sourceClass + "Test";
             state.entries.add(entry);
+        }
+        for (Entry entry : state.entries) {
+            state.referenceSources.put(entry.sourceClass, entry.source);
+        }
+        if (businessContracts.supports(context)) {
+            Set<String> ambiguous = new LinkedHashSet<>();
+            for (String path : businessContracts.artifactPaths(context)) {
+                File file = workspaceService.resolve(path);
+                if (!file.getName().endsWith(".java") || !file.toPath().startsWith(sourceRoot.toPath())) {
+                    continue;
+                }
+                CompilationUnit unit = inspector.parse(inspector.read(file));
+                for (com.github.javaparser.ast.body.TypeDeclaration<?> type : unit.getTypes()) {
+                    String old = state.referenceSources.putIfAbsent(type.getNameAsString(), path);
+                    if (old != null && !old.equals(path)) {
+                        ambiguous.add(type.getNameAsString());
+                    }
+                }
+            }
+            ambiguous.forEach(state.referenceSources::remove);
         }
         if (state.entries.isEmpty()) {
             throw new IllegalArgumentException("S2 没有可执行测试条目；跳过原因=" + state.skipped);
@@ -200,7 +225,11 @@ public class S2TestCoordinator {
                 + "；唯一测试产物: " + (entry == null ? "全部完成" : entry.test)
                 + "；模块 POM: " + state.pom + "\n"
                 + "当前测试文件存在: " + (entry != null && workspaceService.resolve(entry.test).isFile()) + "\n"
+                + "当前测试文件不存在时，直接按真实业务源码生成该路径的新测试，不要尝试读取它或其它尚未生成的测试。\n"
                 + "当前未满足项: " + (entry == null ? "无" : validate(state, entry)) + "\n"
+                + skillManager.buildAcceptanceContext(context.getSkills(), entry == null ? null : entry.sourceClass)
+                + "逐项将命中 Skill 的 Acceptance 转为真实输入、调用和结果/交互断言；测试方法名或有断言不代表业务验收已覆盖。"
+                + "同一入口命中多个 Skill 时全部覆盖；测试失败保留原断言强度，先核对并修复真实业务实现。\n"
                 + testDependencyRules(context)
                 + testIsolationRules()
                 + "使用真实业务签名和已有 JUnit4/5、断言/Mockito；测试须有实际业务断言。"
@@ -208,6 +237,7 @@ public class S2TestCoordinator {
                 + "固定评分输入用具体 BigDecimal 期望验证写回，不仅使用 any(BigDecimal.class)；"
                 + "HTTP 头和参数测试捕获实际 HttpUriRequest 验证，不仅断言响应桩的返回常量。"
                 + "覆盖正常、异常、空值及本需求分支；HTTP/DB/私有服务使用 mock，不启动 Spring 全上下文或真实网络。"
+                + responseCoverageRules(context)
                 + "已有测试先读后局部 patch；禁止重写业务、空壳、恒定值断言、禁用、assume 或删除既有测试/断言。"
                 + "缺测试依赖只局部补模块 POM test scope，版本复用已有管理；不能猜私有依赖坐标或版本。"
                 + "使用 Mockito.mockStatic/mockConstruction 前核对实际 Mockito 版本及 MockMaker；"
@@ -224,6 +254,8 @@ public class S2TestCoordinator {
 
     public String testDependencyRules(AgentContext context) {
         return initializationFeedback(context) + dependencySupport.testDependencyRules(context)
+                + (context.getPhase() == AgentPhase.REPAIR
+                ? skillManager.buildAcceptanceContext(context.getSkills(), null) : "")
                 + "请求 JSON 必须逐字使用当前实体 @JsonProperty 的键名及大小写，不能将 requestHeader/requestData "
                 + "猜成 response_header 风格；当前真实映射（规范化名称=协议键）: " + requestJsonProperties(state(context)) + "。\n"
                 + "默认 Lombok @Data/@ToString 的 toString 使用 Java 字段名，@JsonProperty 不会把它改成协议键。"
@@ -237,6 +269,51 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        if (errors.contains("Bsr_Opr_Dat") || errors.contains("动态日期断言")) {
+            rules.append("经办日不是 expDat。核对当前 Handler 的上海时区日期来源，保留原 assertEquals 和实际值/消息，")
+                    .append("预期改用同一 root 的 header.get(\"requestTime\").asText().substring(0, 8)；")
+                    .append("保留 root/header/data 的声明及初值；header/data 分别从 request_header/request_data 读取。")
+                    .append("源码证明动态来源时门禁认可该精确修正，不能改 Bsr_Ept_Dat 或硬编码今天。\n");
+        }
+        if (errors.contains("静态 Bean 隔离") || errors.contains("初始化交互边界")) {
+            rules.append("逐项修复真实 Handler 和 HttpClientUtil 的可变静态 Bean：先准备 Spring Bean/工厂，")
+                    .append("保存旧字段、注入本轮配置与 tracer，AfterEach finally 恢复旧值（即使旧值为 null）。")
+                    .append("使用 ReflectionTestUtils.getField/setField，不能只替换缓存实例 httpClient。")
+                    .append("验证 init 获取 Bean 次数时，在调用 init 前先对已有 Spring MockedStatic 句柄 clearInvocations()，")
+                    .append("保留原精确 verify；不能 reset、改 times 或使用 atLeastOnce。\n");
+        }
+        if (errors.contains("模板响应测试缺少可见证据")) {
+            rules.append(responseCoverageRules(context));
+        }
+        if (errors.contains("StringEntity") && errors.contains("getValue")) {
+            rules.append("本轮编译错误是 Apache StringEntity 没有 getValue，不是 Header.getValue 不可用。")
+                    .append("原 ((StringEntity) 实体表达式).getValue() 在原位置改为 EntityUtils.toString(同一实体表达式, Consts.UTF_8)，")
+                    .append("补 import org.apache.http.util.EntityUtils 和 org.apache.http.Consts，必要时保留 throws Exception。")
+                    .append("断言中的读取直接替换原实际值，保持原 assertEquals 预期、消息、捕获变量声明/初值及其它验证；")
+                    .append("保留原 StringEntity 转换，或保留已有的同实体 instanceof StringEntity 断言后去掉多余转换。")
+                    .append("系统支持这一真实类型明确的 API 修正，不引入正文别名/helper，不使用实体自身 toString()。")
+                    .append("同时核对 HttpClientUtilTest、DataPrepEventHandlerTest 和 AhiHttpInvokerHandlerTest 的所有同类调用，")
+                    .append("局部变量初始化中的正文读取也要修复，不能改生产代码或删除请求体检查。\n");
+        }
+        if (errors.contains("expected: <application/json> but was: <application/json; charset=UTF-8>")) {
+            rules.append("本轮 Content-Type 失败先核对真实 Handler：ContentType.APPLICATION_JSON.toString() 包含 UTF-8 字符集。")
+                    .append("源码确认后，仅把失败用例 assertEquals 的第一个裸 MIME 预期改成 ")
+                    .append("ContentType.APPLICATION_JSON.toString() 并补 import org.apache.http.entity.ContentType，")
+                    .append("或完整字符串 application/json; charset=UTF-8。系统支持这一有依据的精确预期纠正；")
+                    .append("保留原 getFirstHeader(HTTP.CONTENT_TYPE).getValue()、捕获变量声明及初值、消息和全部其它断言/验证。")
+                    .append("同一问题涉及入口与 Handler 两个测试，逐一修复；不能改用 contains/startsWith、提取 MIME、")
+                    .append("删除字符集检查或修改生产头部来迎合错误预期。\n");
+        }
+        if (errors.contains("getEntity") && errors.contains("HttpUriRequest")) {
+            rules.append("本轮 HttpUriRequest.getEntity 编译错误只需修正请求体访问，保留原捕获对象和全部断言。")
+                    .append("HttpUriRequest 没有 getEntity，实体接口为 org.apache.http.HttpEntityEnclosingRequest。")
+                    .append("保留 captured 的声明及 requestCaptor.getValue() 初值；直接在原断言的实际值位置使用 ")
+                    .append("captured instanceof HttpEntityEnclosingRequest ? ((HttpEntityEnclosingRequest) captured).getEntity() : null，")
+                    .append("补齐真实 import。无实体分支 build 可能返回不实现实体接口的请求，不能盲目强转。")
+                    .append("门禁支持这一同对象、同 getEntity、非实体返回 null 的精确修正；")
+                    .append("保持 assertNotNull/assertEquals 的原类型、null/非空预期及其它参数不变，")
+                    .append("不新增别名或 helper 替换原验证，不改业务或改为更弱的断言。\n");
+        }
         if (errors.contains("toString") && (errors.contains("request_header") || errors.contains("Lombok"))) {
             rules.append("本轮实体断言把 JSON 协议键与 Lombok 调试文本混用。先核对实体字段及 @JsonProperty；")
                     .append("默认 @Data 的 requestHeader 在 toString 中仍名为 requestHeader，不是 request_header。")
@@ -387,6 +464,8 @@ public class S2TestCoordinator {
     public String testIsolationRules() {
         return "测试隔离必须依据真实可访问类型及实际创建路径：禁止 import 或全限定引用包私有 "
                 + "InternalHttpClient，全限定名不能绕过访问控制；禁止对抽象 CloseableHttpClient 做构造器 Mock。"
+                + "HTTP 头部预期取真实源码；ContentType.APPLICATION_JSON.toString() 包含 charset=UTF-8，"
+                + "验证完整 getFirstHeader(...).getValue() 时须用同一常量或对应完整字符串，不能误用裸 application/json。"
                 + "HttpClientUtil 调用 HttpClients.custom()，可 mockStatic(HttpClients.class)，"
                 + "返回 mock(HttpClientBuilder.class, RETURNS_SELF)，让 builder.build() 返回普通 "
                 + "mock(CloseableHttpClient.class)；单独拦截不在实际创建链上的构造器无效。"
@@ -411,13 +490,23 @@ public class S2TestCoordinator {
                 + "只读缓存不需要也不允许将同一缓存引用 setField 写回 static final 字段。"
                 + "响应 JSON 优先封装真实 StringEntity(json, Consts.UTF_8)，不对 HttpEntity.toString 配桩，"
                 + "没有活动静态 Mock 时不能 when(EntityUtils.toString(...))。"
-                + "并配置实际使用的可变静态 ReadConfig/BeeTraceClientHelper，不能改 final 引用。"
+                + "逐个保存/注入/恢复 Handler 和 HttpClientUtil 实际使用的可变静态 ReadConfig/BeeTraceClientHelper，"
+                + "旧值为 null 也须恢复；辅助子类或 closeStaticMocks helper 不免除隔离要求，不能改 final 引用。"
+                + "验证 init 的精确 Spring 调用次数前，用同一 MockedStatic 句柄 clearInvocations() 清除 setup 的初始化交互，"
+                + "紧接着调用真实 init，再保留原 verify；禁止 reset 删除桩或改成 atLeastOnce。"
+                + "经办日验证与同一请求 request_header.requestTime 的日期一致，不能把 Bsr_Opr_Dat 硬编码；"
+                + "Bsr_Ept_Dat 有 expDat 输入时仍断言输入，不要同时改掉。"
                 + "单纯换 Spring Bean Mock 不会让已初始化类再次取 Bean，禁止反射写 static final。"
                 + "HttpClient4 协议常量为 HttpVersion.HTTP_1_1，ProtocolVersion 没有 HTTP_1_1/HTTP_1_0；"
                 + "也可 new ProtocolVersion(\"HTTP\", 1, 1)。新增类型用法必须同时补真实 import。"
                 + "Mockito stub/verify 涉及声明 IOException 的 execute/close 等 API 时，测试方法也需捕获或声明异常；"
                 + "HttpClient4 的 execute 接收 HttpUriRequest；RequestBuilder 只传给业务 invoke，底层 execute 用 build 后的请求。"
                 + "stub/verify 使用 any(HttpUriRequest.class)，补真实 import，不能使用 any(RequestBuilder.class)。"
+                + "HttpUriRequest 未声明 getEntity；请求体使用 captured instanceof HttpEntityEnclosingRequest ? "
+                + "((HttpEntityEnclosingRequest) captured).getEntity() : null，补 org.apache.http.HttpEntityEnclosingRequest。"
+                + "无请求体时 build 可能返回非实体请求，必须保留该分支的 null 断言，不能盲目强转。"
+                + "Apache StringEntity 没有 getValue；读取请求/响应正文用 EntityUtils.toString(真实实体, Consts.UTF_8)，"
+                + "补 org.apache.http.util.EntityUtils 和 org.apache.http.Consts，不能用实体自身 toString() 读取正文。"
                 + "ReflectionTestUtils.setField(HttpClientUtil.class, ...) 也会触发首次静态初始化，"
                 + "必须先准备 ApplicationContext.getBean(ReadConfig.class)/getBean(BeeTraceClientHelper.class) 及有效容量配置。"
                 + "assertThrows lambda 外的 stub 不会被断言代为捕获，不能删除异常断言来消除编译错误。"
@@ -529,12 +618,15 @@ public class S2TestCoordinator {
                     errors.addAll(dependencySupport.validateMockitoCapability(context, previews));
                 }
                 if (!errors.isEmpty()) {
-                    throw new IllegalArgumentException("测试修改不满足门禁: " + errors);
+                    String snapshot = rejectedPreviewSnapshot(context, entry.testClass, after);
+                    throw new IllegalArgumentException("测试修改不满足门禁: path=" + path
+                            + (snapshot.isEmpty() ? "" : " snapshot=" + snapshot) + " errors=" + errors);
                 }
                 if (!before.isEmpty()) {
                     // 断言保护仍以修改前的业务语义为基线，避免同时修改生产代码来放宽断言。
                     inspector.preserveAssertions(before, after, inspector.read(workspaceService.resolve(entry.source)),
-                            entry.testClass, context.getVerifyErrors(), requestJsonProperties(state));
+                            entry.testClass, context.getVerifyErrors(), requestJsonProperties(state),
+                            requestHeaderSource(context, state));
                 }
             }
         }
@@ -555,6 +647,31 @@ public class S2TestCoordinator {
             }
             dependencySupport.validateTestPom(context, before, after,
                     context.getPhase() != AgentPhase.REPAIR, missingVersions);
+        }
+    }
+
+    /** 保留未执行的候选源码以定位误判；每任务最多三份，不写日志正文或目标工程。 */
+    private String rejectedPreviewSnapshot(AgentContext context, String testClass, String source) {
+        Object stored = context.getVariables().get("s2_rejected_preview_count");
+        int count = stored instanceof Number ? ((Number) stored).intValue() : 0;
+        byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
+        if (count >= 3 || bytes.length > 256 * 1024) {
+            return "";
+        }
+        try {
+            java.nio.file.Path directory = new File("logs/s2-preflight").toPath().toAbsolutePath().normalize();
+            java.nio.file.Files.createDirectories(directory);
+            String flow = String.valueOf(context.getVariables().get("s2_flow_id")).replaceAll("[^A-Za-z0-9_-]", "_");
+            java.nio.file.Path snapshot = java.nio.file.Files.createTempFile(directory,
+                    flow + "-" + testClass.replaceAll("[^A-Za-z0-9_-]", "_") + "-", ".java.txt");
+            java.nio.file.Files.write(snapshot, bytes);
+            context.getVariables().put("s2_rejected_preview_count", count + 1);
+            log.warn("S2流程 flow={} 预检拒绝的候选源码未执行，诊断文件={}", flow, snapshot);
+            return snapshot.toString();
+        } catch (java.io.IOException | SecurityException exception) {
+            log.warn("S2流程 flow={} 保存预检候选源码失败 type={}",
+                    context.getVariables().get("s2_flow_id"), exception.getClass().getSimpleName());
+            return "";
         }
     }
 
@@ -586,16 +703,68 @@ public class S2TestCoordinator {
                 .forEach(field -> references.add(field.getScope().toString()));
         unit.findAll(com.github.javaparser.ast.expr.MethodCallExpr.class)
                 .forEach(call -> call.getScope().ifPresent(scope -> references.add(scope.toString())));
+        collectTypeReferences(unit, references);
+        String business = previewSource(entry.source, previews);
+        collectTypeReferences(inspector.parse(business), references);
         Map<String, String> relatedSources = new LinkedHashMap<>();
-        // 仅复用本任务清单中显式类型/静态访问引用的源码，不扫描目标工程。
-        for (Entry related : state.entries) {
-            if (!related.source.equals(entry.source) && references.stream().anyMatch(name ->
-                    name.equals(related.sourceClass) || name.endsWith("." + related.sourceClass))) {
-                relatedSources.put(related.sourceClass, previewSource(related.source, previews));
+        // 本次修改类及已成功读取的复用支持类均可提供真实 API，不扫描目标工程。
+        for (int depth = 0; depth < state.referenceSources.size(); depth++) {
+            int previousSize = relatedSources.size();
+            for (Map.Entry<String, String> related : state.referenceSources.entrySet()) {
+                if (!related.getValue().equals(entry.source) && !relatedSources.containsKey(related.getKey())
+                        && references.stream().anyMatch(name ->
+                        name.equals(related.getKey()) || name.endsWith("." + related.getKey()))) {
+                    String content = previewSource(related.getValue(), previews);
+                    relatedSources.put(related.getKey(), content);
+                    collectTypeReferences(inspector.parse(content), references);
+                }
+            }
+            if (previousSize == relatedSources.size()) {
+                break;
             }
         }
-        return inspector.validate(source, entry.sourceClass, entry.testClass,
-                previewSource(entry.source, previews), relatedSources);
+        return inspector.validate(source, entry.sourceClass, entry.testClass, business, relatedSources);
+    }
+
+    private void collectTypeReferences(CompilationUnit unit, Set<String> references) {
+        unit.getImports().stream().filter(declaration -> !declaration.isStatic() && !declaration.isAsterisk())
+                .forEach(declaration -> references.add(declaration.getNameAsString()));
+        unit.findAll(com.github.javaparser.ast.type.ClassOrInterfaceType.class)
+                .forEach(type -> references.add(type.getNameAsString()));
+    }
+
+    private String responseCoverageRules(AgentContext context) {
+        State state = state(context);
+        Entry active = current(state);
+        String errors = String.join("\n", context.getVerifyErrors());
+        boolean handler = false;
+        boolean entry = false;
+        for (Entry candidate : state.entries) {
+            if (candidate != active && !(context.getPhase() == AgentPhase.REPAIR
+                    && (errors.contains(candidate.testClass) || errors.contains(candidate.test)))) {
+                continue;
+            }
+            CompilationUnit business = inspector.parse(inspector.read(workspaceService.resolve(candidate.source)));
+            handler |= business.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                    method.getNameAsString().equals("doPost") && method.findAll(MethodCallExpr.class).stream()
+                            .anyMatch(call -> call.getNameAsString().equals("parse")));
+            entry |= business.findAll(MethodDeclaration.class).stream().anyMatch(method ->
+                    method.getNameAsString().equals("ahiInvoke") && method.findAll(MethodCallExpr.class).stream()
+                            .anyMatch(call -> call.getNameAsString().equals("getAsBigDecimal")));
+        }
+        if (!handler && !entry) {
+            return "";
+        }
+        return (handler ? "模板 Handler 专项：非法 JSON 用 not-json、缺响应头用 {}，均通过真实 HTTP 响应路径验证返回 null。" : "")
+                + (entry ? "新版入口专项：按 BigDecimal 契约补 0.1/0.123456，验证可用性1和 new BigDecimal(对应十进制字符串)，"
+                + "不经过 float/double；另补成功码0000下缺 response_data、缺评分、缺 time、评分为 bad-score、time为 bad-time "
+                + "五个独立异常用例，改变一个字段时另一个字段必须有效。全部验证 ahiResultAvailable=0、time=0、"
+                + "rst_code=0000、评分BigDecimal.valueOf(2)，不要只验证不抛异常。" : "")
+                + "每例用完整响应 JSON 传响应夹具（方法名不限，可同时接收状态码，必须将正文放入实际返回响应的 StringEntity）"
+                + "或 new StringEntity(完整响应 JSON, Consts.UTF_8)，接入当前 HTTP execute 桩，调用真实业务；"
+                + "正文、实体及响应允许经本 @Test 内唯一声明且无重赋值的局部变量传递；execute 返回桩可在同类 BeforeEach/Before 中。"
+                + "Handler 可 assertNull(handler.doPost(...)) 或先保存返回值再 assertNull，支持 JUnit 消息参数。"
+                + "不是声明未使用的 JSON。保留原用例及所有有效断言。新精度契约由更新后的 S1 入口模板生成。\n";
     }
 
     private String previewSource(String path, Map<String, String> previews) {
@@ -657,11 +826,37 @@ public class S2TestCoordinator {
                 }
             }
         }
+        if (businessContracts.supports(context)) {
+            addRelatedSources(state, paths);
+        }
         addInitializationSources(state, paths);
         for (File pom : dependencySupport.pomFiles(context)) {
             paths.add(workspaceService.relativePath(pom));
         }
         return paths;
+    }
+
+    /** 从本任务已知源码沿真实类型引用补齐上下文，复用类不额外变成测试条目。 */
+    private void addRelatedSources(State state, List<String> paths) {
+        Set<String> references = new LinkedHashSet<>();
+        Set<String> scanned = new LinkedHashSet<>();
+        for (int depth = 0; depth <= state.referenceSources.size(); depth++) {
+            for (String path : new ArrayList<>(paths)) {
+                if (path.endsWith(".java") && workspaceService.resolve(path).isFile() && scanned.add(path)) {
+                    collectTypeReferences(inspector.parse(inspector.read(workspaceService.resolve(path))), references);
+                }
+            }
+            int previousSize = paths.size();
+            state.referenceSources.forEach((name, path) -> {
+                if (!paths.contains(path) && references.stream().anyMatch(reference -> reference.equals(name)
+                        || reference.endsWith("." + name))) {
+                    paths.add(path);
+                }
+            });
+            if (previousSize == paths.size()) {
+                break;
+            }
+        }
     }
 
     /** 固定 HTTP 创建链及其三个请求实体，不扫描工程或读取其它模板。 */
@@ -689,6 +884,19 @@ public class S2TestCoordinator {
                 }
             }
         }
+    }
+
+    /** 使用修改前磁盘上的本任务 Handler，不能用同计划生产补丁为错误断言制造依据。 */
+    private String requestHeaderSource(AgentContext context, State state) {
+        if (context.getVerifyErrors().stream().noneMatch(error -> error.contains("application/json; charset=UTF-8"))) {
+            return "";
+        }
+        for (Entry entry : state.entries) {
+            if (entry.sourceClass.equals("AhiHttpInvokerHandler")) {
+                return inspector.read(workspaceService.resolve(entry.source));
+            }
+        }
+        return "";
     }
 
     /** 只采用本任务三个请求实体的真实 Jackson 注解，存在歧义的名称不参与等价修复。 */
@@ -806,6 +1014,7 @@ public class S2TestCoordinator {
         private String pom;
         private final List<Entry> entries = new ArrayList<>();
         private final Map<String, String> skipped = new LinkedHashMap<>();
+        private final Map<String, String> referenceSources = new LinkedHashMap<>();
     }
 
     private static class Entry {

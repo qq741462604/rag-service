@@ -57,6 +57,8 @@ S2 暂停时，只完成 S1 业务代码和静态检查，禁止生成测试类�
 6. 允许 search_code/read_file 定位当前产物的已有实现、配置、必要依赖。能复用的先读取并确认完整结构，不重复创建。当前调用模板所需依赖源码已固定在 Observations 时直接复用，不要反复搜索同一类型；依赖 JAR 中的公共类在源码搜索不到不代表依赖缺失。
 7. 入口在支持类和配置完成后最后修改，不能先引用不存在的类。
 8. 缺少接口字段映射或必要信息时，不编造业务规则；在 description 明确缺失内容。
+9. 没有固定分块模板时，逐项完成全部命中 Skill 的业务规则与 Acceptance：入口、支持类、配置、依赖和写回均齐全才结束 S1，不以一次写入或空计划表示完成。多个 Target 必须逐一定位并读取真实路径，不用第一个入口代替其它入口。
+10. 截取后日期转换由 field-slicing 完成，同项加工不重复生成；需求另含独立日期转换时仍由 date-transform 完成独立部分。S2 按命中 Skill 的 Acceptance 设计真实断言，不能只因代码和测试一起漏掉需求就判断完成。
 
 # 文件操作规则
 
@@ -120,6 +122,9 @@ list_files：仅在当前阶段允许且确有必要时使用。
 - Maven 找不到制品时先核对本次错误与已有类型证据；只有系统明确列出的本任务新增失败依赖可以核实后撤回，原有依赖仍保护。网络/认证故障不能靠改业务代码或反复猜版本处理。
 - S2 新增 HTTP Mock 必须同时补齐 import；HttpClient4 常量为 HttpVersion.HTTP_1_1，不能使用 ProtocolVersion.HTTP_1_1/HTTP_1_0。stub/verify 在 assertThrows lambda 外调用声明 IOException 的 API 时，测试方法须捕获或声明异常。
 - HttpClient4 的 CloseableHttpClient.execute 单参数是 HttpUriRequest，业务向其传 RequestBuilder.build()，不能 mock/verify execute(any(RequestBuilder.class))。同一 Mock/次数/调用不变时，系统支持将错误匹配类型纠正为 any(HttpUriRequest.class)，并同时补齐 stub 与 import；不要用强转裸 any() 放宽匹配。反射写 HttpClientUtil 的静态字段也会先运行原静态初始化，首次写入前必须准备 Spring 的 ReadConfig/BeeTraceClientHelper Bean 及有效容量配置，随后保存/注入/恢复可变字段。
+- HttpUriRequest 没有 getEntity，实体接口是 org.apache.http.HttpEntityEnclosingRequest。读取捕获请求体时使用 captured instanceof HttpEntityEnclosingRequest ? ((HttpEntityEnclosingRequest) captured).getEntity() : null 并补 import；无实体分支的 RequestBuilder.build 结果可能不实现该接口，不能直接强转。已有断言保留原类型、预期、参数和捕获变量声明/初值，只在原实际值位置按上述表达式纠正；本次诊断确认此 API 错误时门禁支持该精确修正，不新增别名/helper，不删除请求体断言或改生产行为。
+- Apache StringEntity 没有 getValue，Header.getValue 仍是合法 API。读取正文使用 EntityUtils.toString(同一真实实体, Consts.UTF_8)，补 org.apache.http.util.EntityUtils 和 org.apache.http.Consts import，必要时声明 throws Exception；实体自身 toString 不是正文。修正已有 ((StringEntity) 实体).getValue() 时，在原位置直接替换读取表达式；保留 StringEntity 转换，或保留已有的同实体 instanceof StringEntity 断言后去掉多余转换。保留原 assertEquals 的预期、消息、捕获对象及初值和其它断言，不新增别名/helper 改写断言。系统按真实类型支持这一同实体读取修正；逐一修复文件中直接断言和局部正文变量初始化的全部同类调用。
+- Content-Type 的完整值取真实生产源码：ContentType.APPLICATION_JSON.toString() 为 application/json; charset=UTF-8，不能拿裸 application/json 与完整 getFirstHeader(HTTP.CONTENT_TYPE).getValue() 比较。若本次失败和真实 Handler 共同确认这个错误，只修正原 assertEquals 的第一个预期为 ContentType.APPLICATION_JSON.toString()（补 org.apache.http.entity.ContentType import）或对应完整字符串；保留原实际值、捕获对象及初值、消息和所有其它断言/验证。不能用 contains/startsWith、提取 MIME、删字符集或改生产头部来通过测试。
 - Java 源码不能用条件表达式当独立语句，例如 verify(...) == null ? null : null 非法；MockedStatic 通过句柄自身的 verify 方法验证 lambda/方法引用，不可把句柄当普通 Mockito Mock。解析失败时按反馈行号及源码修正，不重放原错误。
 - 请求 JSON 的键名和大小写取当前实体 @JsonProperty，不能猜 request_header/request_data 或将所有键变为小写。NPE 先读失败行，JSON get 返回空应核对实体键名；没有类初始化栈证据时不要靠补 Bean 或 Class.forName 猜修复。null Boolean 开关应使用 Boolean.TRUE.equals，禁止自动拆箱。
 - 测试必须验证真实业务；禁止 assertEquals("0", String.valueOf(size >= 0)) 等必败断言，也禁止覆写被测 ahiInvoke 后自行写入结果再验证自己。静态门禁证明此类断言必败时，可保留方法并替换为新增的真实 EventData 写回验证（Mockito.verify，无次数放宽，真实字段、具体预期值）；其它断言保护继续生效。请求体 assertEquals 的实际值 get(...).getAsString/Boolean/Int/Float 中，大小写或下划线猜错的键名仅能改成真实注解证明的同名协议键，不能修改预期值。
@@ -137,7 +142,10 @@ list_files：仅在当前阶段允许且确有必要时使用。
 - HTTP 响应体优先使用真实 StringEntity(responseJson.toString(), Consts.UTF_8)；EntityUtils.toString 读取内容流，不读取 HttpEntity.toString。没有活动 mockStatic(EntityUtils.class) 时，when(EntityUtils.toString(...)) 会执行真实静态方法并可能错误登记 getContent/getStatusLine 桩，不能这样修复 WrongTypeOfReturnValue。
 - 跨包测试不能直接调用 protected 方法，也不能为此将生产方法改 public。测试侧使用子类同签名 public override 直接 super 转发，测试变量改用该子类，保留断言内原调用、参数、预期与断言类型，不能复制生产实现来自测。
 - ReflectionTestUtils.getField 返回 Object，没有按左值推断类型的泛型重载。读取缓存必须写成 HttpClientUtil cached = (HttpClientUtil) ReflectionTestUtils.getField(AhiHttpInvokerHandler.class, "httpClientUtil")；读取实例 httpClient 同样显式转 CloseableHttpClient。只读取得缓存后仅保存/替换/恢复内部非 final 字段，禁止 setField(AhiHttpInvokerHandler.class, "httpClientUtil", cached)，即使写回相同对象仍违反 final。入口测试反射其它业务类时，同样依据该类真实字段声明检查。
-- 入口关闭或 eventFields 为 null 时，先读真实提前 return 分支；若只写 ahiResultAvailable=2 就返回，新测试不能要求该分支再写 time/rst_code/评分，更不能修改生产分支迁就测试。评分期望依据真实 Float 到 BigDecimal 的转换构造，不能假定 0.95F 转 double 后仍精确等于十进制 0.95；基础成功用例可选择能精确表示的 0.5/0.75，专门的精度用例按真实契约验证。已有有效断言保护保持不变。
+- 入口关闭或 eventFields 为 null 时，先读真实提前 return 分支；若只写 ahiResultAvailable=2 就返回，新测试不能要求该分支再写 time/rst_code/评分。新版入口模板直接 getAsBigDecimal，不经过 Float/Double，并在评分与耗时全部解析成功后提交；补 0.1、0.123456 精度用例，验证具体 BigDecimal。旧源码尚为 Float 时按真实旧契约验证，不能为了断言擅改业务语义；新版精度契约由 S1 模板生成。已有有效断言保护保持不变。
+- 动态经办日 Bsr_Opr_Dat 不得硬编码，也不是 expDat；与同一请求 root 的 header.get("requestTime").asText().substring(0, 8) 比较，header/data 分别来自 request_header/request_data。源码证明该动态来源时，门禁只允许纠正原 assertEquals 的固定日期预期，实际值、消息、局部变量声明及初值不变。Bsr_Ept_Dat 有输入时保持原输入预期。模板用同次 requestTime 派生经办日，避免跨午夜两次 now。
+- 静态 Bean 必须逐个保存/注入/恢复，包括 Handler.readConfig、HttpClientUtil.readConfig/beeTraceClientHelper；使用真实字段及 ReflectionTestUtils.getField/setField，旧值为 null 也须恢复。测试转发子类、清理 helper 或重新配置 getBean 都不能代替字段隔离。验证 init 精确次数前对已有 Spring MockedStatic 句柄 clearInvocations()，紧接真实 init，保留原 verify；不能 reset、改次数或改 atLeastOnce。
+- 模板异常响应及精度用例按系统给出的专项清单生成：Handler 非法 JSON/缺头验证真实返回 null；新版入口成功码下缺数据/评分/耗时及非法评分/耗时验证全部失败回写，不能留下半成功评分。每例把完整响应字面量接入真实 HTTP 响应夹具及 execute 桩，不能只声明数据或只断言不抛异常；精度用例保留十进制原值和具体 BigDecimal 验证。
 - EventData 的数据夹具只使用已确认 API，不猜 setData(Map)。依赖仅有 getData/putDataAndOriginData 时，非空真实实例使用 getData().putAll(原Map)；必须返回 null/特殊集合的用例使用 getData 的 Mock 桩，不能把 null 换成空集合。编译已明确缺失 setter 后修当前文件全部同类调用，保留测试及断言；被截断原文的准确范围补读以最新 Observations 为准，不重复读取已经完整可见的范围。
 - EventData 为普通 Mock 时，单独创建/填充 eventFields 不会绑定 getData()；在 ahiInvoke 前用 when(eventData.getData()).thenReturn(eventFields) 或真实 Answer 连接本用例的输入 Map。doPost 实参出现空 Map/空 IP 时，先核对该输入绑定，保留原 Map、具体 IP、成功/异常/空响应分支及全部验证，不用 anyMap/anyString 放宽断言。预期异常测试中的 connection refused 等日志仅作辅助定位，真实失败以本次 Surefire failure/error 及系统判定阶段为准。
 

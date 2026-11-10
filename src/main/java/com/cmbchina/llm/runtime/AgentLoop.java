@@ -177,6 +177,20 @@ public class AgentLoop {
                             + context.getTemplateErrors());
                     continue;
                 }
+                if (context.getPhase() == AgentPhase.CODING
+                        && skillTemplateCoordinator.hasBusinessContracts(context)) {
+                    List<String> pending = skillTemplateCoordinator.validateBusiness(context);
+                    context.getTemplateErrors().clear();
+                    context.getTemplateErrors().addAll(pending);
+                    if (!pending.isEmpty()) {
+                        if (++emptyRounds >= 2) {
+                            stop(context, "S1 普通 Skill 尚未完成却连续返回空计划: " + pending);
+                            return;
+                        }
+                        context.getVerifyErrors().add("全部命中 Skill 尚未完成，不能用空计划进入 S2: " + pending);
+                        continue;
+                    }
+                }
                 if (hasSuccessfulCodeChange(context) && context.getPhase() != AgentPhase.ANALYSIS) {
                     codingS1Done = true;
                     context.setPhase(AgentPhase.VERIFY);
@@ -284,7 +298,22 @@ public class AgentLoop {
                     context.getVerifyErrors().removeIf(error -> error.startsWith("连续只读提醒:"));
                 }
                 codingS1Done = skillTemplateCoordinator.currentTemplate(context) == null;
+                if (codingS1Done) {
+                    List<String> pending = skillTemplateCoordinator.validateBusiness(context);
+                    context.getTemplateErrors().addAll(pending);
+                    codingS1Done = pending.isEmpty();
+                }
                 // 不能以一次成功写入代替整个 S1 完成，模板产物齐全才允许进入验证。
+                context.setPhase(codingS1Done && codingS2Done ? AgentPhase.VERIFY : AgentPhase.CODING);
+                continue;
+            }
+            if (current == AgentPhase.CODING && context.getCodingTrack() == CodingTrack.S1_BUSINESS
+                    && skillTemplateCoordinator.hasBusinessContracts(context)) {
+                List<String> pending = skillTemplateCoordinator.validateBusiness(context);
+                context.getTemplateErrors().clear();
+                context.getTemplateErrors().addAll(pending);
+                codingS1Done = pending.isEmpty() && hasWrittenMainCode(context, results);
+                log.info("S1 business contracts checked complete={} problems={}，未执行 Maven", codingS1Done, pending.size());
                 context.setPhase(codingS1Done && codingS2Done ? AgentPhase.VERIFY : AgentPhase.CODING);
                 continue;
             }

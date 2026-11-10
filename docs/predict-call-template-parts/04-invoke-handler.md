@@ -1,7 +1,8 @@
 ## 三、调用 Handler（完整类示例）
 
-> 统一使用 `HttpClientUtil` 发送 POST 请求，请求头 `Content-Type: application/json`，返回 `JsonObject`。
+> 统一使用 `HttpClientUtil` 发送 POST 请求，请求头使用 `ContentType.APPLICATION_JSON.toString()`，完整值为 `application/json; charset=UTF-8`，返回 `JsonObject`。验证完整请求头时使用同一常量或对应完整字符串，不能与裸 `application/json` 比较。
 > 该类为**完整类示例**，包含 `doPost`（发请求）与 `buildRequestBody`（构建请求体）。`REQUEST_URL` 从配置读取（见第二章），禁止硬编码。
+> 经办日使用同一次 `requestTime` 的前八位，避免跨午夜两次读取时钟产生不同日期。测试应验证 `Bsr_Opr_Dat` 与本次 `request_header.requestTime` 的日期一致；`Bsr_Ept_Dat` 有输入时仍使用输入，不能一并改成当天。
 
 ```java
 package com.cmbchina.plugin.handler;
@@ -173,7 +174,7 @@ public class AhiHttpInvokerHandler {
         ahiHttpBodyDataEntity.setTrxAmt(eventFields.getOrDefault("trxAmt", "").toString());
 
 // 用当前日期填充
-        String bsrDate = LocalDateTime.now(ZoneId.of("Asia/Shanghai")).format(FORMATTER_DAY);
+        String bsrDate = requestTime.substring(0, 8);
         ahiHttpBodyDataEntity.setBsrOprDat(bsrDate);
         String d = "".equals(eventFields.getOrDefault("expDat", "").toString()) ? requestTime.substring(0, 8) :
                 eventFields.getOrDefault("expDat", "").toString();
