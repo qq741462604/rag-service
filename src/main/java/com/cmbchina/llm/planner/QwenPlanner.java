@@ -348,10 +348,10 @@ public class QwenPlanner implements Planner {
                 }
                 String message = "第 " + index + " 步 patch_file 预检失败，原计划全部未执行。path="
                         + input.getPath() + "；原因=" + e.getMessage()
+                        // 修复补丁：先给出具体恢复动作，不将整文件替换误报为补丁顺序冲突。
+                        + patchFailureRecoveryHint(e, patchSteps.getOrDefault(file, Collections.emptyList()))
                         + patchConflictHint(plan, patchSteps.getOrDefault(file, Collections.emptyList()), input, content)
-                        + "\n这是整份计划的补丁顺序/片段冲突，不是落盘文件已部分修改。"
-                        + "同一文件后续 oldText 必须匹配前序补丁之后的内存内容；前序已删除的 import 不能在后续 oldText 再出现。"
-                        + "重新规划仍以 Observations 中的最新磁盘原文为起点，重做必要的完整局部补丁；"
+                        + "\n预检失败不表示落盘文件已部分修改。重新规划仍以 Observations 中的最新磁盘原文为起点，重做必要的完整局部补丁；"
                         + "不要把下方虚拟中间状态当作已落盘内容，也不要照抄旧计划重放。系统刷新原文同样满足先读再改。"
                         + "\n本文件此前已预演的补丁步骤: " + patchSteps.getOrDefault(file, Collections.emptyList())
                         + "\n失败的 oldText:\n" + summarize(input.getOldText(), 700)
@@ -372,6 +372,24 @@ public class QwenPlanner implements Planner {
             previews.forEach((file, after) -> skillTemplateCoordinator.validatePomPreview(
                     context, file, originals.get(file), after));
         }
+    }
+
+    /** 修复补丁：区分范围违规、歧义和顺序问题，避免刷新原文后仍重复全文补丁。 */
+    private String patchFailureRecoveryHint(Exception error, List<Integer> previousSteps) {
+        String reason = String.valueOf(error.getMessage());
+        if (reason.contains("整文件替换")) {
+            return "\n补丁类型=整文件范围被拒绝。不要重发全文；每步只改一个字段、方法或 import 区块，"
+                    + "oldText 从真实原文复制并带唯一上下文，保留其他成员及注释。多个修改分别提交局部步骤。";
+        }
+        if (reason.contains("匹配多处")) {
+            return "\n补丁类型=定位歧义。加入所属方法签名或相邻唯一字段，不要改成整文件匹配。";
+        }
+        if (previousSteps.isEmpty()) {
+            return "\n补丁类型=首个补丁无法应用，不存在本文件前序补丁冲突。"
+                    + "核对路径及刷新后的原文，使用真实唯一的局部片段。";
+        }
+        return "\n补丁类型=局部补丁无法应用，请核对前序步骤。后续 oldText 必须匹配前序修改后的内存内容，"
+                + "前序已删除的 import 不能再次出现在后续 oldText；整份计划仍未落盘。";
     }
 
     private boolean isS2(AgentContext context) {

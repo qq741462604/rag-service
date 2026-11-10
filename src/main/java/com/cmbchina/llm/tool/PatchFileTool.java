@@ -3,6 +3,13 @@ package com.cmbchina.llm.tool;
 import com.cmbchina.llm.agent.AgentContext;
 import com.cmbchina.llm.agent.observation.Observation;
 import com.cmbchina.llm.workspace.WorkspaceService;
+// 修复补丁：仅借助现有 JavaParser 证明全文上下文中的单成员局部修改。
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParseResult;
+import com.github.javaparser.ParserConfiguration;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.BodyDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -112,7 +119,24 @@ public class PatchFileTool extends BaseTool {
             return newText;
         }
 
-        String result = applyMatchedPatch(content, oldText, newText);
+        // 修复补丁：全文匹配先尝试安全缩小；不让提前抛异常阻断上下文裁剪。
+        String actualOldText = oldText == null || oldText.trim().isEmpty()
+                ? null : findActualMatch(content, oldText);
+        if (actualOldText != null && actualOldText.trim().equals(content.trim())) {
+            if (oldText.equals(newText)) {
+                return content;
+            }
+            String localized = localizeWholeJavaPatch(content, oldText, newText, toolInput.getPath());
+            if (localized != null) {
+                return localized;
+            }
+            throw new IllegalArgumentException("已有非空文件只允许局部修改，禁止通过 patch_file 整文件替换；"
+                    + "全文上下文无法证明为保留其他成员的单个字段/方法修改或新增。"
+                    + "请只提交真实唯一的字段、方法或 import 局部片段，不要重新提交全文");
+        }
+
+        // 修复补丁：复用上面的匹配结果，普通局部补丁不重复扫描/分词文件。
+        String result = applyLocatedPatch(content, actualOldText, newText);
         if (result != null) {
             return result;
         }
@@ -140,11 +164,118 @@ public class PatchFileTool extends BaseTool {
         throw new IllegalArgumentException("oldText 未匹配真实内容；请复制原文局部片段，保留原注释和标点");
     }
 
+    /**
+     * 修复补丁：只有类头、导包及其他成员不变，且仅新增/修改一个成员时才缩小全文补丁。
+     * 不自动拆分多个改动，不接受成员删除或整类重写；原有唯一匹配及后续门禁继续执行。
+     */
+    private String localizeWholeJavaPatch(String content, String oldText, String newText, String path) {
+        if (path == null || !path.endsWith(".java") || oldText.length() > 256 * 1024
+                || newText.length() > 256 * 1024) {
+            return null;
+        }
+        JavaParser parser = new JavaParser(new ParserConfiguration()
+                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_11));
+        ParseResult<CompilationUnit> before = parser.parse(oldText);
+        ParseResult<CompilationUnit> after = parser.parse(newText);
+        if (!before.isSuccessful() || !after.isSuccessful()
+                || !before.getResult().isPresent() || !after.getResult().isPresent()) {
+            return null;
+        }
+        CompilationUnit oldUnit = before.getResult().get();
+        CompilationUnit newUnit = after.getResult().get();
+        if (oldUnit.getTypes().size() != 1 || newUnit.getTypes().size() != 1) {
+            return null;
+        }
+        TypeDeclaration<?> oldType = oldUnit.getType(0);
+        TypeDeclaration<?> newType = newUnit.getType(0);
+        CompilationUnit oldHeader = oldUnit.clone();
+        CompilationUnit newHeader = newUnit.clone();
+        oldHeader.getType(0).getMembers().clear();
+        newHeader.getType(0).getMembers().clear();
+        if (!oldHeader.toString().equals(newHeader.toString())) {
+            return null;
+        }
+        int head = 0;
+        int oldSize = oldType.getMembers().size();
+        int newSize = newType.getMembers().size();
+        while (head < oldSize && head < newSize && oldType.getMember(head).toString()
+                .equals(newType.getMember(head).toString())) {
+            head++;
+        }
+        int tail = 0;
+        while (tail < oldSize - head && tail < newSize - head
+                && oldType.getMember(oldSize - tail - 1).toString()
+                .equals(newType.getMember(newSize - tail - 1).toString())) {
+            tail++;
+        }
+        if (head + tail == 0 || oldSize - head - tail > 1 || newSize - head - tail != 1) {
+            return null;
+        }
+        BodyDeclaration<?> changed = newType.getMember(head);
+        if (!changed.isFieldDeclaration() && !changed.isMethodDeclaration()
+                && !changed.isConstructorDeclaration()) {
+            return null;
+        }
+        if (oldSize - head - tail == 1) {
+            BodyDeclaration<?> original = oldType.getMember(head);
+            if (original.getClass() != changed.getClass()) {
+                return null;
+            }
+        }
+        int prefix = commonLinePrefix(oldText, newText);
+        int suffix = commonLineSuffix(oldText, newText, prefix);
+        if (!isWithinMemberLines(newText, prefix, suffix, changed)
+                || oldSize - head - tail == 1
+                && !isWithinMemberLines(oldText, prefix, suffix, oldType.getMember(head))) {
+            return null;
+        }
+        if (oldText.substring(prefix, oldText.length() - suffix).trim().isEmpty()) {
+            // 纯新增需要保留前一整行作定位锚点，仍要求在真实原文中唯一匹配。
+            prefix = oldText.lastIndexOf('\n', Math.max(-1, prefix - 2)) + 1;
+        }
+        String result = applyMatchedPatch(content,
+                oldText.substring(prefix, oldText.length() - suffix),
+                newText.substring(prefix, newText.length() - suffix));
+        if (result != null) {
+            log.info("修复补丁 patch_file localized full context path={} prefixChars={} suffixChars={}",
+                    path, prefix, suffix);
+        }
+        return result;
+    }
+
+    /** 修复补丁：文本改动也必须落在已确认成员内，防止仅保留类头和大括号绕过保护。 */
+    private boolean isWithinMemberLines(String source, int prefix, int suffix, BodyDeclaration<?> member) {
+        if (!member.getRange().isPresent()) {
+            return false;
+        }
+        int end = source.length() - suffix;
+        while (end > prefix && Character.isWhitespace(source.charAt(end - 1))) {
+            end--;
+        }
+        int firstLine = 1;
+        int lastLine = 1;
+        for (int index = 0; index < end; index++) {
+            if (source.charAt(index) == '\n') {
+                lastLine++;
+                if (index < prefix) {
+                    firstLine++;
+                }
+            }
+        }
+        return firstLine >= member.getRange().get().begin.line
+                && lastLine <= member.getRange().get().end.line;
+    }
+
     private String applyMatchedPatch(String content, String oldText, String newText) {
         if (oldText == null || oldText.trim().isEmpty()) {
             return null;
         }
         String actualOldText = findActualMatch(content, oldText);
+        return applyLocatedPatch(content, actualOldText, newText);
+    }
+
+    /** 修复补丁：预检和上下文裁剪共用定位后的原有覆盖保护及唯一性检查。 */
+    private String applyLocatedPatch(String content, String actualOldText, String newText) {
         if (actualOldText == null) {
             return null;
         }

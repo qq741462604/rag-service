@@ -143,6 +143,10 @@ public class AgentLoop {
                 // HTTP/额度/鉴权/网络错误不由外层重试，避免与客户端重试相乘。
                 if (isModelFailure(e) || ++planningFailures >= 3
                         || e.getMessage() != null && e.getMessage().startsWith("规划模型调用已达到任务预算")) {
+                    // 修复补丁：记录真实阶段及连续失败次数，区别于模型总调用预算。
+                    log.warn("planning stopped flow={} phase={} track={} consecutiveFailures={} modelCalls={}",
+                            context.getVariables().get("s2_flow_id"), context.getPhase(),
+                            context.getCodingTrack(), planningFailures, context.getModelCalls());
                     stop(context, "规划失败，停止模型调用: " + failureMessage(e));
                     return;
                 }
@@ -374,14 +378,21 @@ public class AgentLoop {
     private void stop(AgentContext context, String reason) {
         context.getVerifyErrors().clear();
         context.getVerifyErrors().add(reason);
+        // 修复补丁：FINISH 前保存真实停止阶段，开启 S2 不代表失败发生在 S2。
+        AgentPhase stoppedPhase = context.getPhase();
+        String stoppedTrack = String.valueOf(context.getCodingTrack());
+        boolean stoppedInS2 = context.getCodingTrack() == CodingTrack.S2_TEST
+                || stoppedPhase == AgentPhase.REPAIR;
         context.setPhase(AgentPhase.FINISH);
         if (testGenerationEnabled) {
-            log.warn("S2流程 flow={} agentId={} round={} 停止，尚未通过验证 reason={}",
-                    context.getVariables().get("s2_flow_id"), context.getAgentId(),
+            log.warn("{}流程 flow={} agentId={} phase={} track={} round={} 停止，尚未通过验证 reason={}",
+                    stoppedInS2 ? "S2" : "S1", context.getVariables().get("s2_flow_id"),
+                    context.getAgentId(), stoppedPhase, stoppedTrack,
                     context.getVariables().get("s2_repair_round"), logDiagnostic(reason, 1600));
         }
-        log.warn("agent stopped agentId={} modelCalls={} reason={}",
-                context.getAgentId(), context.getModelCalls(), logDiagnostic(reason, 1600));
+        log.warn("agent stopped agentId={} phase={} track={} modelCalls={} reason={}",
+                context.getAgentId(), stoppedPhase, stoppedTrack,
+                context.getModelCalls(), logDiagnostic(reason, 1600));
     }
 
     /**
