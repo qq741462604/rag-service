@@ -121,6 +121,8 @@ public class TestSourceInspector {
         validateReflectionResultTypes(unit, errors);
         if (businessSource != null) {
             CompilationUnit business = parse(businessSource);
+            // 修复补丁3：工具类单测不能把被测对象本身替换为默认不执行真实方法的构造器 Mock。
+            validateHttpUtilSubjectMock(unit, business, sourceClass, errors);
             validateReflectiveFieldWrites(unit, business, sourceClass, errors);
             validateCachedHttpClientFixture(unit, business, sourceClass, errors);
             validateMutableStaticBeans(unit, business, sourceClass, errors);
@@ -551,11 +553,44 @@ public class TestSourceInspector {
                             owner, name, saved, true);
                     if (saved.isEmpty() || !injected || !restored) {
                         errors.add("静态 Bean 隔离不完整: " + sourceClass + "." + name
+                                // 修复补丁3：指出缺失环节及字段真正所属者，避免只重复抽象隔离提示。
+                                + " [saved=" + !saved.isEmpty() + ", injected=" + injected + ", restored=" + restored + "]"
+                                + "；真实字段所属类=" + owner + "，不是 Bean 类型 " + variable.getType().asString()
                                 + "；每个 BeforeEach/Before 在 Bean/工厂就绪后保存旧值并注入本轮 Bean，"
                                 + "AfterEach/After 的 finally 恢复同一旧值（包括 null）；只换 Spring getBean 桩无效。"
                                 + "使用真实字段的直接访问或 ReflectionTestUtils.getField/setField，不改 final/生产初始化，保留全部断言");
                     }
                 }
+            }
+        }
+    }
+
+    /** 修复补丁3：仅检查当前 HTTP 工具测试的默认构造器拦截；调用方隔离依赖的 Mock 不受影响。 */
+    private void validateHttpUtilSubjectMock(CompilationUnit unit, CompilationUnit business,
+                                             String sourceClass, List<String> errors) {
+        if (!"HttpClientUtil".equals(sourceClass)) {
+            return;
+        }
+        String owner = business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("")
+                + sourceClass;
+        for (MethodCallExpr call : unit.findAll(MethodCallExpr.class)) {
+            if (isMockitoCall(unit, call, "mockConstruction") && call.getArguments().size() <= 2
+                    && !call.getArguments().isEmpty() && call.getArgument(0).isClassExpr()
+                    && matchesType(unit, call.getArgument(0).asClassExpr().getType().asString(), owner)
+                    && (call.getArguments().size() == 1 || call.getArgument(1).isLambdaExpr()
+                    && call.getArgument(1).findAll(MethodCallExpr.class).stream().noneMatch(callback ->
+                    java.util.Arrays.asList("callRealMethod", "doCallRealMethod", "thenCallRealMethod")
+                            .contains(callback.getNameAsString())))) {
+                errors.add("当前被测 HttpClientUtil 被默认构造器 Mock 拦截，invoke 不执行真实业务；"
+                        + "使用真实 new HttpClientUtil()，只 Mock 底层 HttpClients/CloseableHttpClient 和追踪依赖。"
+                        + "不得从尚无构造的 constructed().get(0) 取对象或人为构造对象凑数量；"
+                        + "保留实际请求、追踪及异常断言，不能通过给被测 Mock 配返回值制造通过");
+            }
+            if (isMockitoCall(unit, call, "mockStatic") && !call.getArguments().isEmpty()
+                    && call.getArgument(0).isClassExpr() && matchesType(unit,
+                    call.getArgument(0).asClassExpr().getType().asString(), "org.springframework.context.ApplicationContext")) {
+                errors.add("ApplicationContext 应为普通实例 Mock，不是静态工具：使用 mock(ApplicationContext.class)，"
+                        + "只对 SpringContextBeanUtil 注册可关闭的静态 Mock；删除无用途的 ApplicationContext 静态注册");
             }
         }
     }

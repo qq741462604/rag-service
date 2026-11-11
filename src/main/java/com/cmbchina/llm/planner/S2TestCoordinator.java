@@ -232,6 +232,8 @@ public class S2TestCoordinator {
                 + "同一入口命中多个 Skill 时全部覆盖；测试失败保留原断言强度，先核对并修复真实业务实现。\n"
                 + testDependencyRules(context)
                 + testIsolationRules()
+                // 修复补丁3：当前工具本身必须真实执行，不能套用上游调用方的构造器 Mock 夹具。
+                + httpClientUtilFixtureRules(entry)
                 + "使用真实业务签名和已有 JUnit4/5、断言/Mockito；测试须有实际业务断言。"
                 + "初始化测试保留对象非空断言，并补初始化后的状态或依赖交互，不能只断言 new 的对象非空。"
                 + "固定评分输入用具体 BigDecimal 期望验证写回，不仅使用 any(BigDecimal.class)；"
@@ -252,6 +254,31 @@ public class S2TestCoordinator {
                 + "Maven 由服务端验证阶段执行，模型不得调用 run_test、shell、exec 或其他命令工具。\n";
     }
 
+    /** 修复补丁3：仅当前 HttpClientUtil 条目追加，避免把专用夹具规则注入其他测试。 */
+    private String httpClientUtilFixtureRules(Entry entry) {
+        if (entry == null || !"HttpClientUtil".equals(entry.sourceClass)) {
+            return "";
+        }
+        return "当前被测对象是 HttpClientUtil 本身，创建真实实例执行 invoke/init；"
+                + "不要 mockConstruction(HttpClientUtil.class) 后拿 constructed() 的普通 Mock 当真实实例，"
+                + "否则 invoke 不执行，构造器回调也不会凭空创建对象。只 Mock HttpClients 工厂返回的底层客户端及外部追踪依赖。"
+                + "本条目使用纯 Mockito 夹具，不额外启动 @SpringBootTest/SpringExtension。"
+                + "ApplicationContext 是普通接口实例：导入 org.springframework.context.ApplicationContext，"
+                + "用 mock(ApplicationContext.class)，不要 mockStatic(ApplicationContext.class)。"
+                + "所有 ReadConfig/追踪/连接池容量桩在首次使用 HttpClientUtil 前就绪。"
+                + "字段所属者是 HttpClientUtil：保存 originReadConfig=HttpClientUtil.readConfig、"
+                + "originTraceHelper=HttpClientUtil.beeTraceClientHelper 后，向这两个同名字段注入本轮 Bean；"
+                + "不要对 ReadConfig.class 设置 readConfig，或对 BeeTraceClientHelper.class 设置 beeTraceClientHelper。"
+                + "旧值保存在测试实例字段，AfterEach 的 finally 无条件恢复（包括 null），并独立关闭所有静态 Mock。"
+                + "优先明确字段赋值或 ReflectionTestUtils 的真实类/字段字面量；不要用 clazz+字符串键及 Class.forName 恢复，"
+                + "clazz.toString() 带 class 前缀，无法作为二进制类名。"
+                + "init 测试显式调用真实 init，再检查本轮配置的连接池结果，不依赖静态块每个用例重跑。"
+                + "响应状态使用真实 BasicStatusLine(HttpVersion.HTTP_1_1,200,...) 或单独 Mock StatusLine，"
+                + "默认 mockResponse.getStatusLine() 为 null，不能直接链式 when(...getStatusCode())。"
+                + "不要 import/初始化本测试不使用的 AhiHttpInvokerHandler 或 EventData；"
+                + "如确需调用关联类，必须同时隔离该类真实静态状态。保留成功、异常分支和全部有效断言。\n";
+    }
+
     public String testDependencyRules(AgentContext context) {
         return initializationFeedback(context) + dependencySupport.testDependencyRules(context)
                 + (context.getPhase() == AgentPhase.REPAIR
@@ -269,6 +296,15 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        // 修复补丁3：拒绝后的下一轮优先解释字段所属者，保留原门禁，不靠增加预算重试。
+        if (errors.contains("静态 Bean 隔离不完整")) {
+            rules.append("上轮静态 Bean 隔离拒绝，请先按 saved/injected/restored 缺项纠正。")
+                    .append("字段所属者是声明静态字段的业务类，不是字段值的 Bean 类型；")
+                    .append("例如 HttpClientUtil.readConfig 与 HttpClientUtil.beeTraceClientHelper 均属于 HttpClientUtil.class。")
+                    .append("明确保存到测试实例字段，setup 注入本轮 Mock，cleanup finally 恢复同一旧值，包括 null。")
+                    .append("不要使用无法定位所属者的泛型保存 helper、Class.toString 字符串键或吞异常的 Class.forName 循环，")
+                    .append("每个 Mock 句柄独立释放，setup 部分失败也需清理。不要删除有效断言、修改生产 static/final 或增加无用关联类。\n");
+        }
         if (errors.contains("Bsr_Opr_Dat") || errors.contains("动态日期断言")) {
             rules.append("经办日不是 expDat。核对当前 Handler 的上海时区日期来源，保留原 assertEquals 和实际值/消息，")
                     .append("预期改用同一 root 的 header.get(\"requestTime\").asText().substring(0, 8)；")
