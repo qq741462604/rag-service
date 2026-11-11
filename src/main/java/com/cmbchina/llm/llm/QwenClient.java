@@ -22,6 +22,10 @@ public class QwenClient {
         try {
             LlmRequest request = new LlmRequest();
             request.setModel(properties.getModel());
+            // 修复补丁：流式只改变通信方式，仍返回完整文本后再解析和执行计划。
+            if (properties.isCodeGenerationStreamEnabled()) {
+                request.setStream(Boolean.TRUE);
+            }
             Map<String, Object> deepThinkType = new HashMap<>();
             deepThinkType.put("enable_thinking", properties.isEnableThinking());
             request.setChatTemplateKwargs(deepThinkType);

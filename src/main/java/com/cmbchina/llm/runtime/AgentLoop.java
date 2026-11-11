@@ -368,8 +368,22 @@ public class AgentLoop {
         }
         if (cause instanceof org.springframework.web.client.HttpStatusCodeException) {
             // 不把服务端原始响应（可能包含请求信息）直接塞回下一次模型提示词。
-            return "模型 HTTP " + ((org.springframework.web.client.HttpStatusCodeException) cause).getRawStatusCode()
-                    + "，请检查额度、鉴权或模型配置";
+            // 修复补丁：网关超时、鉴权、限流分别说明，不再将 504 一概归为额度问题。
+            int status = ((org.springframework.web.client.HttpStatusCodeException) cause).getRawStatusCode();
+            if (status == 504) {
+                return "模型 HTTP 504，网关等待上游超时；请核实首包、空闲及总时限，"
+                        + "流式也受网关限制；本次未取得完整计划，未自动重发";
+            }
+            if (status == 401 || status == 403) {
+                return "模型 HTTP " + status + "，请核实密钥、接口权限及服务商返回的拒绝原因";
+            }
+            if (status == 429) {
+                return "模型 HTTP 429，请核实请求/Token 限流或服务商额度限制；未自动重发";
+            }
+            return "模型 HTTP " + status + "，请核实模型服务和网关状态；未自动重发";
+        }
+        if (isModelFailure(error) && cause instanceof java.net.SocketTimeoutException) {
+            return "模型连接或读取超时，未取得完整计划；请核实接口响应及超时设置，未自动重发";
         }
         // 业务预检外层携带路径、步骤和真实片段，不能只显示最底层的笼统匹配失败。
         return isModelFailure(error) ? cause.getMessage() : error.getMessage();

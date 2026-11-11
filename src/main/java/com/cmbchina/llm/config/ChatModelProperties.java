@@ -64,6 +64,21 @@ public class ChatModelProperties {
      */
     private int readTimeoutMillis = 30 * 60 * 1000;
 
+    /**
+     * 修复补丁：仅代码规划使用 SSE；关闭后恢复原非流式调用，文档等原始请求不受影响。
+     */
+    private boolean codeGenerationStreamEnabled = true;
+
+    /**
+     * 修复补丁：流式连续等待上游数据的超时，不是整个生成任务的时长。
+     */
+    private int streamReadTimeoutMillis = 120000;
+
+    /**
+     * 修复补丁：单次模型流接收总时限，防止持续心跳导致无限等待。
+     */
+    private int streamTotalTimeoutMillis = 30 * 60 * 1000;
+
     @PostConstruct
     public void init() {
         // 兼容尚未提供 ai.chat 配置的旧部署，新配置存在时以新配置为准。

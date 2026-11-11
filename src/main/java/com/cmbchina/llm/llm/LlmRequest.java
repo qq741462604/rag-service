@@ -14,6 +14,12 @@ public class LlmRequest {
 
     private String model;
 
+    /**
+     * 修复补丁：仅启用流式时发送 true，未设置时保持原请求结构。
+     */
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+    private Boolean stream;
+
     /*
      * 深度思考功能
      */

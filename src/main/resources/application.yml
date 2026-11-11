@@ -41,6 +41,10 @@ ai:
     reasoning-effort: high #  deepseek的配置 reasoning_effort，可选 low/high/max
     connect-timeout-millis: 1800000 # 保持原有30分钟连接超时
     read-timeout-millis: 1800000 # 保持原有30分钟读取超时
+    # 修复补丁：只切换 S1/S2 代码规划，文档等原始响应调用保持现状。
+    code-generation-stream-enabled: true
+    stream-read-timeout-millis: 120000 # 流式等待数据超时；网关自身限制需单独核实
+    stream-total-timeout-millis: 1800000 # 单次模型流总时限，心跳不会重置
 
 kb:
   raw-path: "data/canonical_field_dirt.xlsx"
