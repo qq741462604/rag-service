@@ -34,6 +34,8 @@ final class SseChatResponseReader {
     private final long timeoutNanos;
     private final StringBuilder content = new StringBuilder();
     private final Map<String, Object> metadata = new LinkedHashMap<>();
+    // 修复补丁2：每个响应最多记录三个字段的元数据差异，避免按 token 刷日志。
+    private final java.util.Set<String> metadataChanges = new java.util.LinkedHashSet<>();
     private JsonNode usage;
     private boolean stopped;
     private boolean done;
@@ -175,14 +177,8 @@ final class SseChatResponseReader {
         if (event == null || !event.isObject() || event.hasNonNull("error")) {
             throw failure("模型 SSE 返回异常响应");
         }
-        for (String key : new String[]{"id", "model", "created"}) {
-            if (event.hasNonNull(key)) {
-                if (metadata.containsKey(key) && !metadata.get(key).equals(event.get(key))) {
-                    throw failure("SSE 响应标识不一致");
-                }
-                metadata.put(key, event.get(key));
-            }
-        }
+        // 修复补丁2：id 用于检查响应归属，model/created 是元数据，不能等同于混流判据。
+        collectMetadata(event);
         if (event.path("usage").isObject()) {
             usage = event.get("usage");
         }
@@ -223,6 +219,40 @@ final class SseChatResponseReader {
         }
     }
 
+    /**
+     * 修复补丁2：保留首个有效元数据；容忍网关模型别名/分块时间变化，不拼接不同非空 id。
+     * 比较标量文本，避免相同时间戳因 Jackson 数值节点类型不同被误判。
+     */
+    private void collectMetadata(JsonNode event) throws IOException {
+        for (String key : new String[]{"id", "model", "created"}) {
+            JsonNode current = event.get(key);
+            if (current == null || current.isNull()
+                    || (current.isTextual() && current.asText().trim().isEmpty())) {
+                continue;
+            }
+            if (("created".equals(key) && !current.isIntegralNumber() && !current.isTextual())
+                    || (!"created".equals(key) && !current.isTextual())) {
+                throw failure("SSE 元数据类型异常 field=" + key);
+            }
+            Object previous = metadata.get(key);
+            if (previous == null) {
+                metadata.put(key, current);
+                continue;
+            }
+            if (((JsonNode) previous).asText().equals(current.asText())) {
+                continue;
+            }
+            if ("id".equals(key)) {
+                throw failure("SSE 响应标识不一致 field=id；同一连接出现不同非空响应 id，"
+                        + "请核实网关是否重写分块 id 或混入其它响应");
+            }
+            if (metadataChanges.add(key)) {
+                log.warn("修复补丁2 llm stream metadata changed field={} event={} action=keep-first-and-continue",
+                        key, eventCount);
+            }
+        }
+    }
+
     private void checkActive() throws IOException {
         if (Thread.currentThread().isInterrupted()) {
             throw failure("模型流接收已取消");
@@ -244,6 +274,7 @@ final class SseChatResponseReader {
     String summary() {
         return "events=" + eventCount + " contentChars=" + content.length() + " wireChars=" + wireChars
                 + " firstEventMs=" + firstEventMillis + " firstContentMs=" + firstContentMillis
+                + " metadataChangedFields=" + metadataChanges
                 + " finishReason=" + (stopped ? "stop" : "missing") + " done=" + done;
     }
 }
