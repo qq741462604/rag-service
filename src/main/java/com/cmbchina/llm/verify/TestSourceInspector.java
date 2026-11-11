@@ -61,18 +61,29 @@ public class TestSourceInspector {
                 .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_11));
         ParseResult<CompilationUnit> result = parser.parse(source);
         if (!result.isSuccessful() || !result.getResult().isPresent()) {
+            // 修复补丁：先集中给出位置和解析原因，再附源码；日志隐藏源码时不再截掉原因。
+            String[] lines = source.split("\\R", -1);
             String details = result.getProblems().stream().limit(3).map(problem -> {
                 String message = problem.getMessage();
+                int stacktrace = message.indexOf("Problem stacktrace");
+                if (stacktrace >= 0) {
+                    message = message.substring(0, stacktrace);
+                }
+                message = message.replaceAll("\\s+", " ").trim();
+                String location = problem.getLocation().flatMap(range -> range.toRange()).map(range ->
+                        "第 " + range.begin.line + " 行，第 " + range.begin.column + " 列，").orElse("");
+                return location + "解析原因=" + message.substring(0, Math.min(500, message.length()));
+            }).collect(java.util.stream.Collectors.joining(" | "));
+            String excerpts = result.getProblems().stream().limit(3).map(problem -> {
                 String location = problem.getLocation().flatMap(range -> range.toRange()).map(range -> {
-                    String[] lines = source.split("\\R", -1);
                     int line = range.begin.line;
                     String excerpt = line > 0 && line <= lines.length ? lines[line - 1].trim() : "";
-                    return "第 " + line + " 行，第 " + range.begin.column + " 列，源码: "
-                            + excerpt.substring(0, Math.min(240, excerpt.length())) + "；";
+                    return "第 " + line + " 行: " + excerpt.substring(0, Math.min(240, excerpt.length()));
                 }).orElse("");
-                return location + message.substring(0, Math.min(500, message.length()));
+                return location;
             }).collect(java.util.stream.Collectors.joining("\n"));
-            throw new IllegalArgumentException("Java 语法解析失败（不是计划 JSON 转换失败，原计划未执行）: " + details);
+            throw new IllegalArgumentException("Java 语法解析失败（不是计划 JSON 转换失败，原计划未执行）: "
+                    + details + "\n源码: " + excerpts);
         }
         return result.getResult().get();
     }

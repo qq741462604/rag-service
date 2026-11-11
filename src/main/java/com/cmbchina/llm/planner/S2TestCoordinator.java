@@ -612,10 +612,19 @@ public class S2TestCoordinator {
                 }
             }
             if (entry.test.equals(path)) {
-                List<String> errors = validateSource(state, entry, after, previews);
-                errors.addAll(inspector.validateReportedApiUsage(after, context.getVerifyErrors()));
-                if (inspector.requiresInlineMocking(after)) {
-                    errors.addAll(dependencySupport.validateMockitoCapability(context, previews));
+                List<String> errors;
+                try {
+                    errors = validateSource(state, entry, after, previews);
+                    errors.addAll(inspector.validateReportedApiUsage(after, context.getVerifyErrors()));
+                    if (inspector.requiresInlineMocking(after)) {
+                        errors.addAll(dependencySupport.validateMockitoCapability(context, previews));
+                    }
+                } catch (RuntimeException exception) {
+                    // 修复补丁：解析直接抛异常也保存未落盘候选，路径放在源码前，日志仍能定位。
+                    String snapshot = rejectedPreviewSnapshot(context, entry.testClass, after);
+                    throw new IllegalArgumentException("S2 测试候选预检异常: candidatePath=" + path
+                            + (snapshot.isEmpty() ? " snapshot=未保存（查看快照限制日志）" : " snapshot=" + snapshot)
+                            + "；原因=" + exception.getMessage(), exception);
                 }
                 if (!errors.isEmpty()) {
                     String snapshot = rejectedPreviewSnapshot(context, entry.testClass, after);
@@ -656,6 +665,10 @@ public class S2TestCoordinator {
         int count = stored instanceof Number ? ((Number) stored).intValue() : 0;
         byte[] bytes = source.getBytes(StandardCharsets.UTF_8);
         if (count >= 3 || bytes.length > 256 * 1024) {
+            // 修复补丁：明确快照缺失原因，不扩大保留数量或覆盖已有诊断文件。
+            log.warn("S2流程 flow={} 候选快照未保存 testClass={} count={} bytes={} reason={}",
+                    context.getVariables().get("s2_flow_id"), testClass, count, bytes.length,
+                    count >= 3 ? "每任务最多3份" : "候选超过256KiB");
             return "";
         }
         try {
@@ -672,6 +685,15 @@ public class S2TestCoordinator {
             log.warn("S2流程 flow={} 保存预检候选源码失败 type={}",
                     context.getVariables().get("s2_flow_id"), exception.getClass().getSimpleName());
             return "";
+        }
+    }
+
+    /** 修复补丁：指明实际解析失败文件，区分候选测试与关联业务源码。 */
+    private CompilationUnit parseSource(String source, String path) {
+        try {
+            return inspector.parse(source);
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException("解析文件=" + path + "；" + exception.getMessage(), exception);
         }
     }
 
@@ -696,7 +718,7 @@ public class S2TestCoordinator {
     }
 
     private List<String> validateSource(State state, Entry entry, String source, Map<String, String> previews) {
-        CompilationUnit unit = inspector.parse(source);
+        CompilationUnit unit = parseSource(source, entry.test);
         Set<String> references = unit.findAll(com.github.javaparser.ast.expr.ClassExpr.class).stream()
                 .map(literal -> literal.getType().asString()).collect(java.util.stream.Collectors.toSet());
         unit.findAll(com.github.javaparser.ast.expr.FieldAccessExpr.class)
@@ -705,7 +727,7 @@ public class S2TestCoordinator {
                 .forEach(call -> call.getScope().ifPresent(scope -> references.add(scope.toString())));
         collectTypeReferences(unit, references);
         String business = previewSource(entry.source, previews);
-        collectTypeReferences(inspector.parse(business), references);
+        collectTypeReferences(parseSource(business, entry.source), references);
         Map<String, String> relatedSources = new LinkedHashMap<>();
         // 本次修改类及已成功读取的复用支持类均可提供真实 API，不扫描目标工程。
         for (int depth = 0; depth < state.referenceSources.size(); depth++) {
@@ -716,7 +738,7 @@ public class S2TestCoordinator {
                         name.equals(related.getKey()) || name.endsWith("." + related.getKey()))) {
                     String content = previewSource(related.getValue(), previews);
                     relatedSources.put(related.getKey(), content);
-                    collectTypeReferences(inspector.parse(content), references);
+                    collectTypeReferences(parseSource(content, related.getValue()), references);
                 }
             }
             if (previousSize == relatedSources.size()) {
