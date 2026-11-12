@@ -244,8 +244,12 @@ public class S2TestCoordinator {
                 + "缺测试依赖只局部补模块 POM test scope，版本复用已有管理；不能猜私有依赖坐标或版本。"
                 + "使用 Mockito.mockStatic/mockConstruction 前核对实际 Mockito 版本及 MockMaker；"
                 + "spring-boot-starter-test 或 mockito-core 的存在不代表支持静态/构造器 Mock。"
+                // 修复补丁5：与依赖门禁统一同版本 core/inline 的依据，避免模型猜测固定版本。
                 + "Mockito 3/4 须启用 inline，缺失时局部补同现有 core 版本的 mockito-inline test 依赖，"
-                + "版本优先复用已确认的 BOM 管理，不升级已有依赖；Mockito 5 默认 inline，仍须检查覆盖配置。"
+                + "版本优先复用已确认的 BOM 管理；若现有 POM/父链已确认 mockito-core 为 3.x/4.x，"
+                + "同版本标准 mockito-inline test 依赖可作为明确版本依据，即使 inline 尚未下载；"
+                + "不得选择与 core 不同或模型记忆中的版本（例如无依据的 4.11.0）。不升级已有依赖；"
+                + "Mockito 5 默认 inline，仍须检查覆盖配置。"
                 + "测试须先准备 SpringContextBeanUtil 的 Mock 和所需 Bean，再首次主动使用有静态 Bean 字段的业务类。"
                 + "类初始化只执行一次，反射置空不会重新初始化；不要反射写 static final 字段或把生产依赖置空，"
                 + "可变静态状态只注入正确 Mock，并在测试结束后恢复，不能修改生产初始化来迁就测试。"

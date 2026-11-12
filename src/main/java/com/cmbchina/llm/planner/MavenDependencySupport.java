@@ -305,10 +305,36 @@ public class MavenDependencySupport {
                         + "；先复用系统给出的本地 JAR 类型证据或配置映射，禁止根据 Java 包名猜私有坐标。");
             }
             if (!version.isEmpty() && !version.contains("${") && !localVersion) {
+                // 修复补丁5：inline 与已确认 core 同版本是明确依据，不要求 inline 已提前下载。
+                if (isConfirmedMockitoInlineAddition(context, dependency, coordinate, version)) {
+                    log.info("S2 dependency version evidence coordinate={} version={} source=existing-mockito-core",
+                            coordinate, version);
+                    continue;
+                }
                 throw new IllegalArgumentException("新增依赖显式版本缺少本地依据: " + coordinate + ":" + version
-                        + "；核对目标 POM/properties/父 POM/BOM，禁止猜版本；不能删除版本来绕过 Maven 管理核实。");
+                        + "；核对目标 POM/properties/父 POM/BOM，禁止猜版本；不能删除版本来绕过 Maven 管理核实。"
+                        + ("org.mockito:mockito-inline".equals(coordinate)
+                        ? "仅 test scope、无 classifier 的标准 JAR 可复用已确认的 Mockito 3/4 core 精确版本；"
+                        + "当前 core 版本依据=" + confirmedMockitoCoreVersion(context, availableDeclarations(context, true))
+                        + "，inline 本地已有版本=" + localArtifacts.versions(repository, coordinate)
+                        + "；空值表示尚未确认，不得根据模型记忆选择版本。" : ""));
             }
         }
+    }
+
+    /** 修复补丁5：仅接受现有依赖提供的同版本 inline，不从候选计划新增的 core 自证版本。 */
+    private boolean isConfirmedMockitoInlineAddition(AgentContext context, Element dependency,
+                                                      String coordinate, String version) {
+        if (!"org.mockito:mockito-inline".equals(coordinate) || !"test".equals(text(dependency, "scope"))
+                || !text(dependency, "classifier").isEmpty()
+                || !(text(dependency, "type").isEmpty() || "jar".equals(text(dependency, "type")))
+                || !version.matches("[34]\\.\\d+\\.\\d+")) {
+            return false;
+        }
+        Map<String, Element> declared = availableDeclarations(context, true);
+        return (declared.containsKey("org.mockito:mockito-core")
+                || declared.containsKey("org.springframework.boot:spring-boot-starter-test"))
+                && version.equals(confirmedMockitoCoreVersion(context, declared));
     }
 
     public Set<String> compileDependencies(AgentContext context) {
@@ -361,6 +387,10 @@ public class MavenDependencySupport {
             }
             return "生成前 Mockito 能力依据（不是本轮测试执行失败）：仅在当前测试需要 mockStatic/mockConstruction 时核对以下缺口。"
                     + "普通实例 Mock 或实体测试无需因此新增依赖；需要补齐能力时，将必要的 POM 局部补丁与测试放在同一计划中。\n"
+                    // 修复补丁5：inline 是运行能力依赖，不能只展示 import 首选坐标 core 的版本。
+                    + "mockito-inline 本地已有版本（不代表与当前 core 兼容）: "
+                    + localArtifacts.versions(localArtifacts.repository(), "org.mockito:mockito-inline")
+                    + "；优先复用已确认的 core 精确版本，不能按本地最新版本升级。\n"
                     + String.join("\n", gaps) + "\n";
         } catch (RuntimeException exception) {
             return "生成前 Mockito 能力暂未确认；先核对真实 POM、MockMaker 配置和已有版本依据，"
@@ -501,9 +531,24 @@ public class MavenDependencySupport {
         if (declared.containsKey("org.mockito:mockito-inline")) {
             return errors;
         }
+        // 修复补丁5：能力提示和新增依赖门禁共享相同的 core 版本依据。
+        String version = confirmedMockitoCoreVersion(context, declared);
+        if (version.matches("[1-4]\\..*")) {
+            errors.add("Mockito 静态/构造器 Mock 预检: 已确认 mockito-core=" + version
+                    + "，当前本地声明与配置未提供 inline MockMaker。先核对完整测试类路径，"
+                    + "若无其它提供方，在模块 POM 局部补同版本 mockito-inline test 依赖，复用已确认版本管理；"
+                    + "可与当前测试放在同一计划，禁止升级 core、删断言或改生产初始化来绕过。"
+                    + "已确认的 3/4 core 标准发布版本可作为同版本 inline 的版本依据，"
+                    + "不要求 inline 预先下载；能否从公司仓库解析仍由后续 Maven 验证。");
+        }
+        return errors;
+    }
+
+    /** 修复补丁5：复用既有本地解析路径，不访问远程 BOM，不把候选新增依赖当作版本依据。 */
+    private String confirmedMockitoCoreVersion(AgentContext context, Map<String, Element> declared) {
         String version = text(declared.get("org.mockito:mockito-core"), "version");
         if (version.isEmpty()) {
-            version = localProperties(context).getOrDefault("mockito.version", "");
+            version = expand(localProperties(context).getOrDefault("mockito.version", ""), localProperties(context));
         }
         if (version.isEmpty() && !declared.containsKey("org.mockito:mockito-core")
                 && declared.containsKey("org.springframework.boot:spring-boot-starter-test")) {
@@ -526,13 +571,7 @@ public class MavenDependencySupport {
                 version = text(starterDependencies.get("org.mockito:mockito-core"), "version");
             }
         }
-        if (version.matches("[1-4]\\..*")) {
-            errors.add("Mockito 静态/构造器 Mock 预检: 已确认 mockito-core=" + version
-                    + "，当前本地声明与配置未提供 inline MockMaker。先核对完整测试类路径，"
-                    + "若无其它提供方，在模块 POM 局部补同版本 mockito-inline test 依赖，复用已确认版本管理；"
-                    + "可与当前测试放在同一计划，禁止升级 core、删断言或改生产初始化来绕过。");
-        }
-        return errors;
+        return version;
     }
 
     private void collectDependencies(Element dependencies, Map<String, String> properties,
