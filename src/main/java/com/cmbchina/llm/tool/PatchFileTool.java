@@ -284,7 +284,13 @@ public class PatchFileTool extends BaseTool {
         }
         int matchStart = content.indexOf(actualOldText);
         if (content.indexOf(actualOldText, matchStart + 1) >= 0) {
-            throw new RuntimeException("oldText 匹配多处，请读取并提供包含上下文的唯一片段");
+            // 修复补丁7：由真实匹配器提供候选位置，不让规划层用另一套规则猜测命中。
+            java.util.List<int[]> matches = new java.util.ArrayList<>();
+            for (int from = matchStart; from >= 0 && matches.size() < 3;
+                 from = content.indexOf(actualOldText, from + 1)) {
+                matches.add(new int[]{from, from + actualOldText.length()});
+            }
+            throw new AmbiguousPatchException("oldText 匹配多处，请读取并提供包含上下文的唯一片段", content, matches);
         }
 
         return content.substring(0, matchStart) + newText
@@ -381,6 +387,8 @@ public class PatchFileTool extends BaseTool {
         }
 
         String result = null;
+        // 修复补丁7：最多保留三个实际 token 匹配范围，反馈不重新进行精确文本搜索。
+        java.util.List<int[]> matches = new java.util.ArrayList<>();
         for (int start = 0;
              start + oldTokens.size() <= contentTokens.size();
              start++) {
@@ -398,15 +406,61 @@ public class PatchFileTool extends BaseTool {
                 }
             }
             if (matched) {
-                if (result != null) {
-                    throw new IllegalArgumentException("oldText 空白归一化后匹配多处，请提供更完整的唯一上下文");
-                }
                 int segStart = contentTokens.get(start)[0];
                 int segEnd = contentTokens.get(start + oldTokens.size() - 1)[1];
                 result = content.substring(segStart, segEnd);
+                matches.add(new int[]{segStart, segEnd});
+                if (matches.size() >= 3) {
+                    break;
+                }
             }
         }
+        if (matches.size() > 1) {
+            throw new AmbiguousPatchException("oldText 空白归一化后匹配多处，请提供更完整的唯一上下文",
+                    content, matches);
+        }
         return result;
+    }
+
+    /**
+     * 修复补丁7：保留真实候选的有界诊断，不提供自动选中或修改文件的能力。
+     *
+     * @author summer
+     * @date 2026-11-12 00:00:00
+     */
+    public static final class AmbiguousPatchException extends IllegalArgumentException {
+        private final String feedback;
+
+        private AmbiguousPatchException(String reason, String source, java.util.List<int[]> matches) {
+            super(reason + "；候选起始行=" + candidateLines(source, matches));
+            StringBuilder details = new StringBuilder("\n唯一性冲突：以下为本步骤内存预演内容的实际命中（最多3处），"
+                    + "仅用于定位，未落盘；须加入目标方法签名/父配置键及相邻唯一上下文重新规划：");
+            for (int[] range : matches) {
+                int begin = Math.max(0, range[0] - 100);
+                int end = Math.min(source.length(), range[0] + 160);
+                details.append("\n候选位置附近原文:\n").append(source, begin, end);
+            }
+            feedback = details.toString();
+        }
+
+        private static java.util.List<Integer> candidateLines(String source, java.util.List<int[]> matches) {
+            java.util.List<Integer> lines = new java.util.ArrayList<>();
+            int line = 1;
+            int scanned = 0;
+            for (int[] range : matches) {
+                for (; scanned < range[0]; scanned++) {
+                    if (source.charAt(scanned) == '\n') {
+                        line++;
+                    }
+                }
+                lines.add(line);
+            }
+            return lines;
+        }
+
+        public String getFeedback() {
+            return feedback;
+        }
     }
 
     private String detectLineSeparator(String content) {

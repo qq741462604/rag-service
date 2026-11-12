@@ -337,6 +337,9 @@ public class QwenPlanner implements Planner {
                 previews.put(file, patchFileTool.previewPatch(content, input));
                 patchSteps.computeIfAbsent(file, key -> new ArrayList<>()).add(index);
             } catch (Exception e) {
+                // 修复补丁8：在异常正文被日志过滤前独立保存诊断，不修改被拒绝的计划或目标文件。
+                String diagnostic = saveRejectedPatchPlan(context, plan, index, input, content, originals,
+                        patchSteps.getOrDefault(file, Collections.emptyList()), e);
                 // 每个任务对同一文件最多安排一次原文刷新，不增加模型预算或无限重试。
                 if (content != null) {
                     String path = workspaceService.relativePath(
@@ -347,10 +350,10 @@ public class QwenPlanner implements Planner {
                     }
                 }
                 String message = "第 " + index + " 步 patch_file 预检失败，原计划全部未执行。path="
-                        + input.getPath() + "；原因=" + e.getMessage()
+                        + input.getPath() + "；诊断文件=" + diagnostic + "；原因=" + e.getMessage()
                         // 修复补丁：先给出具体恢复动作，不将整文件替换误报为补丁顺序冲突。
                         + patchFailureRecoveryHint(e, patchSteps.getOrDefault(file, Collections.emptyList()), input.getPath())
-                        + patchConflictHint(plan, patchSteps.getOrDefault(file, Collections.emptyList()), input, content)
+                        + patchConflictHint(plan, patchSteps.getOrDefault(file, Collections.emptyList()), input, content, e)
                         + "\n预检失败不表示落盘文件已部分修改。重新规划仍以 Observations 中的最新磁盘原文为起点，重做必要的完整局部补丁；"
                         + "不要把下方虚拟中间状态当作已落盘内容，也不要照抄旧计划重放。系统刷新原文同样满足先读再改。"
                         + "\n本文件此前已预演的补丁步骤: " + patchSteps.getOrDefault(file, Collections.emptyList())
@@ -371,6 +374,66 @@ public class QwenPlanner implements Planner {
         } else {
             previews.forEach((file, after) -> skillTemplateCoordinator.validatePomPreview(
                     context, file, originals.get(file), after));
+        }
+    }
+
+    /** 修复补丁8：保存失败计划、磁盘基线及失败步骤之前的虚拟内容；主日志仅打印路径。 */
+    private String saveRejectedPatchPlan(AgentContext context, CodePlan plan, int failedStep, ToolInput input,
+                                         String previewBeforeStep, Map<File, String> originals,
+                                         List<Integer> previousSteps, Exception error) {
+        Object stored = context.getVariables().get("patch_preflight_diagnostic_count");
+        int count = stored instanceof Number ? ((Number) stored).intValue() : 0;
+        // 每任务最多40份，每份最多4MiB；达到边界明确记录，禁止静默截断 oldText/newText。
+        if (count >= 40) {
+            log.warn("patch preflight diagnostic not saved flow={} step={} reason=task-limit-40",
+                    context.getVariables().get("s2_flow_id"), failedStep);
+            return "未保存（每任务最多40份）";
+        }
+        try {
+            Map<String, Object> report = new LinkedHashMap<>();
+            report.put("flow", context.getVariables().get("s2_flow_id"));
+            report.put("agentId", context.getAgentId());
+            report.put("phase", context.getPhase());
+            report.put("track", context.getCodingTrack());
+            report.put("modelCalls", context.getModelCalls());
+            report.put("failedStep", failedStep);
+            report.put("failedPath", input.getPath());
+            report.put("planExecuted", false);
+            report.put("note", "原计划全部未执行。originalFiles 为本次预检读取的磁盘基线；"
+                    + "previewBeforeFailedStep 含前序步骤内存预演，未落盘，不能当作最新磁盘原文。"
+                    + "plan 为规划预处理后的完整待执行计划；JSON 字符串按 JSON 规则转义，解码后保留原缩进和换行。");
+            report.put("reason", error.getMessage());
+            report.put("previousPatchStepsForFailedFile", previousSteps);
+            report.put("plan", plan);
+            Map<String, String> baselines = new LinkedHashMap<>();
+            originals.forEach((file, source) -> baselines.put(workspaceService.relativePath(file), source));
+            report.put("originalFiles", baselines);
+            report.put("previewBeforeFailedStep", previewBeforeStep);
+            if (error instanceof PatchFileTool.AmbiguousPatchException) {
+                report.put("matchFeedback", ((PatchFileTool.AmbiguousPatchException) error).getFeedback());
+            }
+            byte[] bytes = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(report);
+            if (bytes.length > 4 * 1024 * 1024) {
+                log.warn("patch preflight diagnostic not saved flow={} step={} bytes={} reason=size-limit-4MiB",
+                        context.getVariables().get("s2_flow_id"), failedStep, bytes.length);
+                return "未保存（诊断超过4MiB，未截断）";
+            }
+            java.nio.file.Path directory = new File("logs/patch-preflight").toPath().toAbsolutePath().normalize();
+            Files.createDirectories(directory);
+            String flow = String.valueOf(context.getVariables().get("s2_flow_id"))
+                    .replaceAll("[^A-Za-z0-9_-]", "_");
+            java.nio.file.Path snapshot = Files.createTempFile(directory,
+                    flow + "-call" + context.getModelCalls() + "-step" + failedStep + "-", ".json");
+            Files.write(snapshot, bytes);
+            context.getVariables().put("patch_preflight_diagnostic_count", count + 1);
+            log.warn("patch preflight diagnostic saved flow={} phase={} track={} step={} path={} diagnostic={}",
+                    flow, context.getPhase(), context.getCodingTrack(), failedStep, input.getPath(), snapshot);
+            return snapshot.toString();
+        } catch (java.io.IOException | RuntimeException exception) {
+            // 不打印序列化异常正文，避免源码进入主日志；保存失败也不覆盖原预检失败原因。
+            log.warn("patch preflight diagnostic not saved flow={} step={} type={}",
+                    context.getVariables().get("s2_flow_id"), failedStep, exception.getClass().getSimpleName());
+            return "未保存（保存失败，查看日志中的异常类型）";
         }
     }
 
@@ -418,7 +481,14 @@ public class QwenPlanner implements Planner {
     }
 
     /** 将具体冲突放到反馈开头，避免被行动反馈的长度上限截掉。仅诊断，不修改补丁。 */
-    private String patchConflictHint(CodePlan plan, List<Integer> previousSteps, ToolInput input, String content) {
+    private String patchConflictHint(CodePlan plan, List<Integer> previousSteps, ToolInput input, String content,
+                                     Exception error) {
+        // 修复补丁7：优先使用匹配器真实命中；精确搜索无法解释空白归一化后的歧义。
+        if (error instanceof PatchFileTool.AmbiguousPatchException) {
+            return "\n本文件已预演但未落盘的步骤=" + previousSteps
+                    + "；重新提交须以最新磁盘原文为起点，保留必要步骤并按顺序重做唯一锚点。"
+                    + ((PatchFileTool.AmbiguousPatchException) error).getFeedback();
+        }
         // 修复补丁6：诊断保留 YAML 缩进与边界换行，避免将不同层级误报为同一精确片段。
         String oldText = normalizePatchFeedback(input.getOldText());
         if (oldText.trim().isEmpty()) {
