@@ -296,6 +296,16 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        // 修复补丁4：源码语法拒绝不等于 JSON/依赖异常，未落盘候选不能作为下一轮补丁锚点。
+        if (errors.contains("Java 语法解析失败")) {
+            rules.append("上轮候选 Java 语法不合法，整份计划未执行。先修复解析位置及其前后源码的语法，")
+                    .append("不要通过改依赖、生产实现或削弱断言解决。import 必须为完整的类型/静态成员导入并以分号结束；")
+                    .append("不要保留以点号结尾的半条 import，也不要直接补成通配导入掩盖错误；已有正确导入时去掉多余残片。")
+                    .append("报错位置可能是下一条合法 import，需先检查上一条声明。")
+                    .append("新测试尚未落盘时重新提交包含修正的完整 create_file/write_file 内容；")
+                    .append("已有测试继续以 Observations 中最新磁盘原文做局部 patch，不能拿被拒绝候选作 oldText，")
+                    .append("诊断快照也不是目标工程文件。保留本轮其它必要修改和有效断言，纠正后重新提交完整计划。\n");
+        }
         // 修复补丁3：拒绝后的下一轮优先解释字段所属者，保留原门禁，不靠增加预算重试。
         if (errors.contains("静态 Bean 隔离不完整")) {
             rules.append("上轮静态 Bean 隔离拒绝，请先按 saved/injected/restored 缺项纠正。")

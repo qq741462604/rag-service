@@ -74,11 +74,21 @@ public class TestSourceInspector {
                         "第 " + range.begin.line + " 行，第 " + range.begin.column + " 列，").orElse("");
                 return location + "解析原因=" + message.substring(0, Math.min(500, message.length()));
             }).collect(java.util.stream.Collectors.joining(" | "));
-            String excerpts = result.getProblems().stream().limit(3).map(problem -> {
+            // 修复补丁4：语法错误可能定位在下一条 import；反馈相邻原文，避免模型只修报错行。
+            // 仅首个错误前后两行、每行最多 160 字，便于在规划反馈上限内保留有效上下文。
+            String excerpts = result.getProblems().stream().limit(1).map(problem -> {
                 String location = problem.getLocation().flatMap(range -> range.toRange()).map(range -> {
                     int line = range.begin.line;
-                    String excerpt = line > 0 && line <= lines.length ? lines[line - 1].trim() : "";
-                    return "第 " + line + " 行: " + excerpt.substring(0, Math.min(240, excerpt.length()));
+                    StringBuilder excerpt = new StringBuilder();
+                    for (int index = Math.max(1, line - 2); index <= Math.min(lines.length, line + 2); index++) {
+                        if (excerpt.length() > 0) {
+                            excerpt.append('\n');
+                        }
+                        String text = lines[index - 1].trim();
+                        excerpt.append("第 ").append(index).append(" 行: ")
+                                .append(text, 0, Math.min(160, text.length()));
+                    }
+                    return excerpt.toString();
                 }).orElse("");
                 return location;
             }).collect(java.util.stream.Collectors.joining("\n"));
