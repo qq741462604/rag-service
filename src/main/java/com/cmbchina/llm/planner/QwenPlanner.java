@@ -349,7 +349,7 @@ public class QwenPlanner implements Planner {
                 String message = "第 " + index + " 步 patch_file 预检失败，原计划全部未执行。path="
                         + input.getPath() + "；原因=" + e.getMessage()
                         // 修复补丁：先给出具体恢复动作，不将整文件替换误报为补丁顺序冲突。
-                        + patchFailureRecoveryHint(e, patchSteps.getOrDefault(file, Collections.emptyList()))
+                        + patchFailureRecoveryHint(e, patchSteps.getOrDefault(file, Collections.emptyList()), input.getPath())
                         + patchConflictHint(plan, patchSteps.getOrDefault(file, Collections.emptyList()), input, content)
                         + "\n预检失败不表示落盘文件已部分修改。重新规划仍以 Observations 中的最新磁盘原文为起点，重做必要的完整局部补丁；"
                         + "不要把下方虚拟中间状态当作已落盘内容，也不要照抄旧计划重放。系统刷新原文同样满足先读再改。"
@@ -375,13 +375,20 @@ public class QwenPlanner implements Planner {
     }
 
     /** 修复补丁：区分范围违规、歧义和顺序问题，避免刷新原文后仍重复全文补丁。 */
-    private String patchFailureRecoveryHint(Exception error, List<Integer> previousSteps) {
+    private String patchFailureRecoveryHint(Exception error, List<Integer> previousSteps, String path) {
         String reason = String.valueOf(error.getMessage());
         if (reason.contains("整文件替换")) {
             return "\n补丁类型=整文件范围被拒绝。不要重发全文；每步只改一个字段、方法或 import 区块，"
                     + "oldText 从真实原文复制并带唯一上下文，保留其他成员及注释。多个修改分别提交局部步骤。";
         }
         if (reason.contains("匹配多处")) {
+            // 修复补丁6：YAML 按配置层级定位，不能沿用 Java 方法签名或测试 stub 的纠正提示。
+            if (isYamlPatch(path)) {
+                return "\n补丁类型=YAML 定位歧义。oldText 在文件中不唯一，禁止任选第一处替换。"
+                        + "从最新磁盘原文复制包含目标父级配置键及相邻同级键的完整局部块，保留缩进、换行和注释；"
+                        + "若相同配置存在于多个 --- 文档，还需加入目标文档的 profile/激活条件或其它唯一上下文。"
+                        + "newText 保留同一上下文，只改目标键；不能只用空行、短值或重复键作锚点，不能整文件覆盖。";
+            }
             return "\n补丁类型=定位歧义。加入所属方法签名或相邻唯一字段，不要改成整文件匹配。";
         }
         if (previousSteps.isEmpty()) {
@@ -390,6 +397,12 @@ public class QwenPlanner implements Planner {
         }
         return "\n补丁类型=局部补丁无法应用，请核对前序步骤。后续 oldText 必须匹配前序修改后的内存内容，"
                 + "前序已删除的 import 不能再次出现在后续 oldText；整份计划仍未落盘。";
+    }
+
+    /** 修复补丁6：只区分提示类型，不改变补丁匹配、唯一性门禁或写入范围。 */
+    private boolean isYamlPatch(String path) {
+        String normalized = path == null ? "" : path.toLowerCase(Locale.ROOT);
+        return normalized.endsWith(".yml") || normalized.endsWith(".yaml");
     }
 
     private boolean isS2(AgentContext context) {
@@ -406,16 +419,17 @@ public class QwenPlanner implements Planner {
 
     /** 将具体冲突放到反馈开头，避免被行动反馈的长度上限截掉。仅诊断，不修改补丁。 */
     private String patchConflictHint(CodePlan plan, List<Integer> previousSteps, ToolInput input, String content) {
-        String oldText = normalizePatchFeedback(input.getOldText()).trim();
-        if (oldText.isEmpty()) {
+        // 修复补丁6：诊断保留 YAML 缩进与边界换行，避免将不同层级误报为同一精确片段。
+        String oldText = normalizePatchFeedback(input.getOldText());
+        if (oldText.trim().isEmpty()) {
             return "";
         }
         for (int position = previousSteps.size() - 1; position >= 0; position--) {
             int previousIndex = previousSteps.get(position);
             ToolInput previous = (ToolInput) plan.getSteps().get(previousIndex - 1).getInput();
-            String previousOld = normalizePatchFeedback(previous.getOldText()).trim();
-            String previousNew = normalizePatchFeedback(previous.getNewText()).trim();
-            if (!previousOld.isEmpty() && !previousOld.equals(previousNew)
+            String previousOld = normalizePatchFeedback(previous.getOldText());
+            String previousNew = normalizePatchFeedback(previous.getNewText());
+            if (!previousOld.trim().isEmpty() && !previousOld.equals(previousNew)
                     && (oldText.contains(previousOld) || previousOld.contains(oldText))) {
                 return "\n冲突线索：当前 oldText 与本文件第 " + previousIndex + " 步的旧片段重叠。"
                         + "第 " + previousIndex + " 步已在内存中替换该片段；请合并为同一方法/夹具的一处局部修复，"
@@ -429,8 +443,11 @@ public class QwenPlanner implements Planner {
         if (first < 0 || source.indexOf(oldText, first + 1) < 0) {
             return "";
         }
-        StringBuilder matches = new StringBuilder("\n唯一性冲突：相同片段出现在以下位置，"
-                + "请加入所属测试方法签名或该用例特有上下文，不要只用公共 stub 行定位：");
+        // 修复补丁6：配置文件给出配置块锚点；正文仍仅反馈模型，不打印到运行日志。
+        StringBuilder matches = new StringBuilder("\n唯一性冲突：相同片段出现在以下位置，")
+                .append(isYamlPatch(input.getPath())
+                        ? "请加入目标父级配置键、同级键或文档激活条件，逐字保留缩进，不要只用重复配置行定位："
+                        : "请加入所属方法签名或相邻唯一上下文，不要只用公共语句定位：");
         int from = first;
         int line = 1;
         int scanned = 0;
