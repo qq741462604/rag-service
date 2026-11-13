@@ -442,6 +442,10 @@ public class QwenPlanner implements Planner {
         String reason = String.valueOf(error.getMessage());
         if (reason.contains("整文件替换")) {
             if (path == null || !path.toLowerCase(Locale.ROOT).endsWith(".java")) {
+                if (isYamlPatch(path)) {
+                    return "\n补丁类型=YAML 全文范围被拒绝。若只改一个配置值，重新从最新原文提交包含父级配置键和相邻同级键的局部 oldText/newText；"
+                            + "只替换目标行并保留缩进、注释、换行。多行结构变化必须拆成局部步骤，不能重发完整 YAML 或任选重复配置的第一处。";
+                }
                 return "\n补丁类型=整文件范围被拒绝。不要重发全文；每步只改一个字段、方法或 import 区块，"
                         + "oldText 从真实原文复制并带唯一上下文，保留其他成员及注释。多个修改分别提交局部步骤。";
             }

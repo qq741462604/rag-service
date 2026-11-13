@@ -130,6 +130,10 @@ public class PatchFileTool extends BaseTool {
             if (localized != null) {
                 return localized;
             }
+            localized = localizeSingleLineYamlPatch(content, oldText, newText, toolInput.getPath());
+            if (localized != null) {
+                return localized;
+            }
             throw new IllegalArgumentException("已有非空文件只允许局部修改，禁止通过 patch_file 整文件替换；"
                     + "全文上下文无法证明为保留其他成员的单个字段/方法修改或新增。"
                     + "请只提交真实唯一的字段、方法或 import 局部片段，不要重新提交全文");
@@ -241,6 +245,81 @@ public class PatchFileTool extends BaseTool {
                     path, prefix, suffix);
         }
         return result;
+    }
+
+    /**
+     * 修复补丁13：全文上下文中只有一行 YAML 简单标量值变化时，缩小为带相邻键的唯一局部片段。
+     * 多行结构变更或非唯一上下文继续走整文件保护，不自动选择命中位置。
+     */
+    private String localizeSingleLineYamlPatch(String content, String oldText, String newText, String path) {
+        if (path == null || !(path.toLowerCase(java.util.Locale.ROOT).endsWith(".yml")
+                || path.toLowerCase(java.util.Locale.ROOT).endsWith(".yaml"))
+                || oldText.length() > 256 * 1024 || newText.length() > 256 * 1024
+                || !content.contains(oldText)) {
+            return null;
+        }
+        String oldNormalized = oldText.replace("\r\n", "\n").replace('\r', '\n');
+        String newNormalized = newText.replace("\r\n", "\n").replace('\r', '\n');
+        String[] oldLines = oldNormalized.split("\n", -1);
+        String[] newLines = newNormalized.split("\n", -1);
+        if (oldLines.length != newLines.length) {
+            return null;
+        }
+        int changed = -1;
+        for (int index = 0; index < oldLines.length; index++) {
+            if (!oldLines[index].equals(newLines[index])) {
+                if (changed >= 0) {
+                    return null;
+                }
+                changed = index;
+            }
+        }
+        if (changed < 0 || oldLines[changed].trim().isEmpty()) {
+            return null;
+        }
+        // 只接受同一简单键、缩进及行尾注释不变的普通标量，不接受键/层级、引用或块标量变更。
+        java.util.regex.Pattern scalar = java.util.regex.Pattern.compile(
+                "^([ ]*[A-Za-z0-9_.-]+:[ ]+)([A-Za-z0-9_./:%?=+@~-]+)([ \\t]*(?:#.*)?)$");
+        java.util.regex.Matcher oldScalar = scalar.matcher(oldLines[changed]);
+        java.util.regex.Matcher newScalar = scalar.matcher(newLines[changed]);
+        if (!oldScalar.matches() || !newScalar.matches()
+                || !oldScalar.group(1).equals(newScalar.group(1))
+                || !oldScalar.group(3).equals(newScalar.group(3))) {
+            return null;
+        }
+
+        String separator = detectLineSeparator(content);
+        // 逐步扩大父级/相邻键上下文，直到在真实原文中唯一命中。
+        for (int radius = 2; radius <= 5; radius++) {
+            int start = Math.max(0, changed - radius);
+            int end = Math.min(oldLines.length, changed + radius + 1);
+            String oldBlock = joinLines(oldLines, start, end, separator);
+            String newBlock = joinLines(newLines, start, end, separator);
+            int position = content.indexOf(oldBlock);
+            if (position < 0 || oldBlock.trim().equals(content.trim())
+                    || content.indexOf(oldBlock, position + 1) >= 0) {
+                continue;
+            }
+            // 此分支只接受精确唯一原文，不以空白归一化跨 YAML 层级匹配。
+            String result = applyLocatedPatch(content, oldBlock, newBlock);
+            if (result != null) {
+                log.info("patch_file localized single-line YAML path={} line={} contextLines={}",
+                        path, changed + 1, end - start);
+                return result;
+            }
+        }
+        return null;
+    }
+
+    private String joinLines(String[] lines, int start, int end, String separator) {
+        StringBuilder result = new StringBuilder();
+        for (int index = start; index < end; index++) {
+            if (index > start) {
+                result.append(separator);
+            }
+            result.append(lines[index]);
+        }
+        return result.toString();
     }
 
     /** 修复补丁：文本改动也必须落在已确认成员内，防止仅保留类头和大括号绕过保护。 */
