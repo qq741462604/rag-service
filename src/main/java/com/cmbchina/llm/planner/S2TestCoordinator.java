@@ -235,6 +235,9 @@ public class S2TestCoordinator {
                 // 修复补丁3：当前工具本身必须真实执行，不能套用上游调用方的构造器 Mock 夹具。
                 + httpClientUtilFixtureRules(entry)
                 + "使用真实业务签名和已有 JUnit4/5、断言/Mockito；测试须有实际业务断言。"
+                // 修复补丁14：注释或仅执行用例不能代替逐方法的行为验证。
+                + "逐个检查每个 @Test 方法都含有效结果/状态断言或完整 Mockito.verify(...).真实方法(...)；"
+                + "when/thenReturn 是配桩，不是验证，注释、仅执行不抛异常和 assertTrue(true) 不满足要求。"
                 + "初始化测试保留对象非空断言，并补初始化后的状态或依赖交互，不能只断言 new 的对象非空。"
                 + "固定评分输入用具体 BigDecimal 期望验证写回，不仅使用 any(BigDecimal.class)；"
                 + "HTTP 头和参数测试捕获实际 HttpUriRequest 验证，不仅断言响应桩的返回常量。"
@@ -284,6 +287,17 @@ public class S2TestCoordinator {
                 + "本条目使用纯 Mockito 夹具，不额外启动 @SpringBootTest/SpringExtension。"
                 + "ApplicationContext 是普通接口实例：导入 org.springframework.context.ApplicationContext，"
                 + "用 mock(ApplicationContext.class)，不要 mockStatic(ApplicationContext.class)。"
+                // 修复补丁14：实例配桩和静态句柄配桩的 API 不同，工具测试不照搬调用方缓存。
+                + "普通上下文使用 Mockito.when(mockApplicationContext.getBean(ReadConfig.class)).thenReturn(mockReadConfig)，"
+                + "BeeTraceClientHelper 同理；不能 mockApplicationContext.when(() -> ...)，只有 MockedStatic 句柄有此 API。"
+                + "当前工具类是否有 httpClientUtil 静态缓存以真实源码字段为准；没有就不要反射 getField(HttpClientUtil.class, \"httpClientUtil\")。"
+                + "Handler 的缓存规则不要求工具本身有同名缓存；直接构造真实 HttpClientUtil，使用工厂返回的 Mock 或注入该实例的非 final httpClient。"
+                + "每个 Header 分支用例通过 ArgumentCaptor<HttpUriRequest> 捕获底层 execute 的实际请求，"
+                + "按该用例输入验证头值；例如输入 Custom-Key=Custom-Value 和 Content-Length 时，验证自定义头值且输入的 Content-Length 没被复制。"
+                + "无实体时可断言捕获请求的 Content-Length Header 为 null，"
+                + "若传输层实际生成该头则按真实实现验证，不能只返回固定字符串或写注释声称走通。"
+                + "异常用例中 mockHttpClient.execute(...) 的 when 配桩在 assertThrows lambda 外也声明 IOException，"
+                + "所在方法要 throws Exception 或捕获，不能只给 lambda 加异常断言。"
                 + "所有 ReadConfig/追踪/连接池容量桩在首次使用 HttpClientUtil 前就绪。"
                 + "字段所属者是 HttpClientUtil：保存 originReadConfig=HttpClientUtil.readConfig、"
                 + "originTraceHelper=HttpClientUtil.beeTraceClientHelper 后，向这两个同名字段注入本轮 Bean；"
@@ -321,6 +335,13 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        // 修复补丁14：缺断言时修复被点名方法的真实行为验证，不删除用例或只给其它方法补断言。
+        if (errors.contains("测试方法缺少有效断言或交互验证")) {
+            rules.append("上轮被点名的测试方法没有有效验证；保留该方法和被测调用，在该方法内新增真实结果/状态断言或依赖交互验证。")
+                    .append("HTTP Header 用例捕获 mockHttpClient.execute 的实际 HttpUriRequest，断言自定义头值及输入 Content-Length 未被复制；")
+                    .append("when/thenReturn 配桩、注释、仅执行无异常、恒真断言都不算验证，不要删除该用例或只给别的方法加断言。")
+                    .append("新测试候选尚未落盘则重交完整修正内容，已有测试从最新磁盘原文做局部补丁，保留全部既有有效断言。\n");
+        }
         // 修复补丁12：类型导入缺失会连带影响反射隔离识别，不能把全部 false 当成代码不存在。
         if (errors.contains("缺少导入") && (errors.contains("ReflectionTestUtils") || errors.contains("HttpClients"))) {
             rules.append("上轮候选缺少工具导入，先在同一计划补齐 import org.springframework.test.util.ReflectionTestUtils; ")

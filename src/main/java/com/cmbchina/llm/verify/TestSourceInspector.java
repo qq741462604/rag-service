@@ -198,7 +198,10 @@ public class TestSourceInspector {
             if (!method.getBody().isPresent() || method.getBody().get().getStatements().isEmpty()) {
                 errors.add("测试方法为空: " + method.getNameAsString());
             } else if (assertionCount(unit, method) == 0) {
-                errors.add("测试方法缺少有效断言或交互验证: " + method.getNameAsString());
+                // 修复补丁14：点名原方法及可执行修复动作，配桩和执行注释不能代替验证。
+                errors.add("测试方法缺少有效断言或交互验证: " + method.getNameAsString()
+                        + "；保留用例，在本方法内断言实际业务结果/状态或 verify 实际依赖调用；when/thenReturn 和注释不算验证。"
+                        + "HTTP 头分支需捕获 execute 的实际请求并检查目标 Header，不能只断言回调固定常量或执行无异常");
             } else if (method.findAll(MethodCallExpr.class).stream().filter(call -> isEffectiveAssertion(unit, call))
                     .allMatch(call -> isConstructionNotNull(method, call))) {
                 errors.add("测试仅验证直接 new 的对象非空，未验证业务行为: " + method.getNameAsString()
@@ -645,6 +648,43 @@ public class TestSourceInspector {
         Map<String, String> variableTypes = new HashMap<>();
         unit.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).forEach(variable ->
                 variableTypes.putIfAbsent(variable.getNameAsString(), variable.getType().asString()));
+        // 修复补丁14：仅在变量声明唯一且类型明确时检查普通上下文误用静态句柄 API，避免猜测别名。
+        for (MethodCallExpr call : unit.findAll(MethodCallExpr.class)) {
+            if (!call.getNameAsString().equals("when") || call.getArguments().size() != 1
+                    || !call.getArgument(0).isLambdaExpr() || !call.getScope().isPresent()) {
+                continue;
+            }
+            Expression scope = call.getScope().get();
+            if (!(scope.isNameExpr() || scope.isFieldAccessExpr() && scope.asFieldAccessExpr().getScope().isThisExpr())) {
+                continue;
+            }
+            String receiver = bindingName(scope);
+            List<com.github.javaparser.ast.body.VariableDeclarator> declarations = unit.findAll(
+                    com.github.javaparser.ast.body.VariableDeclarator.class).stream()
+                    .filter(variable -> variable.getNameAsString().equals(receiver))
+                    .collect(java.util.stream.Collectors.toList());
+            if (declarations.size() == 1 && matchesType(unit, declarations.get(0).getType().asString(),
+                    "org.springframework.context.ApplicationContext")
+                    && unit.findAll(com.github.javaparser.ast.body.Parameter.class).stream()
+                    .noneMatch(parameter -> parameter.getNameAsString().equals(receiver))) {
+                errors.add("ApplicationContext 实例没有 when(lambda) 方法: " + receiver
+                        + "；改为 Mockito.when(" + receiver + ".getBean(真实Bean.class)).thenReturn(本轮BeanMock)，"
+                        + "只有 MockedStatic 句柄使用 handle.when(lambda)，不要改生产代码或启动 Spring 上下文");
+            }
+        }
+
+        // 修复补丁14：仅在真实工具类无继承且无同名字段时拒绝虚构的 Handler 缓存读取。
+        boolean noUtilityCache = business.getTypes().stream()
+                .filter(type -> type.getNameAsString().equals(sourceClass) && type.isClassOrInterfaceDeclaration())
+                .map(type -> type.asClassOrInterfaceDeclaration())
+                .anyMatch(type -> type.getExtendedTypes().isEmpty() && !type.getFieldByName("httpClientUtil").isPresent());
+        String utilityOwner = business.getPackageDeclaration().map(pkg -> pkg.getNameAsString() + ".").orElse("") + sourceClass;
+        if (noUtilityCache && unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                staticFieldCall(unit, call, "getField", utilityOwner, "httpClientUtil", 2))) {
+            errors.add("真实 HttpClientUtil 未声明 httpClientUtil 字段，不能 getField(HttpClientUtil.class, \"httpClientUtil\")；"
+                    + "不要把 Handler 的缓存夹具复制到工具测试。先准备工厂 Mock，构造真实 HttpClientUtil，"
+                    + "让 execute 桩作用于该实例的非 final httpClient，并保留全部断言");
+        }
         for (MethodCallExpr thenReturn : unit.findAll(MethodCallExpr.class)) {
             if (!thenReturn.getNameAsString().equals("thenReturn") || thenReturn.getArguments().size() != 1
                     || !thenReturn.getArgument(0).isNameExpr() || !thenReturn.getScope().isPresent()
