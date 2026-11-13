@@ -263,7 +263,22 @@ public class S2TestCoordinator {
         if (entry == null || !"HttpClientUtil".equals(entry.sourceClass)) {
             return "";
         }
-        return "当前被测对象是 HttpClientUtil 本身，创建真实实例执行 invoke/init；"
+        // 修复补丁12：先补齐工具导入，再用字段属主明确的调用说明隔离结构，避免只重复抽象要求。
+        return "当前 HttpClientUtil 测试若使用简名，必须同时包含完整导入："
+                + "import org.springframework.test.util.ReflectionTestUtils; "
+                + "import org.apache.http.impl.client.HttpClients; "
+                + "import org.springframework.context.ApplicationContext; "
+                + "不能只添加调用而遗漏导入，或用注释代替实际隔离语句。"
+                + "例如旧值用测试实例字段 Object originReadConfig、originTraceHelper 保存（不能只声明在 setup 局部）。"
+                + "在工厂/Bean 及配置桩全部就绪后，BeforeEach 中先执行 "
+                + "originReadConfig = ReflectionTestUtils.getField(HttpClientUtil.class, \"readConfig\"); "
+                + "再执行 ReflectionTestUtils.setField(HttpClientUtil.class, \"readConfig\", 本轮ReadConfigMock); "
+                + "AfterEach 的 finally 中执行 ReflectionTestUtils.setField(HttpClientUtil.class, \"readConfig\", originReadConfig); "
+                + "beeTraceClientHelper 同样逐项 getField 保存到 originTraceHelper、setField 注入、finally setField 恢复。"
+                + "示意中的本轮ReadConfigMock必须替换成已准备的真实测试变量；每个字段保存成功后再标记可恢复，"
+                + "setup 中途失败时仅恢复已保存的字段，不能按旧值非 null 判断是否恢复。"
+                + "旧值为 null 也要恢复；各字段恢复及 Mock 句柄释放用嵌套 finally 独立保证。\n"
+                + "当前被测对象是 HttpClientUtil 本身，创建真实实例执行 invoke/init；"
                 + "不要 mockConstruction(HttpClientUtil.class) 后拿 constructed() 的普通 Mock 当真实实例，"
                 + "否则 invoke 不执行，构造器回调也不会凭空创建对象。只 Mock HttpClients 工厂返回的底层客户端及外部追踪依赖。"
                 + "本条目使用纯 Mockito 夹具，不额外启动 @SpringBootTest/SpringExtension。"
@@ -306,6 +321,14 @@ public class S2TestCoordinator {
     private String initializationFeedback(AgentContext context) {
         String errors = String.join("\n", context.getVerifyErrors());
         StringBuilder rules = new StringBuilder();
+        // 修复补丁12：类型导入缺失会连带影响反射隔离识别，不能把全部 false 当成代码不存在。
+        if (errors.contains("缺少导入") && (errors.contains("ReflectionTestUtils") || errors.contains("HttpClients"))) {
+            rules.append("上轮候选缺少工具导入，先在同一计划补齐 import org.springframework.test.util.ReflectionTestUtils; ")
+                    .append("及 import org.apache.http.impl.client.HttpClients;（仅实际使用的类型），或逐处使用真实全限定名。")
+                    .append("静态隔离检查需要解析反射工具类型，缺少导入可能使已写的 getField/setField 也显示未识别；")
+                    .append("先纠正导入，再逐项核对保存、注入、恢复，不能只因全 false 就重写已有正确逻辑。")
+                    .append("被拒候选未落盘：新测试重新提交完整修正内容，已有测试从最新磁盘原文局部修改；保留全部有效断言。\n");
+        }
         // 修复补丁4：源码语法拒绝不等于 JSON/依赖异常，未落盘候选不能作为下一轮补丁锚点。
         if (errors.contains("Java 语法解析失败")) {
             rules.append("上轮候选 Java 语法不合法，整份计划未执行。先修复解析位置及其前后源码的语法，")

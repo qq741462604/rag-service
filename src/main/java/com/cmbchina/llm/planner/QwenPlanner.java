@@ -441,8 +441,17 @@ public class QwenPlanner implements Planner {
     private String patchFailureRecoveryHint(Exception error, List<Integer> previousSteps, String path) {
         String reason = String.valueOf(error.getMessage());
         if (reason.contains("整文件替换")) {
-            return "\n补丁类型=整文件范围被拒绝。不要重发全文；每步只改一个字段、方法或 import 区块，"
-                    + "oldText 从真实原文复制并带唯一上下文，保留其他成员及注释。多个修改分别提交局部步骤。";
+            if (path == null || !path.toLowerCase(Locale.ROOT).endsWith(".java")) {
+                return "\n补丁类型=整文件范围被拒绝。不要重发全文；每步只改一个字段、方法或 import 区块，"
+                        + "oldText 从真实原文复制并带唯一上下文，保留其他成员及注释。多个修改分别提交局部步骤。";
+            }
+            // 修复补丁11、12：拆分规则交给模型，批次编号只保留在 Java 注释。
+            return "\n补丁类型=整文件范围被拒绝。不要重发全文或把完整模板覆盖到已有类；"
+                    + "以最新真实原文为基线重新规划，按顺序拆成局部步骤：先用唯一 import 行/相邻 import 区块补导入，"
+                    + "再用字段声明及相邻唯一字段补字段，已有方法的相关修改合并为该方法的完整局部片段，"
+                    + "不同方法分别 patch，新增方法逐个以唯一前后成员或类尾上下文定位。"
+                    + "每个 oldText 必须逐字来自当前原文并保留注释、其它成员和唯一上下文；不要只用重复的花括号、短值或整类文本。"
+                    + "前序步骤仅在内存预演且本轮全部未落盘，后续 oldText 必须按步骤匹配预演后的内容。";
         }
         if (reason.contains("匹配多处")) {
             // 修复补丁6：YAML 按配置层级定位，不能沿用 Java 方法签名或测试 stub 的纠正提示。
@@ -970,6 +979,10 @@ public class QwenPlanner implements Planner {
                 : "按全部命中 Skill 的产物和验收逐项补齐，可分多轮；一次文件写入不代表 S1 完成。\n");
         sb.append("新文件必须确认不存在后 write_file；已有文件必须先 read_file，再 patch_file。\n");
         sb.append("patch_file 的 oldText 是已读真实片段，newText 是该片段的替换内容，不能用整文件替换局部片段。\n");
+        // 修复补丁11、12：编号仅供代码定位，不进入阶段提示词。
+        sb.append("已有 Java 类一次涉及多个成员时必须拆分 patch_file；先处理唯一 import，再处理字段，"
+                + "已有方法按方法局部片段修改，新增方法逐个用唯一前后成员定位。每步 oldText 逐字取自最新原文，"
+                + "不得提交整类全文、重复花括号或短值；同一方法相关改动可合并，不同方法分开提交。\n");
         sb.append("允许读取当前模板对应的已有类、配置、pom 和依赖以补齐真实信息。\n");
         sb.append("有固定模板时按模板顺序修改入口；普通 Skill 先完成依赖类，再接入真实入口。\n");
         sb.append(skillTemplateCoordinator.buildCurrentRules(context));
