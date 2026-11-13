@@ -19,12 +19,7 @@ import java.io.File;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 
 /**
  * S2 真实测试源码的有界读取及 JUnit 结构门禁，不替代实际测试执行。
@@ -133,6 +128,8 @@ public class TestSourceInspector {
             CompilationUnit business = parse(businessSource);
             // 修复补丁3：工具类单测不能把被测对象本身替换为默认不执行真实方法的构造器 Mock。
             validateHttpUtilSubjectMock(unit, business, sourceClass, errors);
+            // 修复补丁9：HttpClientUtil 夹具的类型/调用边界在预检阶段明确指出，避免先进入 Maven 才暴露。
+            validateHttpUtilFixtureApi(unit, business, sourceClass, errors);
             validateReflectiveFieldWrites(unit, business, sourceClass, errors);
             validateCachedHttpClientFixture(unit, business, sourceClass, errors);
             validateMutableStaticBeans(unit, business, sourceClass, errors);
@@ -601,6 +598,92 @@ public class TestSourceInspector {
                     call.getArgument(0).asClassExpr().getType().asString(), "org.springframework.context.ApplicationContext")) {
                 errors.add("ApplicationContext 应为普通实例 Mock，不是静态工具：使用 mock(ApplicationContext.class)，"
                         + "只对 SpringContextBeanUtil 注册可关闭的静态 Mock；删除无用途的 ApplicationContext 静态注册");
+            }
+        }
+    }
+
+    /**
+     * 修复补丁9：检查 HttpClientUtil 测试中可由源码直接判定的 API/夹具错误。
+     * 只针对当前被测工具，不影响把 HttpClientUtil 作为依赖的其它测试。
+     */
+    private void validateHttpUtilFixtureApi(CompilationUnit unit, CompilationUnit business,
+                                            String sourceClass, List<String> errors) {
+        if (!"HttpClientUtil".equals(sourceClass)) {
+            return;
+        }
+        boolean usesReflection = unit.findAll(MethodCallExpr.class).stream().anyMatch(call ->
+                java.util.Arrays.asList("getField", "setField").contains(call.getNameAsString())
+                        && (call.getScope().map(scope -> scope.toString().equals("ReflectionTestUtils")
+                        || scope.toString().equals("org.springframework.test.util.ReflectionTestUtils")).orElse(false)
+                        || unit.getImports().stream().anyMatch(declaration -> declaration.isStatic()
+                        && (declaration.getNameAsString().equals(
+                        "org.springframework.test.util.ReflectionTestUtils." + call.getNameAsString())
+                        || declaration.isAsterisk()
+                        && declaration.getNameAsString().equals("org.springframework.test.util.ReflectionTestUtils")))));
+        boolean reflectionImport = unit.getImports().stream().anyMatch(declaration -> !declaration.isStatic()
+                && (declaration.getNameAsString().equals("org.springframework.test.util.ReflectionTestUtils")
+                || declaration.isAsterisk()
+                && declaration.getNameAsString().equals("org.springframework.test.util")));
+        if (usesReflection && !reflectionImport && unit.findAll(MethodCallExpr.class).stream()
+                .noneMatch(call -> call.getScope().map(scope -> scope.toString()
+                        .equals("org.springframework.test.util.ReflectionTestUtils")).orElse(false))) {
+            errors.add("HttpClientUtil 测试使用 ReflectionTestUtils 但缺少导入；补 import "
+                    + "org.springframework.test.util.ReflectionTestUtils，或使用真实全限定名。"
+                    + "反射只保存/注入/恢复可变静态字段，不改 final/生产初始化。");
+        }
+
+        for (com.github.javaparser.ast.expr.MethodReferenceExpr reference :
+                unit.findAll(com.github.javaparser.ast.expr.MethodReferenceExpr.class)) {
+            if (reference.toString().contains("BeeTraceClientHelper::new")) {
+                errors.add("不能用 mockStatic(BeeTraceClientHelper.class) 拦截 BeeTraceClientHelper 构造器："
+                        + "构造器不是静态方法。使用普通 mock(BeeTraceClientHelper.class)，"
+                        + "通过 SpringContextBeanUtil.getApplicationContext().getBean(BeeTraceClientHelper.class)"
+                        + "返回并注入 HttpClientUtil.beeTraceClientHelper，保存旧值并在 AfterEach 恢复。");
+            }
+        }
+
+        Map<String, String> variableTypes = new HashMap<>();
+        unit.findAll(com.github.javaparser.ast.body.VariableDeclarator.class).forEach(variable ->
+                variableTypes.putIfAbsent(variable.getNameAsString(), variable.getType().asString()));
+        for (MethodCallExpr thenReturn : unit.findAll(MethodCallExpr.class)) {
+            if (!thenReturn.getNameAsString().equals("thenReturn") || thenReturn.getArguments().size() != 1
+                    || !thenReturn.getArgument(0).isNameExpr() || !thenReturn.getScope().isPresent()
+                    || !thenReturn.getScope().get().isMethodCallExpr()) {
+                continue;
+            }
+            MethodCallExpr when = thenReturn.getScope().get().asMethodCallExpr();
+            if (!when.getNameAsString().equals("when") || when.getArguments().size() != 1
+                    || !when.getArgument(0).isMethodCallExpr()) {
+                continue;
+            }
+            MethodCallExpr getter = when.getArgument(0).asMethodCallExpr();
+            if (!getter.getNameAsString().equals("getApplicationContext")) {
+                continue;
+            }
+            String returned = thenReturn.getArgument(0).asNameExpr().getNameAsString();
+            String type = variableTypes.get(returned);
+            if (type != null && (type.equals("SpringContextBeanUtil")
+                    || type.endsWith(".SpringContextBeanUtil"))) {
+                errors.add("SpringContextBeanUtil.getApplicationContext() 必须返回 ApplicationContext 实例，"
+                        + "不能返回 SpringContextBeanUtil 工具类 Mock（变量 " + returned + "）。"
+                        + "使用 mock(org.springframework.context.ApplicationContext.class)，"
+                        + "再在该实例上 stub getBean(ReadConfig.class/BeeTraceClientHelper.class)。");
+            }
+        }
+
+        for (MethodCallExpr call : unit.findAll(MethodCallExpr.class)) {
+            if (call.getNameAsString().equals("readEntity") && call.getScope().isPresent()
+                    && call.getScope().get().toString().equals("objectMapper")) {
+                errors.add("ObjectMapper 没有 readEntity(response) 方法；按真实响应体使用 readTree/readValue，"
+                        + "或使用 HttpClientUtil 的 ResponseHandler 实际 API，保留原响应断言。");
+            }
+            if (call.getNameAsString().equals("invoke") && call.getScope().filter(Expression::isNameExpr)
+                    .map(scope -> scope.asNameExpr().getNameAsString().equals(sourceClass)).orElse(false)
+                    && business.getTypes().stream().flatMap(type -> type.getMethods().stream())
+                    .filter(method -> method.getNameAsString().equals("invoke"))
+                    .anyMatch(method -> !method.isStatic())) {
+                errors.add("HttpClientUtil.invoke 是实例方法，不能用 HttpClientUtil.invoke(...) 静态调用；"
+                        + "先准备底层工厂 Mock，创建真实 HttpClientUtil 实例，再通过该实例调用并保留断言。");
             }
         }
     }

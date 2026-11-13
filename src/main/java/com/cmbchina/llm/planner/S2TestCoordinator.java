@@ -279,6 +279,12 @@ public class S2TestCoordinator {
                 + "init 测试显式调用真实 init，再检查本轮配置的连接池结果，不依赖静态块每个用例重跑。"
                 + "响应状态使用真实 BasicStatusLine(HttpVersion.HTTP_1_1,200,...) 或单独 Mock StatusLine，"
                 + "默认 mockResponse.getStatusLine() 为 null，不能直接链式 when(...getStatusCode())。"
+                + "ReflectionTestUtils 必须补真实 import；SpringContextBeanUtil.getApplicationContext() 返回普通"
+                + "ApplicationContext 实例，不得用 SpringContextBeanUtil 工具类 Mock 冒充上下文。"
+                + "不能用 mockStatic(BeeTraceClientHelper.class) 配置 BeeTraceClientHelper::new；"
+                + "使用普通 BeeTraceClientHelper Mock，并从 ApplicationContext.getBean(BeeTraceClientHelper.class) 返回。"
+                + "ObjectMapper 没有 readEntity(response)，使用 readTree/readValue 或 ResponseHandler 的真实 API；"
+                + "HttpClientUtil.invoke 是实例方法，创建真实 HttpClientUtil 后通过实例调用，不能写成 HttpClientUtil.invoke(...)。"
                 + "不要 import/初始化本测试不使用的 AhiHttpInvokerHandler 或 EventData；"
                 + "如确需调用关联类，必须同时隔离该类真实静态状态。保留成功、异常分支和全部有效断言。\n";
     }
